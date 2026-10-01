@@ -23,6 +23,7 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
@@ -50,7 +51,7 @@ private:
 template <class Body>
 void for_each_rank(const ExecutionContext& ec, Body&& body) {
     const CurrentDevice restore;
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
         body(rank);
     }
@@ -97,37 +98,107 @@ struct ExecutionCore {
     // (`ProgramImplCore::rope_frequency`). Every TextContext built from this core forwards it to
     // its text rope call sites, MTP ones included. All-null is the native constant-table path,
     // bit-for-bit, which is why the default value is the pre-YaRN behavior.
-    std::array<ops::RopeFrequencyOverride, 2> rope_frequency{};
-    const TpPeerCore* peer = nullptr;
+    TpArray<ops::RopeFrequencyOverride> rope_frequency{};
+    // One core per non-zero rank, indexed by RANK; slot 0 is unused and slots at or above the
+    // width stay null. `peer_at(1)` is the single peer the tp2-only paths (MTP, DFlash, the graph
+    // bridge) read; there is deliberately no second, separately-maintained `peer` field, because
+    // two copies of the same fact is exactly how a tp2 path silently keeps running at tp4.
+    TpArray<const TpPeerCore*> peers{};
+    [[nodiscard]] const TpPeerCore* peer_at(std::size_t rank) const noexcept {
+        return rank < peers.size() ? peers[rank] : nullptr;
+    }
 };
 
-// Assembles the TextContext-side view of `peer`. Returns an empty optional at tp == 1.
-[[nodiscard]] inline std::optional<TpExecution> tp_execution(const ExecutionCore& execution) {
-    if (execution.peer == nullptr) { return std::nullopt; }
-    const TpPeerCore& peer = *execution.peer;
-    TpExecution out;
-    out.execution      = peer.execution;
-    out.events         = peer.events;
-    out.device         = peer.device;
-    out.weights        = peer.model;
-    out.work           = peer.work;
-    out.state          = peer.linear_attention;
-    out.io             = peer.io;
-    out.prefill_hidden = peer.prefill_hidden;
-    out.batch_kv       = peer.text_cache;
-    out.batch_mtp_kv   = peer.mtp_cache;
-    out.replay_records = peer.replay_records;
+// Builds the per-rank core array an ExecutionCore is initialised with: rank 1's core at slot 1.
+// (A single-rank-per-slot table is what the two-rank paths below need; the program layer widens it
+// once every rank has its own core.)
+[[nodiscard]] inline TpArray<const TpPeerCore*> peer_lanes(const TpPeerCore* rank_one) {
+    TpArray<const TpPeerCore*> out{};
+    out[1] = rank_one;
     return out;
+}
+
+// The same idea for a per-rank PagedKVCacheView (the MTP prefill's per-sequence window).
+[[nodiscard]] inline TpArray<qwen3_6::PagedKVCacheView>
+peer_mtp_kv_lanes(const qwen3_6::PagedKVCacheView& rank_one) {
+    TpArray<qwen3_6::PagedKVCacheView> out{};
+    out[1] = rank_one;
+    return out;
+}
+
+// ... and for a per-rank pinned ordinary-decode ingress record.
+[[nodiscard]] inline TpArray<const qwen3_6::OrdinaryDecodeIngress*>
+peer_ingress_lanes(const qwen3_6::OrdinaryDecodeIngress* rank_one) {
+    TpArray<const qwen3_6::OrdinaryDecodeIngress*> out{};
+    out[1] = rank_one;
+    return out;
+}
+
+// Assembles the TextContext-side views of every non-zero rank. All slots are empty at tp == 1.
+[[nodiscard]] inline TpPeers tp_executions(const ExecutionCore& execution) {
+    TpPeers out{};
+    for (std::size_t rank = 1; rank < execution.peers.size(); ++rank) {
+        const TpPeerCore* peer = execution.peers[rank];
+        if (peer == nullptr) { continue; }
+        TpExecution lane;
+        lane.execution      = peer->execution;
+        lane.events         = peer->events;
+        lane.device         = peer->device;
+        lane.weights        = peer->model;
+        lane.work           = peer->work;
+        lane.state          = peer->linear_attention;
+        lane.io             = peer->io;
+        lane.prefill_hidden = peer->prefill_hidden;
+        lane.batch_kv       = peer->text_cache;
+        lane.batch_mtp_kv   = peer->mtp_cache;
+        lane.replay_records = peer->replay_records;
+        out[rank]           = lane;
+    }
+    return out;
+}
+
+// Debug-only stage barrier, enabled by NINFER_TP4_MTP_STAGE_SYNC=1. A device fault is STICKY and
+// only surfaces at the next synchronize, so the surviving error message always names whatever
+// synced last (for a prefill chunk, its very end) and never the kernel that actually went out of
+// bounds. These barriers synchronize every rank after one named stage, which turns "illegal memory
+// access somewhere in this 400-line path" into "illegal memory access in the stem's KV append".
+// Off unless the variable is set, so the shipped path pays one predictable branch per stage.
+[[nodiscard]] inline bool mtp_stage_barrier_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_TP4_MTP_STAGE_SYNC");
+        return value != nullptr && *value != '0';
+    }();
+    return enabled;
+}
+
+inline void mtp_stage_barrier(const ExecutionContext& ec, const char* stage) {
+    if (!mtp_stage_barrier_enabled()) { return; }
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        if (ec.dev[static_cast<std::size_t>(rank)].has_value()) {
+            ec.dev[static_cast<std::size_t>(rank)]->synchronize();
+        }
+    }
+    std::fprintf(stderr, "[mtp-stage] %s ok\n", stage);
+}
+
+inline void mtp_stage_barrier(const ExecutionCore& core, const char* stage) {
+    if (!mtp_stage_barrier_enabled()) { return; }
+    core.device.synchronize();
+    for (std::size_t rank = 1; rank < core.peers.size(); ++rank) {
+        const TpPeerCore* peer = core.peers[rank];
+        if (peer != nullptr) { peer->device->synchronize(); }
+    }
+    std::fprintf(stderr, "[mtp-stage] %s ok\n", stage);
 }
 
 struct PrefillContext {
     ExecutionCore execution;
     qwen3_6::PagedKVCacheView text_kv;
     qwen3_6::PagedKVCacheView mtp_kv;
-    // Rank 1's per-sequence MTP KV window at tp == 2; empty at tp == 1 and when MTP is off. The
+    // Each non-zero rank's per-sequence MTP KV window; empty at tp == 1 and when MTP is off. The
     // text prefill needs no peer twin because it drives the BATCH cache view plus table rows,
     // but the MTP prefill appends and reads through the per-sequence execution view.
-    qwen3_6::PagedKVCacheView mtp_kv_peer;
+    TpArray<qwen3_6::PagedKVCacheView> mtp_kv_peers{};
     const qwen3_6::PagedKVCache& text_cache;
     const qwen3_6::PagedKVCache* mtp_cache;
     DFlashPersistentState* dflash;
@@ -147,10 +218,9 @@ struct OrdinaryBatchContext {
     const qwen3_6::OrdinaryDecodeIngress& host_ingress;
     qwen3_6::OrdinaryDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
-    // Rank 1's own pinned copy of `host_ingress`, with every row's sampling counter pointer
-    // nulled (ProgramImplCore::publish_peer_ordinary_ingress). Required whenever
-    // `execution.tp` is engaged; null at tp1.
-    const qwen3_6::OrdinaryDecodeIngress* peer_host_ingress = nullptr;
+    // Each non-zero rank's own pinned copy of `host_ingress`, with every row's sampling counter
+    // pointer nulled (ProgramImplCore::publish_peer_ordinary_ingress). All null at tp1.
+    TpArray<qwen3_6::OrdinaryDecodeIngress*> peer_host_ingress{};
 };
 
 struct MtpBatchContext {
@@ -161,6 +231,13 @@ struct MtpBatchContext {
     const qwen3_6::MtpDecodeIngress& host_ingress;
     qwen3_6::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // One pinned MTP ingress record per NON-ZERO rank, indexed by rank (slot 0 unused, slots at
+    // or above the width null). Each is byte-for-byte rank 0's record except that every row's
+    // `sampling[row].token_counts` names THAT rank's counter lane -- the round is replicated across
+    // every rank and `speculative_accept_greedy_drafts` reads and atomically writes that pointer on
+    // each of them, so handing a rank another rank's lane is a silent double-increment. See
+    // ProgramImplCore::publish_peer_mtp_ingress. All null at tp1.
+    TpArray<qwen3_6::MtpDecodeIngress*> peer_host_ingress{};
 };
 
 struct DFlashBatchContext {
@@ -220,14 +297,14 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
                           ops::GqaExecutionEnvelope envelope);
-// tp == 2 form. `peer` is rank 1's identically-shaped view of ITS OWN frame; the acceptance
-// arithmetic is replicated there rather than transferred, because every one of its inputs is
-// either the ingress record (copied to both frames) or the gathered logits (bit-identical on both
-// ranks). What is NOT replicated is rank 0's bookkeeping: the continuation-hidden scatter and the
-// egress transfer stay on rank 0 alone.
+// Tensor-parallel form: one frame per rank, INDEXED BY RANK. Each rank's frame is its OWN
+// identically-shaped view; the acceptance arithmetic is replicated rather than transferred,
+// because every one of its inputs is either the ingress record (uploaded to every frame) or the
+// gathered logits (bit-identical on every rank). What is NOT replicated is rank 0's bookkeeping:
+// the continuation-hidden scatter and the egress transfer stay on rank 0 alone.
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
-                          TextContext& card, TargetVerifyFrameView frame,
-                          TargetVerifyFrameView peer, ops::GqaExecutionEnvelope envelope);
+                          TextContext& card, const TpArray<TargetVerifyFrameView>& frames,
+                          ops::GqaExecutionEnvelope envelope);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
@@ -249,7 +326,7 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                         std::int32_t purpose);
 // Retained hidden is authoritative on rank 0, including partial MTP commit corrections. Copy it
 // into rank 1's prefill scratch only on resume; both streams protect its producer/read lifetime.
-[[nodiscard]] std::array<Tensor, 2> resume_hidden(ExecutionCore& execution, const Tensor& hidden);
+[[nodiscard]] TpArray<Tensor> resume_hidden(ExecutionCore& execution, const Tensor& hidden);
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                             const Tensor& previous_hidden, std::int32_t position,
                             std::span<const std::int32_t> rope_position, bool build_proposal,

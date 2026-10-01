@@ -69,6 +69,10 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
 // linear_swiglu's own tp2 column shard.
 void fp8_linear_swiglu_a8_launch_shard(const Tensor& x, const Weight& weight, Tensor& out,
                                        WorkspaceArena& workspace, cudaStream_t stream) {
+    if (weight.n == Fp8MlpGateUpTp4ColumnGeometry::kOutputRows) {
+        launch_a8<Fp8MlpGateUpTp4ColumnGeometry>(x, weight, out, workspace, stream);
+        return;
+    }
     launch_a8<Fp8MlpGateUpTp2ColumnGeometry>(x, weight, out, workspace, stream);
 }
 

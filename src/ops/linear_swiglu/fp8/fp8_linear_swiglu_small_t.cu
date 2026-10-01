@@ -45,6 +45,11 @@ constexpr auto kLaunchersShard = make_launchers<Fp8MlpGateUpTp2ColumnGeometry>(
     std::make_index_sequence<kFp8LinearSmallTMax<Fp8MlpGateUpTp2ColumnGeometry> - kFp8FirstSmallT +
                               1>{});
 
+// ... and its tp4 column shard.
+constexpr auto kLaunchersShardTp4 = make_launchers<Fp8MlpGateUpTp4ColumnGeometry>(
+    std::make_index_sequence<kFp8LinearSmallTMax<Fp8MlpGateUpTp4ColumnGeometry> - kFp8FirstSmallT +
+                              1>{});
+
 } // namespace
 
 void fp8_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,
@@ -57,6 +62,15 @@ void fp8_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Ten
 
 void fp8_linear_swiglu_small_t_launch_shard(const Tensor& x, const Weight& weight, Tensor& out,
                                             cudaStream_t stream) {
+    if (weight.n == Fp8MlpGateUpTp4ColumnGeometry::kOutputRows) {
+        if (x.ne[1] < kFp8FirstSmallT ||
+            x.ne[1] > kFp8LinearSmallTMax<Fp8MlpGateUpTp4ColumnGeometry>) {
+            throw std::invalid_argument("fp8 linear_swiglu column-parallel small-T: unsupported T");
+        }
+        kLaunchersShardTp4[static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT)](x, weight, out,
+                                                                                stream);
+        return;
+    }
     if (x.ne[1] < kFp8FirstSmallT ||
         x.ne[1] > kFp8LinearSmallTMax<Fp8MlpGateUpTp2ColumnGeometry>) {
         throw std::invalid_argument("fp8 linear_swiglu column-parallel small-T: unsupported T");

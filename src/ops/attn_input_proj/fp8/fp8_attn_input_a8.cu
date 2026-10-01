@@ -78,6 +78,12 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
 void fp8_attn_input_a8_launch_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                     Tensor& k, Tensor& v, Fp8A8Workspace workspace,
                                     cudaStream_t stream) {
+    if (weight.n == Fp8AttnInputTp4ColumnGeometry::kOutputRows) {
+        launch_a8<Fp8AttnInputTp4ColumnGeometry,
+                  Fp8AttentionInputShardOutput<Fp8AttnInputTp4ColumnGeometry>>(x, weight, q, gate, k,
+                                                                               v, workspace, stream);
+        return;
+    }
     launch_a8<Fp8AttnInputTp2ColumnGeometry, Fp8AttentionInputShardOutput<Fp8AttnInputTp2ColumnGeometry>>(
         x, weight, q, gate, k, v, workspace, stream);
 }

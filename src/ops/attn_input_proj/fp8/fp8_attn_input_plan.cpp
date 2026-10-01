@@ -123,8 +123,12 @@ namespace {
 
 void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                       Tensor& v, WorkspaceArena* workspace, cudaStream_t stream) {
-    constexpr std::int32_t kQRows  = 3072;
-    constexpr std::int32_t kKvRows = 512;
+    // The per-rank row extents, from the shard's own registered geometry: 3072|512 at tp2,
+    // 1536|256 at tp4. These are the row strides of the chunk pointer arithmetic below, so they
+    // must match the shard the weight actually is.
+    const bool tp4                 = weight.n == Fp8AttnInputTp4ColumnGeometry::kOutputRows;
+    const std::int32_t kQRows      = tp4 ? 1536 : 3072;
+    const std::int32_t kKvRows     = tp4 ? 256 : 512;
 #ifdef NINFER_VOLTA_BUILD
     if (x.ne[1] >= kVoltaCutlassMinT && workspace != nullptr) {
         fp8_attn_input_cutlass_sm70_launch_shard(x, weight, q, gate, k, v, *workspace, stream);

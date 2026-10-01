@@ -52,6 +52,13 @@ constexpr auto kLaunchersShard =
         std::make_index_sequence<kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry> -
                                  kFp8FirstSmallT + 1>{});
 
+// The tp4 column shard.
+constexpr auto kLaunchersShardTp4 =
+    make_launchers<Fp8AttnInputTp4ColumnGeometry,
+                   Fp8AttentionInputShardOutput<Fp8AttnInputTp4ColumnGeometry>>(
+        std::make_index_sequence<kFp8LinearSmallTMax<Fp8AttnInputTp4ColumnGeometry> -
+                                 kFp8FirstSmallT + 1>{});
+
 } // namespace
 
 void fp8_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
@@ -65,6 +72,15 @@ void fp8_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor
 
 void fp8_attn_input_small_t_launch_shard(const Tensor& x, const Weight& weight, Tensor& q,
                                          Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (weight.n == Fp8AttnInputTp4ColumnGeometry::kOutputRows) {
+        if (x.ne[1] < kFp8FirstSmallT ||
+            x.ne[1] > kFp8LinearSmallTMax<Fp8AttnInputTp4ColumnGeometry>) {
+            throw std::invalid_argument("fp8 attn_input_proj column-parallel small-T: unsupported T");
+        }
+        kLaunchersShardTp4[static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT)](x, weight, q, gate,
+                                                                                k, v, stream);
+        return;
+    }
     if (x.ne[1] < kFp8FirstSmallT || x.ne[1] > kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry>) {
         throw std::invalid_argument("fp8 attn_input_proj column-parallel small-T: unsupported T");
     }

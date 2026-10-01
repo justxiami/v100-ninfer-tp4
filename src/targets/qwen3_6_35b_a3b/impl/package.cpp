@@ -112,9 +112,9 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan,
     if (execution.tp != 1) {
         throw std::invalid_argument("qwen3_6_35b_a3b has no tensor-parallel execution path");
     }
-    return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime, nullptr,
-                                                   model.impl_->weights_profile, std::move(plan),
-                                                   execution);
+    return qwen3_6::create_program<detail::Variant>(
+        model.impl_->data.runtime, std::span<const detail::Variant::ModelView* const>{},
+        model.impl_->weights_profile, std::move(plan), execution);
 }
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b

@@ -21,36 +21,39 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_6::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
-        std::optional<TpExecution> tp = tp_execution(state.execution);
-        if (tp) {
-            // Rank 1 decodes from ITS OWN copy of the same ingress record, so both ranks read
-            // identical tokens, positions, KV rows and lane ids without a cross-device copy. The
-            // copy is rank 1's OWN pinned record, not rank 0's: the record ends with a
-            // SamplingConfig per row whose `token_counts` is a rank-0 DEVICE address, and rank
-            // 1's frame must never hold one: dereferencing a rank-0 device pointer from rank
-            // 1 is a silent cross-device fault. Rank 1 never samples -- the vocabulary-split
-            // output head gathers to rank 0 and `ops::sample` below runs there alone -- so its
-            // copy carries the configs with the counter pointers nulled.
-            if (!tp->io->ordinary.has_value()) {
-                throw std::logic_error("tensor-parallel decode requires a peer ordinary frame");
+        TpPeers peers = tp_executions(state.execution);
+        for (std::size_t r = 1; r < peers.size(); ++r) {
+            if (!peers[r].has_value()) { continue; }
+            TpExecution& lane = *peers[r];
+            // Every non-zero rank decodes from ITS OWN copy of the same ingress record, so all
+            // ranks read identical tokens, positions, KV rows and lane ids without a cross-device
+            // copy. The copy is that rank's OWN pinned record, not rank 0's: the record ends with a
+            // SamplingConfig per row whose `token_counts` is a rank-0 DEVICE address, and another
+            // rank's frame must never hold one -- dereferencing a rank-0 device pointer there is a
+            // silent cross-device fault. Only rank 0 samples (the vocabulary-split output head
+            // gathers to rank 0 and `ops::sample` below runs there alone), so the other ranks'
+            // copies carry the configs with the counter pointers nulled.
+            if (!lane.io->ordinary.has_value()) {
+                throw std::logic_error(
+                    "tensor-parallel decode requires an ordinary frame on every rank");
             }
-            if (state.peer_host_ingress == nullptr) {
-                throw std::logic_error("tensor-parallel decode requires a peer ingress record");
+            if (state.peer_host_ingress[r] == nullptr) {
+                throw std::logic_error(
+                    "tensor-parallel decode requires an ingress record on every rank");
             }
             int previous = 0;
             CUDA_CHECK(cudaGetDevice(&previous));
-            CUDA_CHECK(cudaSetDevice(tp->device->device));
-            CUDA_CHECK(cudaMemcpyAsync(tp->io->ordinary->ingress.data, state.peer_host_ingress,
+            CUDA_CHECK(cudaSetDevice(lane.device->device));
+            CUDA_CHECK(cudaMemcpyAsync(lane.io->ordinary->ingress.data, state.peer_host_ingress[r],
                                        sizeof(qwen3_6::OrdinaryDecodeIngress),
-                                       cudaMemcpyHostToDevice, tp->device->stream));
+                                       cudaMemcpyHostToDevice, lane.device->stream));
             CUDA_CHECK(cudaSetDevice(previous));
         }
 
         TextContext card(state.execution.device, state.execution.model, state.execution.work,
                          state.execution.rope_frequency, {}, state.execution.linear_attention,
                          state.execution.io, state.execution.prefill_hidden,
-                         state.execution.prefill_chunk, 0, {}, &state.text_cache, nullptr,
-                         tp ? &*tp : nullptr);
+                         state.execution.prefill_chunk, 0, {}, &state.text_cache, nullptr, peers);
 
         Tensor tokens          = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions = ordinary.cache_positions.slice(0, 0, batch_size);

@@ -34,6 +34,14 @@ struct Nvfp4GdnInputSections<Nvfp4GdnInputTp2ColumnGeometry> {
     static constexpr std::int32_t kValueRows = 3072;
 };
 
+// The tp4 column shard (Nvfp4GdnInputTp4ColumnGeometry): a quarter of the heads (4 of 16 key
+// heads, 12 of 48 value heads).
+template <>
+struct Nvfp4GdnInputSections<Nvfp4GdnInputTp4ColumnGeometry> {
+    static constexpr std::int32_t kKeyRows   = 512;
+    static constexpr std::int32_t kValueRows = 1536;
+};
+
 // The tp1-named struct (unparameterized) is kept exactly as it was -- every existing tp1 call site
 // (nvfp4_gdn_input_{decode,small_t,w4a4}.cu, nvfp4_w4a4_tma.cu) continues to build the identical
 // Nvfp4GdnInputOutput{qkv,z} aggregate it always has, unmodified. The shard uses the new templated

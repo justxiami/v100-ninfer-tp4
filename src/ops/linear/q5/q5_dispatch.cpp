@@ -28,11 +28,18 @@ namespace {
 // Returns nullptr when (n, k) is not a registered shard extent, so the caller falls through to the
 // tp1 table and its error message.
 Q5Launch select_q5_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    // The registered shard extents of every width: tp2's are tp1/2, tp4's are tp1/4. The launchers
+    // below are runtime-dimension, so one table serves both widths.
     const bool column_shard = k == 5120 && (n == 512 ||   // 1024  / 2
+                                            n == 256 ||   // 1024  / 4
                                             n == 3072 ||  // 6144  / 2
-                                            n == 3584);   // 7168  / 2
+                                            n == 1536 ||  // 6144  / 4
+                                            n == 3584 ||  // 7168  / 2
+                                            n == 1792);   // 7168  / 4
     const bool row_shard    = n == 5120 && (k == 3072 ||  // 6144  / 2 (attention/gdn output)
-                                            k == 8704);   // 17408 / 2 (mlp/down)
+                                            k == 1536 ||  // 6144  / 4
+                                            k == 8704 ||  // 17408 / 2 (mlp/down)
+                                            k == 4352);   // 17408 / 4
     if (!column_shard && !row_shard) { return nullptr; }
     if (t <= 4) { return launch_q5_simt_r8_c4; }
     if (t <= 24) { return launch_q5_simt_r8_c8; }

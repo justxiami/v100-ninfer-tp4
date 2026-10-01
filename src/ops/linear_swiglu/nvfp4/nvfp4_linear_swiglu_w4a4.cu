@@ -101,7 +101,15 @@ void nvfp4_linear_swiglu_w4a4_launch(const Tensor& x, const Weight& weight, Tens
 
 void nvfp4_linear_swiglu_w4a4_launch_shard(const Tensor& x, const Weight& weight, Tensor& out,
                                            WorkspaceArena& workspace, cudaStream_t stream) {
-    launch<Nvfp4MlpGateUpTp2ColumnGeometry, M48N64>(x, weight, out, workspace, stream);
+    if (weight.n == Nvfp4MlpGateUpTp2ColumnGeometry::kOutputRows) {
+        launch<Nvfp4MlpGateUpTp2ColumnGeometry, M48N64>(x, weight, out, workspace, stream);
+        return;
+    }
+    if (weight.n == Nvfp4MlpGateUpTp4ColumnGeometry::kOutputRows) {
+        launch<Nvfp4MlpGateUpTp4ColumnGeometry, M48N64>(x, weight, out, workspace, stream);
+        return;
+    }
+    throw std::invalid_argument("nvfp4 linear_swiglu column-parallel: unsupported shard rows");
 }
 
 } // namespace ninfer::ops::detail

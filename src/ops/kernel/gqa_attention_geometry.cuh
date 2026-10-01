@@ -44,6 +44,21 @@ static_assert(Gqa27Tp2Geometry::QHeads * 2 == Gqa27Geometry::QHeads);
 static_assert(Gqa27Tp2Geometry::KVHeads * 2 == Gqa27Geometry::KVHeads);
 static_assert(Gqa27Tp2Geometry::GroupSize == Gqa27Geometry::GroupSize);
 
+// Head-local quarter of Gqa27Geometry for four-way tensor parallelism. Device r owns Q heads
+// [r*6,(r+1)*6) and the single KV head r; GroupSize stays 6, so the Q-head -> KV-head grouping
+// `qh / GroupSize` is the same arithmetic the tp1 geometry runs. DecodeSplitScale compensates the
+// quartered KV-head count in the split-KV decode grid, whose x extent is exactly KVHeads: 24|4
+// runs 4 x 85 = 340 CTAs, 12|2 runs 2 x 170 = 340, and 6|1 with scale 4 also runs 1 x 340 = 340
+// (Volta: 4 x 560 == 2 x 1120 == 1 x 2240). This is the same inherited-tuning rule every split
+// form here follows: the split reuses its family's measured policy rather than re-deriving one.
+using Gqa27Tp4Geometry = GqaGeometry<6, 1, 4>;
+
+static_assert(Gqa27Tp4Geometry::QHeads * 4 == Gqa27Geometry::QHeads);
+static_assert(Gqa27Tp4Geometry::KVHeads * 4 == Gqa27Geometry::KVHeads);
+static_assert(Gqa27Tp4Geometry::GroupSize == Gqa27Geometry::GroupSize);
+static_assert(Gqa27Tp4Geometry::DecodeSplits * Gqa27Tp4Geometry::KVHeads ==
+              Gqa27Tp2Geometry::DecodeSplits * Gqa27Tp2Geometry::KVHeads);
+
 // The complete registry. Launcher geometry selection is generated from this one list
 // (ops/launcher/gqa_geometry_dispatch.cuh), so a newly registered geometry cannot be left behind
 // in one launcher's hand-written switch. Q-head counts are pairwise distinct, which is what makes
@@ -51,7 +66,8 @@ static_assert(Gqa27Tp2Geometry::GroupSize == Gqa27Geometry::GroupSize);
 #define NINFER_GQA_GEOMETRIES(X)                                                                   \
     X(Gqa27Geometry)                                                                               \
     X(Gqa35Geometry)                                                                               \
-    X(Gqa27Tp2Geometry)
+    X(Gqa27Tp2Geometry)                                                                            \
+    X(Gqa27Tp4Geometry)
 
 // The cache-append kernels (A2) read Geometry::KVHeads and nothing else -- no Q-head count, no
 // group size, no split policy -- so any two geometries with the same KV-head count produce the
@@ -59,7 +75,8 @@ static_assert(Gqa27Tp2Geometry::GroupSize == Gqa27Geometry::GroupSize);
 // KV-head count over the full registry ambiguous: two entries would match. This sub-list resolves
 // that by naming one representative per distinct KV-head count, and it is what the standalone
 // `gqa_kv_append` entry point (which has no Q heads to select on) dispatches over, so that
-// selection is a function and reordering either list cannot change which kernel runs.
+// selection is a function and reordering either list cannot change which kernel runs. Gqa27Tp4Geometry
+// carries the only 1-KV-head geometry, so it owns that representative.
 //
 // It is NOT a code-size mechanism: `gqa_attention_prompt_launch` reaches
 // `gqa_kv_append_launch_for<Geometry>` through the full `dispatch_gqa_geometry`, so the append
@@ -69,6 +86,7 @@ static_assert(Gqa27Tp2Geometry::GroupSize == Gqa27Geometry::GroupSize);
 // it is added.
 #define NINFER_GQA_KV_REPRESENTATIVES(X)                                                           \
     X(Gqa27Geometry)                                                                               \
-    X(Gqa35Geometry)
+    X(Gqa35Geometry)                                                                               \
+    X(Gqa27Tp4Geometry)
 
 } // namespace ninfer::ops

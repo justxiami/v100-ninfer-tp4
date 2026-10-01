@@ -28,11 +28,20 @@ void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor
     launch<Nvfp4GdnInputGeometry, Nvfp4GdnInputOutput>(x, weight, qkv, z, stream);
 }
 
-// The tp2 column shard, instantiated at Nvfp4GdnInputTp2ColumnGeometry.
+// The column shard: 8192 rows at tp2, 4096 at tp4, selected by the weight's own N.
 void nvfp4_gdn_input_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
                                          Tensor& z, cudaStream_t stream) {
-    launch<Nvfp4GdnInputTp2ColumnGeometry, Nvfp4GdnInputShardOutput<Nvfp4GdnInputTp2ColumnGeometry>>(
-        x, weight, qkv, z, stream);
+    if (weight.n == Nvfp4GdnInputTp2ColumnGeometry::kOutputRows) {
+        launch<Nvfp4GdnInputTp2ColumnGeometry,
+               Nvfp4GdnInputShardOutput<Nvfp4GdnInputTp2ColumnGeometry>>(x, weight, qkv, z, stream);
+        return;
+    }
+    if (weight.n == Nvfp4GdnInputTp4ColumnGeometry::kOutputRows) {
+        launch<Nvfp4GdnInputTp4ColumnGeometry,
+               Nvfp4GdnInputShardOutput<Nvfp4GdnInputTp4ColumnGeometry>>(x, weight, qkv, z, stream);
+        return;
+    }
+    throw std::invalid_argument("nvfp4 gdn_input_proj column-parallel: unsupported shard rows");
 }
 
 } // namespace ninfer::ops::detail

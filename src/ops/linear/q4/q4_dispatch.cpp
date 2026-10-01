@@ -11,13 +11,22 @@ namespace {
 // compile-time exact instantiations (Q4's draft-head small-T table is exact in both N and K).
 // Returns nullptr when (n, k) is not a registered shard extent.
 Q4Launch select_q4_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    // The registered shard extents of every width: tp2's are tp1/2, tp4's are tp1/4. Selection is
+    // by the shard's actual (n,k) and the launchers below are runtime-dimension, so one table
+    // serves both widths -- a tp4 tensor is never handed a tp2-tuned exact instantiation.
     const bool column_shard = (k == 5120 && (n == 512 ||    // 1024  / 2
+                                             n == 256 ||    // 1024  / 4
                                              n == 2048 ||   // 4096  / 2 (gdn/query_key)
-                                             n == 3072 ||   // 6144  / 2
+                                             n == 1024 ||   // 4096  / 4
+                                             n == 3072 ||   // 6144  / 2 (and 12288 / 4)
+                                             n == 1536 ||   // 6144  / 4
                                              n == 3584 ||   // 7168  / 2 (attention/query_key)
+                                             n == 1792 ||   // 7168  / 4
                                              n == 17408 ||  // 34816 / 2 (mlp/gate_up)
-                                             n == 65536))|| // 131072/ 2 (draft_head)
-                              (k == 2048 && n == 65536);    // 131072/ 2 (draft_head, short K)
+                                             n == 8704 ||   // 34816 / 4
+                                             n == 65536 ||  // 131072/ 2 (draft_head)
+                                             n == 32768))|| // 131072/ 4
+                              (k == 2048 && (n == 65536 || n == 32768)); // draft_head, short K
     if (!column_shard) { return nullptr; }
     if (t == 1) {
         // The eight-row SM70 schedule is tuned for the V100 TP2 MLP shard. Keep the

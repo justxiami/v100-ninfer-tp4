@@ -10,6 +10,7 @@
 #include <array>
 #include <limits>
 #include <stdexcept>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::ops::detail {
 namespace {
@@ -36,13 +37,16 @@ struct RouteSpec {
     Q5LinearAddScheduleId schedule;
 };
 
-constexpr std::array<SupportSpec, 4> kSupports{{
+constexpr std::array<SupportSpec, 6> kSupports{{
     {5120, 6144, 6144},
     {5120, 17408, 17408},
-    // TP2 row-parallel halves of attention/GDN output and MLP down-projection. The exact-K
-    // GEMV/split2 templates do not cover these extents; each device profile uses runtime-K routes.
+    // tp2 (tp1/2) and tp4 (tp1/4) row-parallel shards of attention/GDN output and MLP
+    // down-projection. The exact-K GEMV/split2 templates do not cover these extents; each device
+    // profile uses runtime-K routes (see kShardRoutes).
     {5120, 3072, 3072},
+    {5120, 1536, 1536},
     {5120, 8704, 8704},
+    {5120, 4352, 4352},
 }};
 
 #ifdef NINFER_VOLTA_BUILD

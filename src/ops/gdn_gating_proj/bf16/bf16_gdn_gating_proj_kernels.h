@@ -87,8 +87,9 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
                                                 const Tensor& A_log, const Tensor& dt_bias,
                                                 Tensor& g, Tensor& beta, cudaStream_t stream);
 
-// --- tp2 column-shard forms (24 rows/GPU; see bf16_gdn_gating_proj_kernels.cu's kShardN
-// comment for why every T routes through gemv/small-T-split10, bypassing the MMA route). ---
+// --- column-shard forms (24 rows/GPU at tp2, 12 at tp4; see
+// bf16_gdn_gating_proj_kernels.cu's kShardN comment for why every T routes through
+// gemv/small-T-split10, bypassing the MMA route). ---
 
 void bf16_gdn_gating_proj_gemv_shard_launch(const Tensor& x, const Weight& a_weight,
                                             const Weight& b_weight, const Tensor& A_log,
@@ -106,7 +107,9 @@ void bf16_gdn_gating_dispatch_shard(const Tensor& x, const Weight& a_weight,
                                     const Tensor& dt_bias, void* workspace,
                                     std::size_t workspace_bytes, Tensor& g, Tensor& beta,
                                     cudaStream_t stream);
-// Transient workspace required by bf16_gdn_gating_dispatch_shard for the given token count.
-[[nodiscard]] std::size_t bf16_gdn_gating_shard_workspace_bytes(std::int32_t tokens);
+// Transient workspace required by bf16_gdn_gating_dispatch_shard for the given token count and
+// shard head count (24 at tp2, 12 at tp4).
+[[nodiscard]] std::size_t bf16_gdn_gating_shard_workspace_bytes(std::int32_t tokens,
+                                                                std::int32_t heads);
 
 } // namespace ninfer::ops::detail

@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::ops {
 
@@ -195,22 +196,22 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
  * @param[in,out] workspace Per-rank caller-owned transient arena; A16Only routes need none.
  * @param[in] ec Execution context holding exactly two distinct devices.
  */
-void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& query_key_gate_value_weight,
-                                     const std::array<Tensor, 2>& q, const std::array<Tensor, 2>& gate,
-                                     const std::array<Tensor, 2>& k, const std::array<Tensor, 2>& v,
+void attn_input_proj_column_parallel(const TpArray<Tensor>& x,
+                                     const TpArray<Weight>& query_key_gate_value_weight,
+                                     const TpArray<Tensor>& q, const TpArray<Tensor>& gate,
+                                     const TpArray<Tensor>& k, const TpArray<Tensor>& v,
                                      LinearPolicy policy,
-                                     const std::array<WorkspaceArena*, 2>& workspace,
+                                     const TpArray<WorkspaceArena*>& workspace,
                                      const ExecutionContext& ec);
 
 /**
  * A16-only column-parallel convenience form. Passes a null workspace per rank for routes that do
  * not need one (including GGML_K and NVFP4 A16).
  */
-void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& query_key_gate_value_weight,
-                                     const std::array<Tensor, 2>& q, const std::array<Tensor, 2>& gate,
-                                     const std::array<Tensor, 2>& k, const std::array<Tensor, 2>& v,
+void attn_input_proj_column_parallel(const TpArray<Tensor>& x,
+                                     const TpArray<Weight>& query_key_gate_value_weight,
+                                     const TpArray<Tensor>& q, const TpArray<Tensor>& gate,
+                                     const TpArray<Tensor>& k, const TpArray<Tensor>& v,
                                      const ExecutionContext& ec);
 
 /**
@@ -228,12 +229,12 @@ void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
  * @param[out] q,gate Per-rank BF16 `[3072,T]`. @param[out] k,v Per-rank BF16 `[512,T]`.
  * @param[in] ec Execution context holding exactly two distinct devices.
  */
-void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& query_key_weight,
-                                     const std::array<Weight, 2>& gate_value_weight,
-                                     const std::array<Tensor, 2>& q, const std::array<Tensor, 2>& gate,
-                                     const std::array<Tensor, 2>& k, const std::array<Tensor, 2>& v,
-                                     const std::array<WorkspaceArena*, 2>& workspace,
+void attn_input_proj_column_parallel(const TpArray<Tensor>& x,
+                                     const TpArray<Weight>& query_key_weight,
+                                     const TpArray<Weight>& gate_value_weight,
+                                     const TpArray<Tensor>& q, const TpArray<Tensor>& gate,
+                                     const TpArray<Tensor>& k, const TpArray<Tensor>& v,
+                                     const TpArray<WorkspaceArena*>& workspace,
                                      const ExecutionContext& ec);
 
 } // namespace ninfer::ops

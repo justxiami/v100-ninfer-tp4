@@ -11,6 +11,7 @@
 #include <array>
 #include <limits>
 #include <stdexcept>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::ops::detail {
 namespace {
@@ -293,8 +294,13 @@ void q4_q5_attn_input_dispatch(const Tensor& x, const Weight& query_key_weight,
 }
 
 bool q4_q5_attn_input_admits_shard(const Q4Q5AttnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.query_rows == 3072 && problem.kv_rows == 512 &&
-           problem.padded_k == 5120 && problem.cols >= 1;
+    // tp2 (query 3072, key/value 512) and tp4 (query 1536, key/value 256) column shards of the same
+    // [7168,5120] parent.
+    const bool tp2 = problem.input_rows == 5120 && problem.query_rows == 3072 &&
+                     problem.kv_rows == 512 && problem.padded_k == 5120 && problem.cols >= 1;
+    const bool tp4 = problem.input_rows == 5120 && problem.query_rows == 1536 &&
+                     problem.kv_rows == 256 && problem.padded_k == 5120 && problem.cols >= 1;
+    return tp2 || tp4;
 }
 
 void q4_q5_attn_input_dispatch_shard(const Tensor& x, const Weight& query_key_weight,

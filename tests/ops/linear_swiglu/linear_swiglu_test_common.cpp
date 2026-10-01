@@ -23,6 +23,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::test::linear_swiglu {
 namespace {
@@ -380,9 +381,9 @@ int run_column_parallel_profile(std::string_view label, const Profile& shard_pro
     }
     int failures = 0;
     for (const auto tokens : token_cases) {
-        std::array<Tensor, 2> x, output;
-        std::array<Weight, 2> weights;
-        std::array<WorkspaceArena*, 2> workspace;
+        TpArray<Tensor> x, output;
+        TpArray<Weight> weights;
+        TpArray<WorkspaceArena*> workspace;
         const std::size_t elements = checked_elements(shard_profile.output_rows, tokens, "split");
         for (int rank = 0; rank < 2; ++rank) {
             cuda_check(cudaSetDevice(ec.dev[rank]->device), "select split device");

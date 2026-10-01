@@ -113,8 +113,12 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     // MTP/speculative verify round records on each device at tp == 2, and it is the exact partner
     // of FoldGeometry48x24Tp2 in `is_registered_fold_geometry` below -- a record written at this
     // geometry is folded at that one, so the two entries must exist together.
+    // ... and `4|12` is the tp == 4 shard of `16|48`: both counts divide by four, the group size
+    // 48/16 == 24/8 == 12/4 == 3 is preserved, and the split stays group-aligned. Its counterpart
+    // is FoldGeometry48x12Tp4 in `is_registered_fold_geometry` below.
     const bool registered_heads = (qk_heads == 16 && (value_heads == 48 || value_heads == 32)) ||
-                                  (qk_heads == 8 && value_heads == 24);
+                                  (qk_heads == 8 && value_heads == 24) ||
+                                  (qk_heads == 4 && value_heads == 12);
     if (!registered_heads || width < 2 || width > 16 || rows <= 0 || rows > kMaximumRows) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
@@ -177,7 +181,10 @@ bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
     // value-head counts halve, together with the conv channel count.
     const bool geometry_48_tp2 = spec.layers == 48 && spec.qk_heads == 8 &&
                                  spec.value_heads == 24 && spec.conv_channels == 5120;
-    return geometry_48 || geometry_30 || geometry_48_tp2;
+    // FoldGeometry48x12Tp4: device r's quarter of geometry_48 at tp == 4.
+    const bool geometry_48_tp4 = spec.layers == 48 && spec.qk_heads == 4 &&
+                                 spec.value_heads == 12 && spec.conv_channels == 2560;
+    return geometry_48 || geometry_30 || geometry_48_tp2 || geometry_48_tp4;
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {

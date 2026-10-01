@@ -69,6 +69,21 @@ int w8_a16_conformance() {
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {5120, 17408, 241U, Comparison::Sampled, false, kN5120K17408});
 
+    // tp4 shard extents. Every other case here is a tp1 or tp2 extent, and the tp4 ones were not
+    // listed anywhere in w8_dispatch.cpp either -- so a tp4 MTP load threw "unsupported shape or T"
+    // before the kernels were even reached. These cases are the regression test for that gap.
+    constexpr std::array kTp4ShardT{a16(1), a16(2), a16(4), a16(5), a16(16), a16(17)};
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {8704, 5120, 293U, Comparison::Sampled, false, kTp4ShardT});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {5120, 4352, 295U, Comparison::Sampled, false, kTp4ShardT});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {5120, 1536, 297U, Comparison::Sampled, false, kTp4ShardT});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {3584, 5120, 299U, Comparison::Sampled, false, kTp4ShardT});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {5120, 2560, 301U, Comparison::Sampled, false, kTp4ShardT});
+
     constexpr std::array kN2048K4096{
         a16(1),  a16(4),  a16(5),  a16(8),   a16(9),   a16(16),   a16(17), a16(24),
         a16(25), a16(26), a16(27), a16(32),  a16(33),  a16(40),   a16(41), a16(48),

@@ -205,6 +205,10 @@ void fp8_linear_swiglu_dispatch_shard(const Tensor& x, const Weight& weight, Ten
             throw std::invalid_argument(
                 "fp8 A16 linear_swiglu column-parallel requires caller workspace");
         }
+        if (weight.n == Fp8MlpGateUpTp4ColumnGeometry::kOutputRows) {
+            launch_a16<Fp8MlpGateUpTp4ColumnGeometry>(x, weight, out, *workspace, stream);
+            return;
+        }
         launch_a16<Fp8MlpGateUpTp2ColumnGeometry>(x, weight, out, *workspace, stream);
         return;
     }

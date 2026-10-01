@@ -340,6 +340,18 @@ int main() {
         }
         run(48, 3072, 512, true, false);
         run(48, 3072, 512, true, true);
+        // tp4 shard extents. Every shape above is a tp2 shard or a whole-model extent; the tp4
+        // quarters were never covered even though the MTP objects are the only GGML_K consumers
+        // whose shards change shape with width: gate_up 34816/4 x 5120, down 5120 x 17408/4,
+        // attention output 5120 x 6144/4, qkv 14336/4 x 5120, input_projection 5120 x 10240/4.
+        // T covers the draft windows the server runs (k=1 -> 2, k=3 -> 4) and the AR steps (1).
+        for (int t : {1, 2, 4}) {
+            run(8704, 5120, t);   // MTP gate_up  / tp4
+            run(5120, 4352, t);   // MTP down     / tp4  (17408 / 4)
+            run(5120, 1536, t);   // MTP output   / tp4  (6144  / 4)
+            run(3584, 5120, t);   // MTP qkv      / tp4  (14336 / 4)
+            run(5120, 2560, t);   // MTP input_projection / tp4 (10240 / 4)
+        }
 #ifdef NINFER_VOLTA_BUILD
         run_fp32_output();
 #endif

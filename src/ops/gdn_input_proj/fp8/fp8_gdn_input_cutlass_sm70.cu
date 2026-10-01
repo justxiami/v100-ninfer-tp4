@@ -14,16 +14,13 @@ namespace {
 template <class Geometry>
 struct CutlassSections;
 
-template <>
-struct CutlassSections<Fp8GdnInputGeometry> {
-    static constexpr std::int32_t kQkvRows = Fp8GdnInputOutput::kQkvRows;
-    static constexpr std::int32_t kZRows   = Fp8GdnInputOutput::kZRows;
-};
-
-template <>
-struct CutlassSections<Fp8GdnInputTp2ColumnGeometry> {
-    static constexpr std::int32_t kQkvRows = 5120;
-    static constexpr std::int32_t kZRows   = 3072;
+// Reads the same per-geometry section traits the shard output does, so a newly registered width
+// reaches the cutlass split kernel automatically.
+template <class Geometry>
+struct CutlassSections {
+    static constexpr std::int32_t kQkvRows =
+        2 * Fp8GdnInputSections<Geometry>::kKeyRows + Fp8GdnInputSections<Geometry>::kValueRows;
+    static constexpr std::int32_t kZRows = Fp8GdnInputSections<Geometry>::kValueRows;
 };
 
 template <class Geometry, class Allocator>
@@ -87,6 +84,10 @@ void fp8_gdn_input_cutlass_sm70_launch(const Tensor& x, const Weight& weight, Te
 void fp8_gdn_input_cutlass_sm70_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
                                              Tensor& z, WorkspaceArena& workspace,
                                              cudaStream_t stream) {
+    if (weight.n == Fp8GdnInputTp4ColumnGeometry::kOutputRows) {
+        launch<Fp8GdnInputTp4ColumnGeometry>(x, weight, qkv, z, workspace, stream);
+        return;
+    }
     launch<Fp8GdnInputTp2ColumnGeometry>(x, weight, qkv, z, workspace, stream);
 }
 

@@ -61,10 +61,23 @@ private:
     int previous_ = 0;
 };
 
+// Every split form's precondition: at least two ranks, one constructed context per rank, and no
+// device used twice. Widened from "exactly two" so one code path serves every degree: the
+// collectives then pick their backend from `ec.tp` (tp == 2 hand-written pull, tp > 2 NCCL -- see
+// src/core/tp_comm.h), and the shard arithmetic comes from the plan rather than from this check.
 inline void require_split_context(const ExecutionContext& ec, const char* message) {
-    if (ec.tp != 2 || !ec.dev[0].has_value() || !ec.dev[1].has_value() ||
-        ec.dev[0]->device == ec.dev[1]->device) {
-        throw std::invalid_argument(message);
+    if (ec.tp < 2) { throw std::invalid_argument(message); }
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        const std::size_t slot = static_cast<std::size_t>(rank);
+        if (!ec.dev[slot].has_value()) { throw std::invalid_argument(message); }
+    }
+    for (int lhs = 0; lhs < ec.tp; ++lhs) {
+        for (int rhs = lhs + 1; rhs < ec.tp; ++rhs) {
+            if (ec.dev[static_cast<std::size_t>(lhs)]->device ==
+                ec.dev[static_cast<std::size_t>(rhs)]->device) {
+                throw std::invalid_argument(message);
+            }
+        }
     }
 }
 
@@ -106,7 +119,7 @@ inline void require_rank_residency([[maybe_unused]] const ExecutionContext& ec,
 template <class Body>
 void for_each_rank(const ExecutionContext& ec, Body&& body) {
     const CurrentDeviceScope scope;
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         CurrentDeviceScope::set(ec.dev[rank]->device);
         body(rank);
     }

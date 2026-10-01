@@ -40,6 +40,14 @@ struct Nvfp4AttnInputSections<Nvfp4AttnInputTp2ColumnGeometry> {
     static constexpr std::int32_t kKeyRows   = 512;
 };
 
+// The tp4 column shard: a quarter of the heads of every section (6 query/gate heads, 1 key/value
+// head out of 24/4 total), in the same section order as the parent.
+template <>
+struct Nvfp4AttnInputSections<Nvfp4AttnInputTp4ColumnGeometry> {
+    static constexpr std::int32_t kQueryRows = 1536;
+    static constexpr std::int32_t kKeyRows   = 256;
+};
+
 [[nodiscard]] std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy,
                                                                     std::int32_t min_tokens,
                                                                     std::int32_t max_tokens);

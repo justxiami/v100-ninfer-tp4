@@ -30,6 +30,46 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   FetchContent_MakeAvailable(cutlass)
 endif()
 
+# --- NCCL (tp > 2 collectives) ------------------------------------------------
+# The tp == 2 tensor-parallel path is self-contained (a hand-written pull over UVA device-to-device
+# copies, src/ops/common/allreduce.cu); tp > 2 uses NCCL instead (src/core/tp_comm.cu). Point
+# NINFER_NCCL_ROOT at a prefix holding include/nccl.h and lib/libnccl.so*, or set the two cache
+# variables directly. NCCL is deliberately a hard requirement: silently building without it would
+# turn "tp > 2 is unsupported" into a link error much later.
+if(NOT DEFINED NINFER_NCCL_ROOT)
+  set(NINFER_NCCL_ROOT "$ENV{HOME}/miniconda3/envs/1cat-vllm-sm70/lib/python3.12/site-packages/nvidia/nccl"
+      CACHE PATH "Prefix containing NCCL's include/ and lib/")
+endif()
+find_path(NINFER_NCCL_INCLUDE_DIR nccl.h HINTS "${NINFER_NCCL_ROOT}/include" NO_DEFAULT_PATH)
+# The conda shim ships libnccl.so.2 with no libnccl.so symlink, and find_library would look for
+# "libnccl.so.2.so" if the name carries a suffix -- so name the candidates by absolute path, which
+# find_library checks verbatim. A system NCCL (with the usual symlink) still works via the fallback.
+# Detect the library by explicit candidate paths: find_library decorates a name that carries a
+# version suffix (it would look for "libnccl.so.2.so"), and the conda shim ships libnccl.so.2 with
+# no libnccl.so symlink. Only an empty/NOTFOUND value is overwritten, so -DNINFER_NCCL_LIBRARY=...
+# still wins.
+if(NOT NINFER_NCCL_LIBRARY OR NINFER_NCCL_LIBRARY MATCHES "-NOTFOUND$")
+  set(_ninfer_nccl_candidates
+      "${NINFER_NCCL_ROOT}/lib/libnccl.so"
+      "${NINFER_NCCL_ROOT}/lib/libnccl.so.2")
+  foreach(_candidate IN LISTS _ninfer_nccl_candidates)
+    if(EXISTS "${_candidate}")
+      set(NINFER_NCCL_LIBRARY "${_candidate}" CACHE FILEPATH "NCCL library (libnccl.so*)" FORCE)
+      break()
+    endif()
+  endforeach()
+endif()
+if(NOT NINFER_NCCL_LIBRARY OR NINFER_NCCL_LIBRARY MATCHES "-NOTFOUND$")
+  find_library(NINFER_NCCL_LIBRARY NAMES nccl)   # a system NCCL with the usual symlink
+endif()
+if(NOT NINFER_NCCL_INCLUDE_DIR OR NOT NINFER_NCCL_LIBRARY)
+  message(FATAL_ERROR
+    "NCCL not found under NINFER_NCCL_ROOT='${NINFER_NCCL_ROOT}' "
+    "(include=${NINFER_NCCL_INCLUDE_DIR} library=${NINFER_NCCL_LIBRARY}). "
+    "Set -DNINFER_NCCL_ROOT=... or -DNINFER_NCCL_INCLUDE_DIR=... -DNINFER_NCCL_LIBRARY=...")
+endif()
+message(STATUS "NCCL: ${NINFER_NCCL_LIBRARY}")
+
 # NINFER_SM8X_COMPAT gates every Ampere/early-Ada compatibility path. ninfer_ops also sets it
 # PUBLIC for its own consumers, but that link is PRIVATE through ninfer_engine, so apps and tests
 # would not otherwise see it. Defining it globally keeps a single consistent answer for every

@@ -98,7 +98,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // same page count and the same block tables, which is what makes one shared KV capacity plan
     // legal.
     const std::int32_t tp = plan.tp;
-    if (tp != 1 && tp != 2) { throw std::invalid_argument("sequence plan tp must be 1 or 2"); }
+    if (tp != 1 && tp != 2 && tp != 4) {
+        throw std::invalid_argument("sequence plan tp must be 1, 2, or 4");
+    }
     const std::int32_t linear_state_slots =
         LinearStateSlots::state_slot_count(plan.max_concurrency);
     const auto effective_prefill_chunk =
@@ -665,13 +667,13 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
         }
         break;
     }
-    if (options.tp != 1 && options.tp != 2) {
-        throw std::invalid_argument("tensor-parallel width must be 1 or 2");
+    if (options.tp != 1 && options.tp != 2 && options.tp != 4) {
+        throw std::invalid_argument("tensor-parallel width must be 1, 2, or 4");
     }
-    if (options.tp == 2) {
+    if (options.tp > 1) {
         // MTP and DFlash2 have explicit split schedules. Vision remains single-device.
         if (options.enable_vision) {
-            throw std::invalid_argument("--tp 2 does not support Vision in this build");
+            throw std::invalid_argument("--tp > 1 does not support Vision in this build");
         }
     }
     if (device.sm() != 70 && device.sm() != 86 && device.sm() != 89 && device.sm() != 120) {
@@ -742,7 +744,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             // budget there is one multiplier, 20 MiB, against a 0.3b-style worst case of ~19.9
             // MiB: roughly 1 MiB of headroom. Raising this multiplier, not the warm pass, is the
             // lever if that transient is ever observed at tp 2.
-            const std::uint64_t per_batch = impl->tp == 2 ? 20ULL * kMiB : 12ULL * kMiB;
+            //
+            // Widening beyond tp 2 follows the same rule: the graph grows with the rank count (a
+            // tp 4 capture measured 22 MiB of driver state on device 0 at max_concurrency 1), so
+            // the per-request multiplier grows with it -- 8 MiB per added rank over the tp 1
+            // baseline, which reproduces the measured tp 2 value (20 MiB) and leaves the measured
+            // tp 4 value (22 MiB) inside a 36 MiB budget.
+            const std::uint64_t per_batch =
+                impl->tp == 1 ? 12ULL * kMiB
+                              : (8ULL * static_cast<std::uint64_t>(impl->tp) + 4ULL) * kMiB;
             impl->graph_allowance_bytes =
                 checked_mul(per_batch, impl->max_concurrency, "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {

@@ -51,6 +51,8 @@ constexpr auto kResidual17408Launchers = make_launchers<Nvfp4Residual17408Geomet
 // re-instantiation with a different tuning.
 constexpr auto kResidual6144Tp2RowLaunchers  = make_launchers<Nvfp4Residual6144Tp2RowGeometry>();
 constexpr auto kResidual17408Tp2RowLaunchers = make_launchers<Nvfp4Residual17408Tp2RowGeometry>();
+constexpr auto kResidual6144Tp4RowLaunchers  = make_launchers<Nvfp4Residual6144Tp4RowGeometry>();
+constexpr auto kResidual17408Tp4RowLaunchers = make_launchers<Nvfp4Residual17408Tp4RowGeometry>();
 
 } // namespace
 
@@ -70,12 +72,21 @@ void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tens
     case Nvfp4Problem::Residual17408Tp2Row:
         kResidual17408Tp2RowLaunchers[index](x, weight, residual, stream);
         return;
+    case Nvfp4Problem::Residual6144Tp4Row:
+        kResidual6144Tp4RowLaunchers[index](x, weight, residual, stream);
+        return;
+    case Nvfp4Problem::Residual17408Tp4Row:
+        kResidual17408Tp4RowLaunchers[index](x, weight, residual, stream);
+        return;
     case Nvfp4Problem::AttnInput:
     case Nvfp4Problem::GdnInput:
     case Nvfp4Problem::MlpGateUp:
     case Nvfp4Problem::AttnInputTp2Column:
     case Nvfp4Problem::GdnInputTp2Column:
     case Nvfp4Problem::MlpGateUpTp2Column:
+    case Nvfp4Problem::AttnInputTp4Column:
+    case Nvfp4Problem::GdnInputTp4Column:
+    case Nvfp4Problem::MlpGateUpTp4Column:
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");

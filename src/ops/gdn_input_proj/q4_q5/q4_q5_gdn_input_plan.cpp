@@ -11,6 +11,7 @@
 #include <array>
 #include <limits>
 #include <stdexcept>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::ops::detail {
 namespace {
@@ -108,8 +109,17 @@ bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
 // shape like any other, and a tp1 shape that later happened to equal it must keep its own tuned
 // route.
 bool supported_shard_shape(const Q4Q5GdnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.qk_rows == 2048 && problem.value_z_rows == 6144 &&
-           problem.qkv_rows == 5120 && problem.z_rows == 3072 && problem.padded_k == 5120;
+    // tp2: qk 2048, value_z 6144, qkv 5120, z 3072. tp4: every one of those quartered again
+    // (qk 1024, value_z 3072, qkv 2560, z 1536). Both are exact shapes rather than a formula: a
+    // shard extent is a shape like any other, and a tp1 shape that later happened to equal it must
+    // keep its own tuned route.
+    const bool tp2 = problem.input_rows == 5120 && problem.qk_rows == 2048 &&
+                     problem.value_z_rows == 6144 && problem.qkv_rows == 5120 &&
+                     problem.z_rows == 3072 && problem.padded_k == 5120;
+    const bool tp4 = problem.input_rows == 5120 && problem.qk_rows == 1024 &&
+                     problem.value_z_rows == 3072 && problem.qkv_rows == 2560 &&
+                     problem.z_rows == 1536 && problem.padded_k == 5120;
+    return tp2 || tp4;
 }
 
 } // namespace

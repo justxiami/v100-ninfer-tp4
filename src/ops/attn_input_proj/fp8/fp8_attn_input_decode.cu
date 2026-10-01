@@ -35,8 +35,16 @@ void fp8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor&
 }
 
 // The tp2 column shard.
+// The column shard's own row extent selects the geometry: 7168 at tp2, 3584 at tp4. Selecting by
+// the weight's actual N is what keeps a tp4 tensor from being read by a tp2 kernel.
 void fp8_attn_input_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& q,
                                         Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (weight.n == Fp8AttnInputTp4ColumnGeometry::kOutputRows) {
+        launch<Fp8AttnInputTp4ColumnGeometry,
+               Fp8AttentionInputShardOutput<Fp8AttnInputTp4ColumnGeometry>>(x, weight, q, gate, k, v,
+                                                                            stream);
+        return;
+    }
     launch<Fp8AttnInputTp2ColumnGeometry, Fp8AttentionInputShardOutput<Fp8AttnInputTp2ColumnGeometry>>(
         x, weight, q, gate, k, v, stream);
 }

@@ -74,8 +74,10 @@ KvCacheStorage parse_kv_dtype(const char* text) {
 
 int parse_tp(const char* text) {
     const int value = parse_nonnegative_int(text, "tp");
-    if (value != 1 && value != 2) {
-        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1 or 2)");
+    // Same degrees as the CLI parser: the ones with a shard plan. 3 divides neither the hidden size
+    // nor the vocabulary; 4 is the TP4 degree (kMaximumDevices in ninfer/types.h).
+    if (value != 1 && value != 2 && value != 4) {
+        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1, 2 or 4)");
     }
     return value;
 }
@@ -93,8 +95,9 @@ std::vector<int> parse_devices(const char* text) {
         if (comma == std::string_view::npos) { break; }
         start = comma + 1;
     }
-    if (result.empty() || result.size() > 2) {
-        throw std::invalid_argument("--devices must list 1 or 2 device ids");
+    if (result.empty() || result.size() > kMaximumDevices) {
+        throw std::invalid_argument("--devices must list 1 to " + std::to_string(kMaximumDevices) +
+                                    " device ids");
     }
     return result;
 }
@@ -114,8 +117,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--rope native|yarn] [--yarn-factor F] [--yarn-origin O] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2] "
-           "[--devices N,N] "
+           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2|4] "
+           "[--devices N,...] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "

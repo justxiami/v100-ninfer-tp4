@@ -380,6 +380,8 @@ using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;
 
+#include "ninfer/types.h" // kMaximumDevices
+
 class LoadedModelData {
 public:
     LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
@@ -390,12 +392,15 @@ public:
     LoadedModelData(LoadedModelData&&)                 = delete;
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
-    // The model view for one rank. `runtime` is rank 0's (the only one at tp == 1); `runtime_peer`
-    // holds rank 1's at tp == 2. Both describe the SHARD that rank's arena holds, not the whole
-    // model -- every sharded extent in the view is already divided by tp.
+    // The model view for one rank. `runtime` is rank 0's; `runtime_peers[r]` holds rank r > 0's.
+    // Each describes the SHARD that rank's arena holds, not the whole model -- every sharded extent
+    // in the view is already divided by tp.
     [[nodiscard]] const RuntimeModelView& view(int rank) const {
         if (rank == 0) { return runtime; }
-        if (rank == 1 && runtime_peer.has_value()) { return *runtime_peer; }
+        if (rank > 0 && rank < tp &&
+            runtime_peers[static_cast<std::size_t>(rank)].has_value()) {
+            return *runtime_peers[static_cast<std::size_t>(rank)];
+        }
         throw std::out_of_range("qwen3_6_27b model view rank is out of range");
     }
 
@@ -403,7 +408,7 @@ public:
     qwen3_6::FrontendResources frontend;
     int tp = 1;
     RuntimeModelView runtime;
-    std::optional<RuntimeModelView> runtime_peer;
+    std::array<std::optional<RuntimeModelView>, kMaximumDevices> runtime_peers;
 
 private:
     void build_device_view(const BindingPlan& plan, int device, RuntimeModelView& runtime);

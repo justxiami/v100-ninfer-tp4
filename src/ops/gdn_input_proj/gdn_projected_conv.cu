@@ -81,7 +81,7 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& st
     // shard for the same reason it applies to the tp1 geometry -- the kernel is channel-parallel, so
     // the choice is purely "how many channels per CTA" -- and withholding it would have made the
     // shard pay a 256-wide block for 5120 channels on the latency-critical verify path.
-    if constexpr (Channels == 10240 || Channels == 5120) {
+    if constexpr (Channels == 10240 || Channels == 5120 || Channels == 2560) {
         if (width == 4 && batch == 1) {
             constexpr int kT4Threads = 64;
             gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, 4>
@@ -140,6 +140,15 @@ void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& 
         value.ne[0] == 3072) {
         launch<5120, 1024, 1024, 3072>(projected, conv_weight, state_read, valid_columns,
                                        initial_state_slots, query, key, value, publish, stream);
+        return;
+    }
+    // The tp == 4 quarter: 4 of 16 key heads (512 channels each for Q and K) and 12 of 48 value
+    // heads (1536 channels), in the same Q|K|V order -- the same depthwise argument the tp2 shard
+    // above makes, one division further along.
+    if (projected.ne[0] == 2560 && query.ne[0] == 512 && key.ne[0] == 512 &&
+        value.ne[0] == 1536) {
+        launch<2560, 512, 512, 1536>(projected, conv_weight, state_read, valid_columns,
+                                     initial_state_slots, query, key, value, publish, stream);
         return;
     }
     throw std::invalid_argument("GDN projected-conv received an unregistered geometry");

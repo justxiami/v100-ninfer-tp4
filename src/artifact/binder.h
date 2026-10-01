@@ -1,6 +1,7 @@
 #pragma once
 
 #include "artifact/reader.h"
+#include "ninfer/types.h" // ninfer::kMaximumDevices (the TP ceiling)
 
 #include <array>
 #include <cstddef>
@@ -12,8 +13,10 @@
 
 namespace ninfer::artifact {
 
-// One process drives at most two devices (core/device.h ExecutionContext).
-inline constexpr std::size_t kMaximumDevices = 2;
+// The device ceiling has one definition, in ninfer/types.h; re-exported into this namespace because
+// the artifact layer's per-device arrays (and callers that spell it `artifact::kMaximumDevices`) are
+// sized by it.
+using ninfer::kMaximumDevices;
 
 enum class TensorPlacement : std::uint8_t {
     Device,
@@ -92,6 +95,12 @@ public:
     ObjectHandle require_tensor(std::string_view name, NumericFormat format, StorageLayout layout,
                                 std::span<const std::uint64_t> shape);
     ObjectHandle require_resource(std::string_view name, ResourceEncoding encoding);
+
+    // Non-consuming lookup: report an object's declared descriptor without marking it bound.
+    // Targets use this to dispatch on a per-object numeric format that the artifact itself
+    // declares (for example a mixed-precision MLP schedule) before the binding is fixed.
+    // Returns nullptr when no object with that exact name is present.
+    const ObjectDescriptor* find(std::string_view name) const;
 
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
     PayloadSpan payload(ObjectHandle handle) const;

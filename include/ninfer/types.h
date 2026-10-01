@@ -19,6 +19,18 @@ namespace ninfer {
 using TokenId = std::int32_t;
 
 inline constexpr std::uint32_t kMaximumConcurrency = 8;
+
+// Tensor-parallel ceiling. ExecutionContext (core/device.h) and the artifact loader size their
+// per-device arrays by this; `tp` itself stays a runtime value in 1..kMaximumDevices, derived from
+// the requested device list. 4 is this machine's width; the degrees with a shard plan are 1, 2, 4.
+inline constexpr std::size_t kMaximumDevices = 4;
+
+// A per-rank array: one slot per tensor-parallel rank, sized by the ceiling rather than by the
+// degree, so a type never encodes `tp` and one code path serves every degree. Only slots [0, tp)
+// are meaningful -- the tail holds default-constructed values, which is why every loop that walks
+// one of these must be driven by `ec.tp` (or by an explicit rank count) and never by `.size()`.
+template <class T>
+using TpArray = std::array<T, kMaximumDevices>;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
@@ -89,9 +101,9 @@ struct LoadProgress {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device = 0;
-    // Tensor-parallel degree: 1 (default, single device) or 2. `tp == 2` splits the resident
-    // model across two CUDA devices and requires `devices` to name exactly two distinct ids of
-    // the same compute capability. It is supported by the 27B execution package (`qwen3.6-27b`,
+    // Tensor-parallel degree: 1 (default, single device), 2, or 4. `tp > 1` splits the resident
+    // model across that many CUDA devices and requires `devices` to name exactly `tp` distinct ids
+    // of the same compute capability. It is supported by the 27B execution package (`qwen3.6-27b`,
     // `qwen3.8-27b`) with `SpeculativeBackend::None` or `Mtp`; `qwen3.6-35b-a3b`,
     // `SpeculativeBackend::DFlash`, and `enable_vision` are rejected at construction. `tp == 1`
     // is bit-identical to the single-device path.
@@ -520,7 +532,7 @@ struct RuntimeStats {
 
 struct LoadSummary {
     int tp = 1;
-    std::array<DeviceMemoryReport, 2> devices{};
+    std::array<DeviceMemoryReport, kMaximumDevices> devices{};
     // Rotary regime resolved at construction. `effective_max_context` is the ceiling `max_context`
     // was validated against (the variant's native capacity under `RopeMode::Native`,
     // `yarn_origin * yarn_factor` under `RopeMode::Yarn`); `yarn_mscale` is the rotary cos/sin

@@ -2,12 +2,19 @@
 
 #include <cuda_runtime.h>
 
+#include "ninfer/types.h" // kMaximumDevices
+
 #include <array>
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <vector>
 
 namespace ninfer {
+
+// src/core/tp_comm.h: per-rank NCCL communicators for tp > 2. Forward declared so this header stays
+// free of nccl.h -- every translation unit includes it.
+class TpComm;
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
@@ -32,17 +39,26 @@ struct DeviceContext {
     void synchronize() const;
 };
 
-// One process, up to two CUDA devices. dev[0..tp-1] hold constructed DeviceContext instances;
-// the remaining slots stay empty. tp == 1 unless the caller opts into `--tp 2`, which runs the
-// tensor-parallel program across both devices.
+// One process, up to kMaximumDevices CUDA devices. dev[0..tp-1] hold constructed DeviceContext
+// instances; the remaining slots stay empty. tp == 1 unless the caller opts into `--tp 2` (or the
+// TP4 degree), which runs the tensor-parallel program across that many devices.
 struct ExecutionContext {
-    std::array<std::optional<DeviceContext>, 2> dev;
+    std::array<std::optional<DeviceContext>, kMaximumDevices> dev;
     int tp = 1;
 
-    // device_ids.size() must be 1 or 2 and becomes tp. Every id is validated to exist by
-    // DeviceContext's own constructor; when two ids are given they must additionally share the
-    // same compute capability (sm major.minor), since nothing downstream can reconcile mismatched
-    // architectures.
+    // Non-null only for tp > 2, and only once TpComm::create() has succeeded. tp == 2 keeps using
+    // the hand-written pull protocol plus PeerEvents, so this stays null there and the collectives
+    // pick their backend from `tp` (see src/ops/common/allreduce.cu).
+    //
+    // shared_ptr rather than unique_ptr on purpose: TpComm is incomplete in this header, and a
+    // shared_ptr erases its deleter at construction (which happens where the type is complete),
+    // whereas unique_ptr would need an out-of-line ExecutionContext destructor.
+    std::shared_ptr<TpComm> comm;
+
+    // device_ids.size() must be in 1..kMaximumDevices and becomes tp. Every id is validated to
+    // exist by DeviceContext's own constructor; when more than one id is given they must
+    // additionally share the same compute capability (sm major.minor), since nothing downstream
+    // can reconcile mismatched architectures.
     explicit ExecutionContext(const std::vector<int>& device_ids);
 
     [[nodiscard]] DeviceContext& primary() noexcept { return *dev[0]; }

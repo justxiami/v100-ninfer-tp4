@@ -516,13 +516,21 @@ using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
 // (24 % 8 == 0, 5120 % 128 == 0).
 using FoldGeometry48x24Tp2 = FoldGeometry<48, 8, 24, 5120>;
 
+// tp4 head/channel shard of FoldGeometry48x48: device r owns value heads [12r,12r+12), qk heads
+// [4r,4r+4) and conv channels [2560r,2560r+2560). The same group-alignment argument the tp2
+// geometry states holds at tp4: local h maps to local h/(12/4) = h/3, which is global
+// (12r+h)/3 = 4r + h/3, the qk head tp1 assigns. Both static_asserts hold (12 % 4 == 0,
+// 2560 % 128 == 0).
+using FoldGeometry48x12Tp4 = FoldGeometry<48, 4, 12, 2560>;
+
 // Every registered fold geometry, in one place, so `launch_replay_fold`'s dispatch chain is
 // generated rather than hand-written: a newly registered geometry must not be left behind in a
 // hand-written switch.
 #define NINFER_GDN_FOLD_GEOMETRIES(X)                                                              \
     X(FoldGeometry48x48)                                                                           \
     X(FoldGeometry30x32)                                                                           \
-    X(FoldGeometry48x24Tp2)
+    X(FoldGeometry48x24Tp2)                                                                        \
+    X(FoldGeometry48x12Tp4)
 
 template <class Geometry>
 struct FoldAccess {

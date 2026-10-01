@@ -69,6 +69,11 @@ void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
 // The tp2 column shard.
 void fp8_gdn_input_a8_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                    Fp8A8Workspace workspace, cudaStream_t stream) {
+    if (weight.n == Fp8GdnInputTp4ColumnGeometry::kOutputRows) {
+        launch_a8<Fp8GdnInputTp4ColumnGeometry, Fp8GdnInputShardOutput<Fp8GdnInputTp4ColumnGeometry>>(
+            x, weight, qkv, z, workspace, stream);
+        return;
+    }
     launch_a8<Fp8GdnInputTp2ColumnGeometry, Fp8GdnInputShardOutput<Fp8GdnInputTp2ColumnGeometry>>(
         x, weight, qkv, z, workspace, stream);
 }

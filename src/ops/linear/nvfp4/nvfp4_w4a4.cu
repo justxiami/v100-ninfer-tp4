@@ -113,6 +113,12 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
     case Nvfp4Activation8704Geometry::kInputRows:
         launch_quantize_exact<Nvfp4Activation8704Geometry>(x, weight, workspace, stream);
         return;
+    case Nvfp4Activation1536Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation1536Geometry>(x, weight, workspace, stream);
+        return;
+    case Nvfp4Activation4352Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation4352Geometry>(x, weight, workspace, stream);
+        return;
     default:
         throw std::invalid_argument("nvfp4 W4A4 quantize: unsupported K");
     }

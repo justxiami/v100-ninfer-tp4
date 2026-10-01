@@ -18,11 +18,13 @@
 #include <ninfer/targets/qwen3_6/round_state.h>
 
 #include <array>
+#include <optional>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <span>
 #include <vector>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
@@ -77,16 +79,10 @@ inline constexpr ModelConfig kCfg{};
 // head-local attention geometry (12 Q : 2 KV, the same 6:1 group ratio as 24:4); the GDN head
 // counts give the head-split recurrent state; `kShardVocab` is one half of the row-split output
 // head. Nothing here divides the hidden/residual axis, which is replicated.
-inline constexpr int kTensorParallelWidth = 2;
-inline constexpr int kShardQHeads         = ModelConfig::n_q / kTensorParallelWidth;
-inline constexpr int kShardKvHeads        = ModelConfig::n_kv / kTensorParallelWidth;
-inline constexpr int kShardQSize          = ModelConfig::q_size / kTensorParallelWidth;
-inline constexpr int kShardKvSize         = ModelConfig::kv_size / kTensorParallelWidth;
-inline constexpr int kShardKeyDim         = ModelConfig::key_dim / kTensorParallelWidth;
-inline constexpr int kShardValueDim       = ModelConfig::value_dim / kTensorParallelWidth;
-inline constexpr int kShardGdnVHeads      = ModelConfig::gdn_v_heads / kTensorParallelWidth;
-inline constexpr int kShardGdnKHeads      = ModelConfig::gdn_k_heads / kTensorParallelWidth;
-inline constexpr int kShardVocab          = ModelConfig::vocab / kTensorParallelWidth;
+// Per-rank shard geometry lives on TextContext (shard_* accessors below): the degree is a
+// runtime property, so the geometry must not be a namespace-scope compile-time constant.
+// A stray `/ 2` near a tensor view is exactly the bug those accessors replaced.
+
 inline constexpr float kAttnScale                     = kAttentionScale;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 
@@ -195,9 +191,43 @@ struct TpExecution {
     const GdnReplayRecords* replay_records    = nullptr;
 
     [[nodiscard]] bool complete() const noexcept {
-        return execution != nullptr && events != nullptr && device != nullptr &&
-               weights != nullptr && work != nullptr && state != nullptr && io != nullptr;
+        // `events` is the tp2 pull protocol's choreography. It is still constructed at any width
+        // > 1 (every collective's signature takes it), but only the pull path reads it, so a
+        // width above two does not require it to be live.
+        const bool events_ok = events != nullptr || (execution != nullptr && execution->tp > 2);
+        return execution != nullptr && events_ok && device != nullptr && weights != nullptr &&
+               work != nullptr && state != nullptr && io != nullptr;
     }
+};
+
+// Every non-zero lane of one tensor-parallel execution, indexed by rank. Empty (all-null) at
+// tp == 1, where the owning TextContext behaves exactly as it did before tensor parallelism.
+using TpPeers = TpArray<std::optional<TpExecution>>;
+
+// One non-zero rank's complete set of bindings -- exactly the peer half of the TextContext below,
+// gathered per rank so the class can drive an arbitrary width. Index by rank; slots at or above the
+// width stay empty. At tp == 2 only `ranks[1]` is populated, which is why every tp2-only path reads
+// exactly as it did when there was a single `peer`.
+struct TextRankBinding {
+    TpExecution execution{};
+    const Weight* embed      = nullptr;
+    const Tensor* final_norm = nullptr;
+    const Weight* lm_head    = nullptr;
+    std::array<FullLayerW, TextConfig::full_attention_layers()> full{};
+    std::array<GdnLayerW, TextConfig::gdn_layers()> gdn{};
+    MtpW mtp{};
+    // This rank's own vocabulary half of the draft head plus its own device copy of the REPLICATED
+    // [131072] id map. Cleared together with rank 0's when the request runs on the full LM head.
+    const Weight* proposal_head           = nullptr;
+    const std::int32_t* proposal_head_ids = nullptr;
+    // Per-call I32 control tensors. A null binding means "the same thing rank 0 has", which is only
+    // ever valid for the empty Tensor{} cases.
+    const Tensor* cache_positions       = nullptr;
+    const Tensor* rope_positions        = nullptr;
+    const Tensor* kv_table_rows         = nullptr;
+    const Tensor* linear_state_slots    = nullptr;
+    const Tensor* valid_columns         = nullptr;
+    const Tensor* backend_kv_table_rows = nullptr;
 };
 
 class TextContext {
@@ -207,30 +237,32 @@ public:
     // silently-defaulted null descriptor is a correct-looking native run at extended positions.
     // `ExecutionCore::rope_frequency` is what every production caller passes.
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
-                const std::array<ops::RopeFrequencyOverride, kTensorParallelWidth>& rope_frequency,
+                const TpArray<ops::RopeFrequencyOverride>& rope_frequency,
                 qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
                 qwen3_6::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                 std::uint32_t text_kv_base,
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr,
-                const TpExecution* tp                      = nullptr);
+                const TpPeers& peers                       = {});
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
     TextContext& operator=(const TextContext&) = delete;
 
-    // Rank 1's half is bound in bind() and cleared here together with rank 0's: the only caller
+    // Every rank's half is bound in bind() and cleared here together with rank 0's: the only caller
     // that passes a null weight is configure_text_card's "this request uses the full LM head"
-    // path, and leaving the peer bound while rank 0 is not would have the two ranks take
-    // different proposal branches.
+    // path, and leaving one rank bound while rank 0 is not would have the ranks take different
+    // proposal branches.
     void set_proposal_head(const Weight* weight, const std::int32_t* ids, int count) noexcept {
         proposal_head_     = weight;
         proposal_head_ids_ = ids;
         proposal_head_n_   = count;
         if (weight == nullptr) {
-            proposal_head_peer_     = nullptr;
-            proposal_head_ids_peer_ = nullptr;
+            for (auto& rank : ranks_) {
+                rank.proposal_head     = nullptr;
+                rank.proposal_head_ids = nullptr;
+            }
         }
     }
 
@@ -309,49 +341,49 @@ public:
     // token, and the proposal leaves through rank 0's egress.
     // Computes the full target vocabulary on both ranks from replicated final-normalized hidden.
     // The caller owns the hidden replicas, output storage, and subsequent sampling.
-    void target_logits(const std::array<Tensor, 2>& hidden,
-                        const std::array<Tensor, 2>& logits);
-    void target_verify_batch(const std::array<Tensor, 2>& ids,
-                             const std::array<Tensor, 2>& cache_positions,
-                             const std::array<Tensor, 2>& rope_positions,
-                             const std::array<Tensor, 2>& valid_columns,
-                             const std::array<Tensor, 2>& kv_table_rows,
-                             const std::array<Tensor, 2>& linear_state_slots,
+    void target_logits(const TpArray<Tensor>& hidden,
+                        const TpArray<Tensor>& logits);
+    void target_verify_batch(const TpArray<Tensor>& ids,
+                             const TpArray<Tensor>& cache_positions,
+                             const TpArray<Tensor>& rope_positions,
+                             const TpArray<Tensor>& valid_columns,
+                             const TpArray<Tensor>& kv_table_rows,
+                             const TpArray<Tensor>& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope,
-                             const std::array<Tensor, 2>& hidden,
-                             const std::array<Tensor, 2>& logits,
-                             const std::array<Tensor, 2>& target_tokens);
-    void target_verify_batch(const std::array<Tensor, 2>& ids,
-                             const std::array<Tensor, 2>& cache_positions,
-                             const std::array<Tensor, 2>& rope_positions,
-                             const std::array<Tensor, 2>& valid_columns,
-                             const std::array<Tensor, 2>& kv_table_rows,
-                             const std::array<Tensor, 2>& linear_state_slots,
+                             const TpArray<Tensor>& hidden,
+                             const TpArray<Tensor>& logits,
+                             const TpArray<Tensor>& target_tokens);
+    void target_verify_batch(const TpArray<Tensor>& ids,
+                             const TpArray<Tensor>& cache_positions,
+                             const TpArray<Tensor>& rope_positions,
+                             const TpArray<Tensor>& valid_columns,
+                             const TpArray<Tensor>& kv_table_rows,
+                             const TpArray<Tensor>& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope,
-                             const std::array<Tensor, 2>& hidden,
-                             const std::array<Tensor, 2>& logits,
-                             const std::array<Tensor, 2>& target_tokens,
+                             const TpArray<Tensor>& hidden,
+                             const TpArray<Tensor>& logits,
+                             const TpArray<Tensor>& target_tokens,
                              DFlashFeatureSink& sink);
-    void mtp_forward_decode_batch(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                                  const std::array<Tensor, 2>& cache_positions,
-                                  const std::array<Tensor, 2>& rope_positions,
-                                  const std::array<Tensor, 2>& valid_columns,
-                                  const std::array<Tensor, 2>& kv_table_rows,
+    void mtp_forward_decode_batch(const Tensor& ids, const TpArray<Tensor>& hidden,
+                                  const TpArray<Tensor>& cache_positions,
+                                  const TpArray<Tensor>& rope_positions,
+                                  const TpArray<Tensor>& valid_columns,
+                                  const TpArray<Tensor>& kv_table_rows,
                                   ops::GqaExecutionEnvelope envelope,
-                                  const std::array<Tensor, 2>& mtp_hidden);
-    void mtp_propose_batch(const std::array<Tensor, 2>& hidden,
-                           const std::array<Tensor, 2>& logits, Tensor& draft_tokens);
-    void mtp_forward_batch(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                           const std::array<Tensor, 2>& positions,
-                           const std::array<Tensor, 2>& rope_positions,
+                                  const TpArray<Tensor>& mtp_hidden);
+    void mtp_propose_batch(const TpArray<Tensor>& hidden,
+                           const TpArray<Tensor>& logits, Tensor& draft_tokens);
+    void mtp_forward_batch(const Tensor& ids, const TpArray<Tensor>& hidden,
+                           const TpArray<Tensor>& positions,
+                           const TpArray<Tensor>& rope_positions,
                            ops::GqaExecutionEnvelope envelope,
-                           const std::array<Tensor, 2>& mtp_hidden, int logits_column,
-                           const std::array<Tensor, 2>* logits, Tensor* draft_token);
-    void mtp_forward_ar_step(const Tensor& token, const std::array<Tensor, 2>& previous_hidden,
-                             const std::array<Tensor, 2>& position,
+                           const TpArray<Tensor>& mtp_hidden, int logits_column,
+                           const TpArray<Tensor>* logits, Tensor* draft_token);
+    void mtp_forward_ar_step(const Tensor& token, const TpArray<Tensor>& previous_hidden,
+                             const TpArray<Tensor>& position,
                              ops::GqaExecutionEnvelope envelope,
-                             const std::array<Tensor, 2>& mtp_hidden,
-                             const std::array<Tensor, 2>& logits, Tensor& draft_token);
+                             const TpArray<Tensor>& mtp_hidden,
+                             const TpArray<Tensor>& logits, Tensor& draft_token);
 private:
     void bind();
 
@@ -371,17 +403,100 @@ private:
     // residual `x` is REPLICATED (bitwise identical on both ranks -- the reduce sums the same two
     // BF16 partials on both sides and IEEE addition is commutative), which is what keeps every
     // per-device GDN state and KV page in lockstep without any extra synchronization.
-    [[nodiscard]] bool tp2() const noexcept { return tp_ != nullptr; }
+    [[nodiscard]] bool tp2() const noexcept { return tp_count_ > 1; }
     [[nodiscard]] const ExecutionContext& ec() const;
-    [[nodiscard]] std::array<WorkspaceArena*, 2> workspaces() const;
+    [[nodiscard]] std::int32_t rank_count() const noexcept { return tp_count_; }
+    [[nodiscard]] const TextRankBinding& rank_binding(int rank) const noexcept {
+        return ranks_[static_cast<std::size_t>(rank)];
+    }
+    // The PeerEvents every collective's signature takes. Constructed for any width above one; only
+    // the tp2 pull path reads it, so a wider run may leave `live()` false.
+    [[nodiscard]] const ops::PeerEvents& peer_events() const;
+    // Per-rank shard views. Each is a rank-indexed array of the same objects the owning `*_`
+    // members name for rank 0, so an op that takes a TpArray receives a complete argument list at
+    // any width -- there is no remaining place where "exactly two" is implied.
+    [[nodiscard]] TpArray<const Weight*> embed_weights() const;
+    [[nodiscard]] TpArray<const Tensor*> final_norms() const;
+    [[nodiscard]] TpArray<Weight> lm_heads() const;
+    [[nodiscard]] TpArray<const FullLayerW*> full_layers(int index) const;
+    [[nodiscard]] TpArray<const GdnLayerW*> gdn_layers(int index) const;
+    [[nodiscard]] TpArray<const FullAttentionProjectionWeights*> attention_projections(int index) const;
+    [[nodiscard]] TpArray<Weight> attention_output_weights(int index) const;
+    [[nodiscard]] TpArray<const GdnProjectionWeights*> gdn_projections(int index) const;
+    [[nodiscard]] TpArray<Weight> gdn_output_weights(int index) const;
+    [[nodiscard]] TpArray<const MlpWeights*> full_post_mixers(int index) const;
+    [[nodiscard]] TpArray<const MlpWeights*> gdn_post_mixers(int index) const;
+    [[nodiscard]] TpArray<Weight> proposal_heads() const;
+    [[nodiscard]] TpArray<const std::int32_t*> proposal_head_id_maps() const;
+    // Per-rank views of the MTP weight objects the split leaves take (one entry per live rank).
+    [[nodiscard]] TpArray<const typename Variant::MtpAttentionProjectionWeights*>
+    mtp_attention_weights() const;
+    [[nodiscard]] TpArray<Weight> mtp_output_weights() const;
+    [[nodiscard]] TpArray<const typename Variant::MtpPostMixerWeights*>
+    mtp_post_mixer_weights() const;
+    // Each rank's attention output viewed as [shard_q_size, T].
+    [[nodiscard]] TpArray<Tensor> attention_flat(const TpArray<Tensor>& a,
+                                                 std::int32_t tokens) const;
+    [[nodiscard]] TpArray<qwen3_6::RoundState*> rank_ios() const;
+    [[nodiscard]] TpArray<LinearAttentionStatePool*> rank_states() const;
+    // The per-rank transient scopes a layer/mixer call holds for its duration. `WorkspaceArena::Scope`
+    // is movable but neither copyable nor default-constructible, so the array is optional-held.
+    using RankScopes = std::array<std::optional<WorkspaceArena::Scope>, kMaximumDevices>;
+    [[nodiscard]] RankScopes rank_scopes() const;
+
+    // --- per-rank shard geometry ---------------------------------------------------------------
+    // The single source of every per-rank extent. These were compile-time constants divided by a
+    // kTensorParallelWidth of 2, which silently reshards every tensor the moment the degree changes
+    // (a tp4 context holding 2-way views is not a compile error, it is a wrong answer).
+    [[nodiscard]] int shard_q_heads() const noexcept { return ModelConfig::n_q / ec().tp; }
+    [[nodiscard]] int shard_kv_heads() const noexcept { return ModelConfig::n_kv / ec().tp; }
+    [[nodiscard]] int shard_q_size() const noexcept { return ModelConfig::q_size / ec().tp; }
+    [[nodiscard]] int shard_kv_size() const noexcept { return ModelConfig::kv_size / ec().tp; }
+    [[nodiscard]] int shard_key_dim() const noexcept { return ModelConfig::key_dim / ec().tp; }
+    [[nodiscard]] int shard_value_dim() const noexcept { return ModelConfig::value_dim / ec().tp; }
+    [[nodiscard]] int shard_gdn_v_heads() const noexcept {
+        return ModelConfig::gdn_v_heads / ec().tp;
+    }
+    [[nodiscard]] int shard_gdn_k_heads() const noexcept {
+        return ModelConfig::gdn_k_heads / ec().tp;
+    }
+    [[nodiscard]] int shard_vocab() const noexcept { return ModelConfig::vocab / ec().tp; }
+    [[nodiscard]] TpArray<WorkspaceArena*> workspaces() const;
     [[nodiscard]] cudaStream_t stream_for(int rank) const noexcept {
-        return rank == 0 ? ctx_.stream : tp_->device->stream;
+        return rank == 0 ? ctx_.stream
+                         : ranks_[static_cast<std::size_t>(rank)].execution.device->stream;
     }
     [[nodiscard]] qwen3_6::RoundState& io_for(int rank) const noexcept {
-        return rank == 0 ? io_ : *tp_->io;
+        return rank == 0 ? io_ : *ranks_[static_cast<std::size_t>(rank)].execution.io;
     }
     [[nodiscard]] LinearAttentionStatePool& state_for(int rank) const noexcept {
-        return rank == 0 ? state_ : *tp_->state;
+        return rank == 0 ? state_ : *ranks_[static_cast<std::size_t>(rank)].execution.state;
+    }
+    // Replicated per-rank bindings (the embedding table, the final norm) plus the per-rank draft
+    // head that is cleared together with rank 0's when the request uses the full LM head.
+    [[nodiscard]] const Weight& rank_embed(int rank) const noexcept {
+        return rank == 0 ? *embed_ : *ranks_[static_cast<std::size_t>(rank)].embed;
+    }
+    [[nodiscard]] const Tensor& rank_final_norm(int rank) const noexcept {
+        return rank == 0 ? *final_norm_ : *ranks_[static_cast<std::size_t>(rank)].final_norm;
+    }
+    [[nodiscard]] const Weight& rank_proposal_head(int rank) const noexcept {
+        return rank == 0 ? *proposal_head_
+                         : *ranks_[static_cast<std::size_t>(rank)].proposal_head;
+    }
+    [[nodiscard]] const Tensor& rank_prefill_hidden(int rank) const noexcept {
+        return *ranks_[static_cast<std::size_t>(rank)].execution.prefill_hidden;
+    }
+    [[nodiscard]] const qwen3_6::PagedKVCache& rank_batch_kv(int rank) const noexcept {
+        return rank == 0 ? *batch_text_kv_
+                         : *ranks_[static_cast<std::size_t>(rank)].execution.batch_kv;
+    }
+    [[nodiscard]] const qwen3_6::PagedKVCache& rank_batch_mtp_kv(int rank) const noexcept {
+        return rank == 0 ? *batch_mtp_kv_
+                         : *ranks_[static_cast<std::size_t>(rank)].execution.batch_mtp_kv;
+    }
+    [[nodiscard]] qwen3_6::PagedKVCacheView rank_mtp_kv(int rank) const noexcept {
+        return rank == 0 ? mtp_kv_ : ranks_[static_cast<std::size_t>(rank)].execution.mtp_kv;
     }
     // Rank 1's own device copies of the per-call I32 control tensors. Rank 0 keeps using the
     // existing `active_*` bindings unchanged; these are their mirrors, set by the same call that
@@ -394,20 +509,19 @@ private:
     [[nodiscard]] Tensor rank_valid_columns(int rank) const;
     [[nodiscard]] const Tensor& rank_linear_state_slots(int rank) const;
     void synchronize_all() const;
-    void attn_mix_tp2(const FullLayerW& w0, const FullLayerW& w1, std::array<Tensor, 2>& x,
-                      int index, Phase phase, const std::array<Tensor, 2>& staging);
-    void gdn_mix_tp2(const GdnLayerW& w0, const GdnLayerW& w1, std::array<Tensor, 2>& x, int index,
-                     Phase phase, const std::array<Tensor, 2>& staging);
-    void mlp_tail_tp2(const Tensor* post_norm_0, const Tensor* post_norm_1, const MlpW& m0,
-                      const MlpW& m1, std::array<Tensor, 2>& x, Phase phase,
-                      const std::array<Tensor, 2>& staging);
-    void run_layers_tp2(std::array<Tensor, 2>& x, Phase phase,
-                        const std::array<Tensor, 2>& staging,
+    // Resets every non-zero rank's transient workspace (rank 0's is `work_`, reset separately).
+    void reset_peer_workspaces() const;
+    void attn_mix_tp2(TpArray<Tensor>& x, int index, Phase phase,
+                      const TpArray<Tensor>& staging);
+    void gdn_mix_tp2(TpArray<Tensor>& x, int index, Phase phase, const TpArray<Tensor>& staging);
+    void mlp_tail_tp2(TpArray<Tensor>& x, int index, bool full_attention, Phase phase,
+                      const TpArray<Tensor>& staging);
+    void run_layers_tp2(TpArray<Tensor>& x, Phase phase,
+                        const TpArray<Tensor>& staging,
                         DFlashFeatureSink* dflash_sink = nullptr);
     // Vocabulary-split head: each rank computes its own half of the logits, then one allgather
     // per column leaves the FULL logits on both ranks. Sampling then runs on rank 0 alone.
-    void logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits,
-                    Tensor& peer_logits);
+    void logits_tp2(const TpArray<Tensor>& hidden, const TpArray<Tensor>& logits);
     void ordinary_decode_batch_tp2(const Tensor& ids, const Tensor& cache_positions,
                                    const Tensor& rope_positions, const Tensor& kv_table_rows,
                                    const Tensor& linear_state_slots,
@@ -423,26 +537,26 @@ private:
     // call's reduces exactly as the text layer loop reuses its own.
     // `ids` is rank 0's alone: rank 0's fc shard contracts the NORMALIZED EMBEDDING half and
     // rank 1's the NORMALIZED HIDDEN half, so device 1 never embeds a token in the MTP stem.
-    void mtp_forward_stem_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                              std::array<Tensor, 2>& x, std::array<Tensor, 2>& ah,
-                              const std::array<Tensor, 2>& staging);
-    void mtp_forward_tail_tp2(std::array<Tensor, 2>& x, const std::array<Tensor, 2>& ah,
-                              const std::array<Tensor, 2>& positions,
-                              const std::array<Tensor, 2>& rope_positions,
+    void mtp_forward_stem_tp2(const Tensor& ids, const TpArray<Tensor>& hidden,
+                              TpArray<Tensor>& x, TpArray<Tensor>& ah,
+                              const TpArray<Tensor>& staging);
+    void mtp_forward_tail_tp2(TpArray<Tensor>& x, const TpArray<Tensor>& ah,
+                              const TpArray<Tensor>& positions,
+                              const TpArray<Tensor>& rope_positions,
                               ops::GqaExecutionEnvelope envelope,
-                              const std::array<Tensor, 2>& mtp_hidden,
-                              const std::array<Tensor, 2>& staging);
-    void mtp_forward_core_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                              const std::array<Tensor, 2>& positions,
-                              const std::array<Tensor, 2>& rope_positions,
+                              const TpArray<Tensor>& mtp_hidden,
+                              const TpArray<Tensor>& staging);
+    void mtp_forward_core_tp2(const Tensor& ids, const TpArray<Tensor>& hidden,
+                              const TpArray<Tensor>& positions,
+                              const TpArray<Tensor>& rope_positions,
                               ops::GqaExecutionEnvelope envelope,
-                              const std::array<Tensor, 2>& mtp_hidden);
-    void mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                               const std::array<Tensor, 2>& positions,
-                               const std::array<Tensor, 2>& rope_positions,
+                              const TpArray<Tensor>& mtp_hidden);
+    void mtp_prefill_chunk_tp2(const Tensor& ids, const TpArray<Tensor>& hidden,
+                               const TpArray<Tensor>& positions,
+                               const TpArray<Tensor>& rope_positions,
                                ops::GqaExecutionEnvelope envelope, bool final_chunk,
-                               const std::array<Tensor, 2>* final_hidden,
-                               const std::array<Tensor, 2>* logits, Tensor* draft_token);
+                               const TpArray<Tensor>* final_hidden,
+                               const TpArray<Tensor>* logits, Tensor* draft_token);
     // Vocabulary-split proposal head: each rank computes its own half of the proposal logits and
     // one allgather leaves the FULL vector on both, because the winning row is a GLOBAL argmax
     // that can land in either half and `draft_head_token_ids` is replicated for exactly that
@@ -453,8 +567,8 @@ private:
     // AR proposal steps, feeds only rank 0's MTP stem (rank 1's stem contracts the hidden half
     // and never embeds a token). The gather still lands on both ranks because `allgather_rows`
     // writes both destinations; rank 1's copy is simply not read.
-    void proposal_argmax_tp2(const std::array<Tensor, 2>& hidden,
-                             const std::array<Tensor, 2>& logits, Tensor& proposal_tokens);
+    void proposal_argmax_tp2(const TpArray<Tensor>& hidden,
+                             const TpArray<Tensor>& logits, Tensor& proposal_tokens);
     [[nodiscard]] const MtpW& mtp_weights_for(int rank) const;
     [[nodiscard]] const GdnReplayRecords* replay_records_for(int rank) const;
     template <class Tap>
@@ -548,16 +662,13 @@ private:
     // yarn's mscale is entirely a rope-path effect (`ops::RopeFrequencyOverride::mscale`) and
     // there is no attention-side factor, so `kAttnScale` never depends on `rope_frequency_`. See
     // `src/targets/qwen3_6/impl/runtime/yarn_rope.h` for the full account.
-    std::array<ops::RopeFrequencyOverride, kTensorParallelWidth> rope_frequency_{};
+    TpArray<ops::RopeFrequencyOverride> rope_frequency_{};
 
-    const TpExecution* tp_                       = nullptr;
-    const Tensor* peer_cache_positions_          = nullptr;
-    const Tensor* peer_rope_positions_           = nullptr;
-    const Tensor* peer_kv_table_rows_            = nullptr;
-    const Tensor* peer_linear_state_slots_       = nullptr;
-    const Tensor* peer_valid_columns_            = nullptr;
-
-    const Tensor* peer_backend_kv_table_rows_    = nullptr;
+    // Every non-zero rank's bindings, indexed by RANK. `tp_count_` is the width; rank 0 lives in
+    // the `*_` members below. At tp == 1 the array is untouched and every accessor below returns
+    // rank 0's own binding, which is exactly the pre-tensor-parallel behavior.
+    std::array<TextRankBinding, kMaximumDevices> ranks_{};
+    std::int32_t tp_count_                      = 1;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;
@@ -569,18 +680,6 @@ private:
     MtpW mtp_;
     std::array<FullLayerW, TextConfig::full_attention_layers()> full_{};
     std::array<GdnLayerW, TextConfig::gdn_layers()> gdn_{};
-    // Rank 1's own shard bindings; populated only at tp == 2.
-    const Weight* embed_peer_      = nullptr;
-    const Tensor* final_norm_peer_ = nullptr;
-    const Weight* lm_head_peer_    = nullptr;
-    std::array<FullLayerW, TextConfig::full_attention_layers()> full_peer_{};
-    std::array<GdnLayerW, TextConfig::gdn_layers()> gdn_peer_{};
-    MtpW mtp_peer_{};
-    // Rank 1's own vocabulary half of the draft head plus its own device copy of the REPLICATED
-    // [131072] id map. Both are cleared together with rank 0's when the request runs on the full
-    // LM head instead (`set_proposal_head(nullptr, ...)`).
-    const Weight* proposal_head_peer_             = nullptr;
-    const std::int32_t* proposal_head_ids_peer_   = nullptr;
     std::array<Weight, TextConfig::gdn_layers()> gdn_in_a_{};
     std::array<Weight, TextConfig::gdn_layers()> gdn_in_b_{};
     std::array<Tensor, TextConfig::gdn_layers()> gdn_conv1d_views_{};

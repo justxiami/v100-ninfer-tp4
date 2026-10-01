@@ -63,10 +63,15 @@ template <bool TiledGdn>
 __device__ __forceinline__ int input_column(int column, int k) {
     if constexpr (!TiledGdn) { return column; }
     const int head = column / 128;
-    // The registered full and TP2 shapes have 16 and 8 key heads respectively.
-    // Explicit powers of two avoid runtime integer division in every load.
-    const int grouped = k == 3072 ? (head & 7) * 3 + (head >> 3)
-                                  : (head & 15) * 3 + (head >> 4);
+    // The registered widths have 16, 8 and 4 key heads (K = 6144, 3072, 1536 -- the GDN output
+    // projection's input extent is 48 value heads at tp1, divided by the width). Each key head
+    // owns THREE consecutive 128-column value-head blocks, so value head `head` belongs to key
+    // head `head / 3` and sits at position `head % 3` inside it -- which is exactly
+    // `(head % key_heads) * 3 + head / key_heads` for the interleaved input order. Explicit
+    // powers of two keep that out of every load's address arithmetic.
+    const int grouped = k == 1536   ? (head & 3) * 3 + (head >> 2)
+                        : k == 3072 ? (head & 7) * 3 + (head >> 3)
+                                    : (head & 15) * 3 + (head >> 4);
     return grouped * 128 + (column & 127);
 }
 
@@ -443,8 +448,9 @@ void ggml_k_project_split(const Tensor& x, const Weight& weight, const Tensor* o
                           int count, bool add, cudaStream_t stream, bool tiled_gdn_input,
                           WorkspaceArena* workspace) {
     if (tiled_gdn_input) {
-        if (weight.k != 6144 && weight.k != 3072) {
-            throw std::invalid_argument("GGML K GDN output requires K=6144 or TP2 K=3072");
+        if (weight.k != 6144 && weight.k != 3072 && weight.k != 1536) {
+            throw std::invalid_argument(
+                "GGML K GDN output requires K = 6144 (tp1), 3072 (tp2) or 1536 (tp4)");
         }
         project<true>(x, weight, outputs, count, add, stream, workspace);
     } else {

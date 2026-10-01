@@ -118,8 +118,17 @@ void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
 void nvfp4_attn_input_w4a4_launch_shard(const Tensor& x, const Weight& weight, Tensor& q,
                                         Tensor& gate, Tensor& k, Tensor& v,
                                         Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
-    w4a4_launch<Nvfp4AttnInputTp2ColumnGeometry>(x, weight, q, gate, k, v, workspace, stream,
-                                                 &launch_nvfp4_w4a4_tma_attention_shard);
+    if (weight.n == Nvfp4AttnInputTp2ColumnGeometry::kOutputRows) {
+        w4a4_launch<Nvfp4AttnInputTp2ColumnGeometry>(x, weight, q, gate, k, v, workspace, stream,
+                                                     &launch_nvfp4_w4a4_tma_attention_shard);
+        return;
+    }
+    if (weight.n == Nvfp4AttnInputTp4ColumnGeometry::kOutputRows) {
+        w4a4_launch<Nvfp4AttnInputTp4ColumnGeometry>(x, weight, q, gate, k, v, workspace, stream,
+                                                     &launch_nvfp4_w4a4_tma_attention_shard_tp4);
+        return;
+    }
+    throw std::invalid_argument("nvfp4 attn_input_proj column-parallel: unsupported shard rows");
 }
 
 } // namespace ninfer::ops::detail

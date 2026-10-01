@@ -152,11 +152,22 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan,
         throw std::invalid_argument(
             "loaded model shard width does not match the execution context");
     }
-    const detail::RuntimeModelView* peer =
-        data.runtime_peer.has_value() ? &*data.runtime_peer : nullptr;
-    return qwen3_6::create_program<detail::Variant>(data.runtime, peer,
-                                                   model.impl_->weights_profile, std::move(plan),
-                                                   execution);
+    // One model view per rank, INDEXED BY RANK: slot 0 is the owning view (passed separately) and
+    // every slot r > 0 names rank r's own shard view, which the loader already built. The program
+    // layer re-checks the span's size against the execution width.
+    std::array<const detail::RuntimeModelView*, kMaximumDevices> peer_models{};
+    for (int rank = 1; rank < data.tp; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        if (!data.runtime_peers[slot].has_value()) {
+            throw std::invalid_argument("loaded model has no shard view for rank " +
+                                        std::to_string(rank));
+        }
+        peer_models[slot] = &*data.runtime_peers[slot];
+    }
+    return qwen3_6::create_program<detail::Variant>(
+        data.runtime, std::span<const detail::RuntimeModelView* const>(peer_models.data(),
+                                                                      static_cast<std::size_t>(data.tp)),
+        model.impl_->weights_profile, std::move(plan), execution);
 }
 
 } // namespace ninfer::targets::qwen3_6_27b

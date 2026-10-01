@@ -55,16 +55,19 @@ void mtp_split_attn_in(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate
     require_bf16_contiguous_nonnull(v, op, "v");
     const std::int32_t tokens = attn_in.ne[1];
     if (tokens <= 0) { throw std::invalid_argument("mtp_split_attn_in: T must be positive"); }
-    // Two registered row geometries: the tp1 object [14336,T] with 24 query/gate and 4 key/value
-    // heads, and its tp == 2 shard [7168,T] with 12 and 2 -- see kMtpAttnRowsTp2 in
-    // src/ops/kernel/mtp_pack.cuh for how the ShardPlan produces that section layout, and
-    // include/ninfer/ops/mtp_pack.h for the head-locality contract.
-    const bool shard = attn_in.ne[0] == 7168;
-    if (attn_in.ne[0] != 14336 && !shard) {
-        throw std::invalid_argument("mtp_split_attn_in: unregistered attn_in row geometry");
+    // Registered row geometries: the tp1 object [14336,T] with 24 query/gate and 4 key/value
+    // heads, and its tp == 2 [7168] and tp == 4 [3584] shards with 12|2 and 6|1 -- see
+    // kMtpAttnRowsTp2 / kMtpAttnRowsTp4 in src/ops/kernel/mtp_pack.cuh for how the ShardPlan
+    // produces those section layouts, and include/ninfer/ops/mtp_pack.h for the head-locality
+    // contract.
+    const std::int32_t rows = attn_in.ne[0];
+    const std::int32_t q_heads =
+        rows == 7168 ? 12 : rows == 3584 ? 6 : rows == 14336 ? 24 : 0;
+    const std::int32_t kv_heads = q_heads == 24 ? 4 : q_heads == 12 ? 2 : q_heads == 6 ? 1 : 0;
+    if (q_heads == 0) {
+        throw std::invalid_argument("mtp_split_attn_in: unregistered attn_in row geometry (rows=" +
+                                    std::to_string(rows) + ")");
     }
-    const std::int32_t q_heads  = shard ? 12 : 24;
-    const std::int32_t kv_heads = shard ? 2 : 4;
     require_shape(attn_in, attn_in.ne[0], tokens, op, "attn_in");
     if (q.ne[0] != 256 || q.ne[1] != q_heads || q.ne[2] != tokens || q.ne[3] != 1) {
         throw std::invalid_argument("mtp_split_attn_in: invalid shape for q");

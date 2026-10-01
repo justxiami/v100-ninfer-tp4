@@ -46,15 +46,35 @@ static_assert(Fp8GdnInputOutput::kRows == 16384);
 static_assert((Fp8GdnInputOutput::kQkvRows % 128) == 0);
 static_assert((Fp8GdnInputOutput::kZRows % 128) == 0);
 
-// The tp2 column shard's own 2-tensor output (this device's Q|K|V packed into qkv,
-// this device's Z into z), Geometry-parameterized -- exactly the same interior boundary rule
-// derived for NVFP4 in nvfp4_gdn_input_output.cuh (Q and K are both key_dim rows, V and Z are
-// both value_dim rows). Only the shard Geometry is registered here; FP8 is not optional for this
-// object -- it is the flagship Qwen38Nvfp4 profile's own binding for `gdn/query_key_value_z`.
+// Per-geometry key/value section rows -- the one place a width is registered for this family.
 template <class Geometry>
-struct Fp8GdnInputShardOutput {
+struct Fp8GdnInputSections;
+
+template <>
+struct Fp8GdnInputSections<Fp8GdnInputGeometry> {
+    static constexpr std::int32_t kKeyRows   = 2048;
+    static constexpr std::int32_t kValueRows = 6144;
+};
+
+template <>
+struct Fp8GdnInputSections<Fp8GdnInputTp2ColumnGeometry> {
     static constexpr std::int32_t kKeyRows   = 1024;
     static constexpr std::int32_t kValueRows = 3072;
+};
+
+template <>
+struct Fp8GdnInputSections<Fp8GdnInputTp4ColumnGeometry> {
+    static constexpr std::int32_t kKeyRows   = 512;
+    static constexpr std::int32_t kValueRows = 1536;
+};
+
+// The column shard's own 2-tensor output (this device's Q|K|V packed into qkv, this device's Z
+// into z), Geometry-parameterized -- exactly the same interior boundary rule derived for NVFP4 in
+// nvfp4_gdn_input_output.cuh (Q and K are both key_dim rows, V and Z are both value_dim rows).
+template <class Geometry>
+struct Fp8GdnInputShardOutput {
+    static constexpr std::int32_t kKeyRows   = Fp8GdnInputSections<Geometry>::kKeyRows;
+    static constexpr std::int32_t kValueRows = Fp8GdnInputSections<Geometry>::kValueRows;
     static constexpr std::int32_t kQkvRows   = 2 * kKeyRows + kValueRows;
     static constexpr std::int32_t kZRows     = kValueRows;
 

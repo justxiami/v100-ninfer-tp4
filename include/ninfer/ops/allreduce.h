@@ -81,6 +81,7 @@
 
 #include <array>
 #include <cstddef>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::ops {
 
@@ -100,8 +101,8 @@ namespace ninfer::ops {
 // none of this setup is graph-capturable or belongs in a hot path. A non-TP2 context returns false.
 bool enable_peer_access(const ExecutionContext& ec);
 
-// The reusable cross-device ordering events: two per device, created on that device with timing
-// disabled.
+// The reusable cross-device ordering events: two per rank, created on that rank's device with
+// timing disabled (tp == 2 only in practice; see live()).
 //
 //   inputs_ready(r) - recorded on rank r's stream once the inputs rank r contributes are complete;
 //                     the peer waits on it before reading them.
@@ -132,14 +133,24 @@ public:
     }
 
     // False for a moved-from instance.
+    // True when every rank in [0, tp()) has both events. tp is 2 for the pull transport, which is
+    // the only consumer of these events; the tp > 2 path constructs them so the collective
+    // signatures stay uniform but never waits on them (NCCL sequences itself inside its kernels).
     [[nodiscard]] bool live() const noexcept {
-        return inputs_ready_[0] != nullptr && inputs_ready_[1] != nullptr &&
-               pull_done_[0] != nullptr && pull_done_[1] != nullptr;
+        for (int rank = 0; rank < tp_; ++rank) {
+            const std::size_t slot = static_cast<std::size_t>(rank);
+            if (inputs_ready_[slot] == nullptr || pull_done_[slot] == nullptr) { return false; }
+        }
+        return tp_ >= 2;
     }
 
+    // Number of ranks this instance holds events for.
+    [[nodiscard]] int tp() const noexcept { return tp_; }
+
 private:
-    std::array<cudaEvent_t, 2> inputs_ready_{nullptr, nullptr};
-    std::array<cudaEvent_t, 2> pull_done_{nullptr, nullptr};
+    TpArray<cudaEvent_t> inputs_ready_{};
+    TpArray<cudaEvent_t> pull_done_{};
+    int tp_ = 0;
 };
 
 /**
@@ -162,7 +173,7 @@ private:
  * Requires `ec.tp == 2` and a live `events`. Consecutive calls sharing the same arguments need no
  * host synchronization between them.
  */
-void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
+void allreduce_sum(const TpArray<Tensor>& buffer, const TpArray<Tensor>& staging,
                    const ExecutionContext& ec, const PeerEvents& events);
 
 /**
@@ -187,7 +198,7 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
  * Requires `ec.tp == 2` and a live `events`. Consecutive calls sharing the same arguments need no
  * host synchronization between them.
  */
-void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<Tensor, 2>& part,
+void allgather_rows(const TpArray<Tensor>& destination, const TpArray<Tensor>& part,
                     const ExecutionContext& ec, const PeerEvents& events);
 
 /**
@@ -197,7 +208,7 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
  * The source lifetime edge still orders rank 1 after rank 0 has finished importing its shard,
  * so the same work buffers may be reused by the next graph round.
  */
-void gather_columns_rank0(const Tensor& destination, const std::array<Tensor, 2>& part,
+void gather_columns_rank0(const Tensor& destination, const TpArray<Tensor>& part,
                           const ExecutionContext& ec, const PeerEvents& events);
 
 // Exact one-way relocation from rank 0 to rank 1. Both tensors have the same contiguous

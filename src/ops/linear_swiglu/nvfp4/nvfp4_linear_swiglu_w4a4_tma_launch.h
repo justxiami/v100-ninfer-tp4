@@ -22,4 +22,12 @@ void launch_nvfp4_linear_swiglu_w4a4_tma_shard(const std::uint8_t* activation_co
                                                __nv_bfloat16* output, std::int32_t tokens,
                                                float alpha, cudaStream_t stream);
 
+// The tp4 column-shard sibling (Nvfp4MlpGateUpTp4ColumnGeometry, 8704x5120).
+void launch_nvfp4_linear_swiglu_w4a4_tma_shard_tp4(const std::uint8_t* activation_codes,
+                                                   const std::uint8_t* activation_scales,
+                                                   const std::uint8_t* weight_codes,
+                                                   const std::uint8_t* weight_scales,
+                                                   __nv_bfloat16* output, std::int32_t tokens,
+                                                   float alpha, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

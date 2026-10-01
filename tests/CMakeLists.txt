@@ -331,6 +331,14 @@ ninfer_add_op_test(ninfer_rope_yarn_test
 
 # Cross-device collectives. The suite needs two CUDA devices in one process and reports the
 # shared skip code when fewer are visible.
+ninfer_add_op_test(ninfer_tp4_issue_probe
+  SOURCES ops/test_tp4_issue_probe.cpp
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_allreduce_nccl4_test
+  SOURCES ops/test_allreduce_nccl4.cpp
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_allreduce_test
   SOURCES ops/test_allreduce.cpp
   LIBRARIES ninfer_ops)

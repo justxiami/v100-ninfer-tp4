@@ -43,6 +43,10 @@ constexpr auto kLaunchersShard = make_launchers<
     Nvfp4GdnInputTp2ColumnGeometry, Nvfp4GdnInputShardOutput<Nvfp4GdnInputTp2ColumnGeometry>>(
     std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
 
+constexpr auto kLaunchersShardTp4 = make_launchers<
+    Nvfp4GdnInputTp4ColumnGeometry, Nvfp4GdnInputShardOutput<Nvfp4GdnInputTp4ColumnGeometry>>(
+    std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+
 } // namespace
 
 void nvfp4_gdn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -53,7 +57,15 @@ void nvfp4_gdn_input_small_t_launch(const Tensor& x, const Weight& weight, Tenso
 // The tp2 column shard.
 void nvfp4_gdn_input_small_t_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
                                           Tensor& z, cudaStream_t stream) {
-    kLaunchersShard[x.ne[1] - kNvfp4FirstSmallT](x, weight, qkv, z, stream);
+    if (weight.n == Nvfp4GdnInputTp2ColumnGeometry::kOutputRows) {
+        kLaunchersShard[x.ne[1] - kNvfp4FirstSmallT](x, weight, qkv, z, stream);
+        return;
+    }
+    if (weight.n == Nvfp4GdnInputTp4ColumnGeometry::kOutputRows) {
+        kLaunchersShardTp4[x.ne[1] - kNvfp4FirstSmallT](x, weight, qkv, z, stream);
+        return;
+    }
+    throw std::invalid_argument("nvfp4 gdn_input_proj column-parallel: unsupported shard rows");
 }
 
 } // namespace ninfer::ops::detail

@@ -6,6 +6,7 @@
 #include <array>
 #include <limits>
 #include <stdexcept>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::ops::detail {
 namespace {

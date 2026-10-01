@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/memory.cuh"
+#include "ops/linear/fp8/fp8_config.h" // the registered attention-input shard geometries
 
 #include <cuda_bf16.h>
 
@@ -54,16 +55,39 @@ struct Fp8AttentionInputOutput {
     }
 };
 
-// attn_input_proj's own tp2 column shard output -- each device's own head-local
-// Q|K|Gate|V sections (query/gate rows halved to 3072, key/value rows halved to 512), Geometry-
-// parameterized the same way fp8_gdn_input_output.cuh's Fp8GdnInputShardOutput<Geometry> is for
-// its sibling family. The tp1-named Fp8AttentionInputOutput struct above is kept exactly as it
-// was -- every existing tp1 call site continues to build the identical 4-tensor aggregate.
+// Per-geometry Q/K section rows, the one place a width is registered. The tp1 struct above keeps
+// its own constants (it is the unparameterized reference layout); the shard output below and the
+// cutlass split kernel both read this, so registering a width cannot leave one of them behind.
+template <class Geometry>
+struct Fp8AttnInputSections;
+
+template <>
+struct Fp8AttnInputSections<Fp8AttnInputGeometry> {
+    static constexpr std::int32_t kQueryRows = kFp8AttnInputQueryRows;
+    static constexpr std::int32_t kKeyRows   = kFp8AttnInputKeyRows;
+};
+
+template <>
+struct Fp8AttnInputSections<Fp8AttnInputTp2ColumnGeometry> {
+    static constexpr std::int32_t kQueryRows = 3072;
+    static constexpr std::int32_t kKeyRows   = 512;
+};
+
+template <>
+struct Fp8AttnInputSections<Fp8AttnInputTp4ColumnGeometry> {
+    static constexpr std::int32_t kQueryRows = 1536;
+    static constexpr std::int32_t kKeyRows   = 256;
+};
+
+// attn_input_proj's own column shard output -- each device's own head-local Q|K|Gate|V sections,
+// Geometry-parameterized the same way fp8_gdn_input_output.cuh's Fp8GdnInputShardOutput<Geometry>
+// is for its sibling family. The tp1-named Fp8AttentionInputOutput struct above is kept exactly as
+// it was -- every existing tp1 call site continues to build the identical 4-tensor aggregate.
 template <class Geometry>
 struct Fp8AttentionInputShardOutput {
-    static constexpr std::int32_t kQueryRows  = 3072;
-    static constexpr std::int32_t kKeyRows    = 512;
-    static constexpr std::int32_t kGateRows   = 3072;
+    static constexpr std::int32_t kQueryRows  = Fp8AttnInputSections<Geometry>::kQueryRows;
+    static constexpr std::int32_t kKeyRows    = Fp8AttnInputSections<Geometry>::kKeyRows;
+    static constexpr std::int32_t kGateRows   = kQueryRows;
     static constexpr std::int32_t kKeyBegin   = kQueryRows;
     static constexpr std::int32_t kGateBegin  = kKeyBegin + kKeyRows;
     static constexpr std::int32_t kValueBegin = kGateBegin + kGateRows;

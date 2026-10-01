@@ -81,6 +81,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 using namespace ninfer;
 using namespace ninfer::test;
@@ -330,13 +331,13 @@ int run_head_case(const HeadCase& test_case, const ExecutionContext& ec,
                 arena[slot].emplace(workspace_bytes);
             }
 
-            const std::array<Tensor, 2> x{Tensor(x_dev[0].p, DType::BF16, {kHidden, tokens}),
+            const TpArray<Tensor> x{Tensor(x_dev[0].p, DType::BF16, {kHidden, tokens}),
                                           Tensor(x_dev[1].p, DType::BF16, {kHidden, tokens})};
-            const std::array<Weight, 2> w{shard_w[0].weight, shard_w[1].weight};
-            const std::array<Tensor, 2> out{
+            const TpArray<Weight> w{shard_w[0].weight, shard_w[1].weight};
+            const TpArray<Tensor> out{
                 Tensor(shard_out[0]->data(), DType::BF16, {kHalf, tokens}),
                 Tensor(shard_out[1]->data(), DType::BF16, {kHalf, tokens})};
-            const std::array<WorkspaceArena*, 2> workspace{&*arena[0], &*arena[1]};
+            const TpArray<WorkspaceArena*> workspace{&*arena[0], &*arena[1]};
 
             retire_staging(ec);
             ops::linear_column_parallel(x, w, out, policy, workspace, ec);
@@ -384,14 +385,14 @@ int run_head_case(const HeadCase& test_case, const ExecutionContext& ec,
             }
             retire_staging(ec);
             for (std::int32_t token = 0; token < tokens; ++token) {
-                const std::array<Tensor, 2> part{
+                const TpArray<Tensor> part{
                     Tensor(byte_offset(shard_out[0]->data(),
                                        static_cast<std::size_t>(token) * kHalf, sizeof(std::uint16_t)),
                            DType::BF16, {1, kHalf}),
                     Tensor(byte_offset(shard_out[1]->data(),
                                        static_cast<std::size_t>(token) * kHalf, sizeof(std::uint16_t)),
                            DType::BF16, {1, kHalf})};
-                const std::array<Tensor, 2> destination{
+                const TpArray<Tensor> destination{
                     Tensor(byte_offset(full_logits[0]->data(),
                                        static_cast<std::size_t>(token) * kVocab,
                                        sizeof(std::uint16_t)),

@@ -331,28 +331,28 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         // full target vocabulary even when the ordinary/MTP route uses the optimized shortlist.
         Tensor logits = state.execution.work.alloc(
             DType::BF16, {TextConfig::output_rows, static_cast<std::int32_t>(k) * batch_size});
-        if (state.execution.peer == nullptr) {
+        if (state.execution.peer_at(1) == nullptr) {
             ops::linear(proposal_hidden, state.execution.model.output_head, logits,
                         state.execution.device.stream);
         } else {
             const std::int32_t columns = static_cast<std::int32_t>(k) * batch_size;
             const std::int32_t shard   = TextConfig::output_rows / 2;
-            Tensor peer_hidden = state.execution.peer->work->alloc(DType::BF16,
+            Tensor peer_hidden = state.execution.peer_at(1)->work->alloc(DType::BF16,
                                                                      {Config::hidden, columns});
             ops::broadcast_rank0(proposal_hidden, peer_hidden,
-                                 *state.execution.peer->execution,
-                                 *state.execution.peer->events);
+                                 *state.execution.peer_at(1)->execution,
+                                 *state.execution.peer_at(1)->events);
             Tensor part0 = state.execution.work.alloc(DType::BF16, {shard, columns});
-            Tensor part1 = state.execution.peer->work->alloc(DType::BF16, {shard, columns});
+            Tensor part1 = state.execution.peer_at(1)->work->alloc(DType::BF16, {shard, columns});
             ops::linear_column_parallel(
                 {proposal_hidden, peer_hidden},
-                {state.execution.model.output_head, state.execution.peer->model->output_head},
-                {part0, part1}, *state.execution.peer->execution);
+                {state.execution.model.output_head, state.execution.peer_at(1)->model->output_head},
+                {part0, part1}, *state.execution.peer_at(1)->execution);
             // The lattice selector runs only on rank 0.  Gathering the full vocabulary to rank 1
             // doubles the PCIe/DMA-FQ traffic and event choreography without feeding any
             // consumer, so import only rank 1's shard into rank 0's logits image.
-            ops::gather_columns_rank0(logits, {part0, part1}, *state.execution.peer->execution,
-                                      *state.execution.peer->events);
+            ops::gather_columns_rank0(logits, {part0, part1}, *state.execution.peer_at(1)->execution,
+                                      *state.execution.peer_at(1)->events);
         }
         Tensor selector_gate = state.execution.work.alloc(
             DType::BF16, {256, static_cast<std::int32_t>(k) * batch_size});
@@ -384,17 +384,19 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
-        std::optional<TpExecution> tp = tp_execution(state.execution);
+        TpPeers peers = tp_executions(state.execution);
+        TpExecution* tp = peers[1].has_value() ? &*peers[1] : nullptr;
         qwen3_6::DFlashDecodeState* peer_frame = nullptr;
-        if (tp) {
-            if (!tp->io->dflash_decode || state.execution.peer->dflash_host_ingress == nullptr) {
+        if (tp != nullptr) {
+            if (!tp->io->dflash_decode ||
+                state.execution.peer_at(1)->dflash_host_ingress == nullptr) {
                 throw std::logic_error("tensor-parallel DFlash decode requires a peer frame and ingress");
             }
             peer_frame = &*tp->io->dflash_decode;
             const CurrentDevice restore;
             CUDA_CHECK(cudaSetDevice(tp->device->device));
             CUDA_CHECK(cudaMemcpyAsync(peer_frame->ingress.data,
-                                       state.execution.peer->dflash_host_ingress,
+                                       state.execution.peer_at(1)->dflash_host_ingress,
                                        sizeof(qwen3_6::DFlashDecodeIngress),
                                        cudaMemcpyHostToDevice, tp->device->stream));
         }
@@ -454,8 +456,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         TextContext card(state.execution.device, state.execution.model, state.execution.work,
                          state.execution.rope_frequency, {}, state.execution.linear_attention,
                          state.execution.io, state.execution.prefill_hidden,
-                         state.execution.prefill_chunk, 0, {}, &state.text_cache, nullptr,
-                         tp ? &*tp : nullptr);
+                         state.execution.prefill_chunk, 0, {}, &state.text_cache, nullptr, peers);
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, lanes, valid_columns, width, batch_size);
         auto verify_view = [batch_size](qwen3_6::DFlashDecodeState& f,
@@ -485,9 +486,11 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             };
         };
         if (peer_frame != nullptr) {
-            target_verify_accept(state.execution, state.continuation_hidden_store, card,
-                                 verify_view(frame, state.execution.replay_records, &sink),
-                                 verify_view(*peer_frame, tp->replay_records, nullptr),
+            // DFlash is a two-rank path (rejected at tp > 2), so its frame set is exactly two.
+            TpArray<TargetVerifyFrameView> frames{};
+            frames[0] = verify_view(frame, state.execution.replay_records, &sink);
+            frames[1] = verify_view(*peer_frame, tp->replay_records, nullptr);
+            target_verify_accept(state.execution, state.continuation_hidden_store, card, frames,
                                  target_envelope);
         } else {
             target_verify_accept(state.execution, state.continuation_hidden_store, card,

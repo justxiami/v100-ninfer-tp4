@@ -19,6 +19,7 @@
 #define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_6_27b::detail::Variant
 #define NINFER_QWEN36_RUNTIME_NS qwen3_6_27b_runtime
 #include "targets/qwen3_6/impl/runtime/instantiate.h"
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::targets::qwen3_6_27b::detail {
 namespace {
@@ -560,18 +561,35 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
 
 namespace {
 
+// Every live rank's payload, after requiring that all of them use the SAME storage form. The
+// variant is resolved from every rank rather than from rank 0 with the rest assumed: a rank that
+// bound a different form would otherwise run a different kernel from its peers.
 template <class Payload, class Weights>
-std::array<const Payload*, 2> require_same_alternative(const std::array<const Weights*, 2>& w,
-                                                       const char* label) {
-    const auto* a = std::get_if<Payload>(w[0]);
-    const auto* b = std::get_if<Payload>(w[1]);
-    if (a == nullptr || b == nullptr) {
-        throw std::logic_error(std::string(label) + ": tp2 ranks disagree on weight storage form");
+TpArray<const Payload*> require_same_alternative(const TpArray<const Weights*>& w,
+                                                 const char* label, const ExecutionContext& ec) {
+    TpArray<const Payload*> out{};
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        const auto slot     = static_cast<std::size_t>(rank);
+        const auto* payload = std::get_if<Payload>(w[slot]);
+        if (payload == nullptr) {
+            throw std::logic_error(std::string(label) +
+                                   ": ranks disagree on weight storage form");
+        }
+        out[slot] = payload;
     }
-    return {a, b};
+    return out;
 }
 
-std::array<Weight, 2> pair_of(const Weight& a, const Weight& b) { return {a, b}; }
+// One entry per live rank, selected out of that rank's payload.
+template <class Result, class Payload, class Select>
+TpArray<Result> rank_shards(const ExecutionContext& ec, const TpArray<const Payload*>& payloads,
+                            Select&& select) {
+    TpArray<Result> out{};
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        out[rank] = select(*payloads[static_cast<std::size_t>(rank)]);
+    }
+    return out;
+}
 
 // Current-device save/restore around a per-rank kernel issue. Only ONE tp2 leaf below needs it --
 // `mtp_attention_projection`, whose second stage (`ops::mtp_split_attn_in`) is a purely
@@ -595,7 +613,7 @@ private:
 template <class Body>
 void for_each_rank(const ExecutionContext& ec, Body&& body) {
     const CurrentDevice restore;
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
         body(rank);
     }
@@ -606,111 +624,149 @@ void require_mtp_shard(const Weight& a, const Weight& b, const char* label) {
     if (a.qtype != b.qtype ||
         (a.qtype != QType::W8G32_F16S && a.qtype != QType::GGML_K)) {
         throw std::logic_error(std::string(label) +
-                               ": unsupported or inconsistent tp2 MTP weight format");
+                               ": unsupported or inconsistent MTP weight format");
     }
     if (a.k != b.k || a.n != b.n) {
-        throw std::logic_error(std::string(label) + ": tp2 MTP shards disagree on shape");
+        throw std::logic_error(std::string(label) + ": MTP shards disagree on shape");
+    }
+}
+
+// Requires every rank's shard of one member to agree, checked against rank 0's. `get(rank)` names
+// that rank's shard.
+template <class Getter>
+void require_agreeing_shards(const ExecutionContext& ec, const char* label, Getter&& get) {
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        require_mtp_shard(get(0), get(rank), label);
     }
 }
 
 } // namespace
 
-void Variant::attention_projection(const std::array<Tensor, 2>& hidden,
-                                   const std::array<const FullAttentionProjectionWeights*, 2>& w,
-                                   const std::array<Tensor, 2>& query,
-                                   const std::array<Tensor, 2>& gate,
-                                   const std::array<Tensor, 2>& key,
-                                   const std::array<Tensor, 2>& value, qwen3_6::TextPhase,
-                                   const std::array<WorkspaceArena*, 2>& workspace,
+void Variant::attention_projection(const TpArray<Tensor>& hidden,
+                                   const TpArray<const FullAttentionProjectionWeights*>& w,
+                                   const TpArray<Tensor>& query,
+                                   const TpArray<Tensor>& gate,
+                                   const TpArray<Tensor>& key,
+                                   const TpArray<Tensor>& value, qwen3_6::TextPhase,
+                                   const TpArray<WorkspaceArena*>& workspace,
                                    const ExecutionContext& ec) {
     if (std::holds_alternative<SplitAttentionProjectionPayload>(*w[0])) {
         const auto split = require_same_alternative<SplitAttentionProjectionPayload>(
-            w, "attention projection");
+            w, "attention projection", ec);
         ops::attn_input_proj_column_parallel(
-            hidden, pair_of(split[0]->query_key, split[1]->query_key),
-            pair_of(split[0]->gate_value, split[1]->gate_value), query, gate, key, value,
-            workspace, ec);
+            hidden,
+            rank_shards<Weight>(ec, split,
+                                [](const SplitAttentionProjectionPayload& p) { return p.query_key; }),
+            rank_shards<Weight>(
+                ec, split,
+                [](const SplitAttentionProjectionPayload& p) { return p.gate_value; }),
+            query, gate, key, value, workspace, ec);
         return;
     }
-    const auto fused =
-        require_same_alternative<FusedAttentionProjectionPayload>(w, "attention projection");
+    const auto fused = require_same_alternative<FusedAttentionProjectionPayload>(
+        w, "attention projection", ec);
     ops::attn_input_proj_column_parallel(
-        hidden, pair_of(fused[0]->query_key_gate_value, fused[1]->query_key_gate_value), query,
-        gate, key, value, text_policy(fused[0]->query_key_gate_value), workspace, ec);
+        hidden,
+        rank_shards<Weight>(ec, fused,
+                            [](const FusedAttentionProjectionPayload& p) {
+                                return p.query_key_gate_value;
+                            }),
+        query, gate, key, value, text_policy(fused[0]->query_key_gate_value), workspace, ec);
 }
 
-void Variant::attention_output_projection(const std::array<Tensor, 2>& attention,
-                                          const std::array<Weight, 2>& weight,
-                                          const std::array<Tensor, 2>& residual,
-                                          const std::array<Tensor, 2>& staging, qwen3_6::TextPhase,
-                                          const std::array<WorkspaceArena*, 2>& workspace,
+void Variant::attention_output_projection(const TpArray<Tensor>& attention,
+                                          const TpArray<Weight>& weight,
+                                          const TpArray<Tensor>& residual,
+                                          const TpArray<Tensor>& staging, qwen3_6::TextPhase,
+                                          const TpArray<WorkspaceArena*>& workspace,
                                           const ExecutionContext& ec, const ops::PeerEvents& ev) {
     ops::linear_add_row_parallel(attention, weight, residual, staging, text_policy(weight[0]),
                                  workspace, ec, ev);
 }
 
-void Variant::gdn_input_projection(const std::array<Tensor, 2>& hidden,
-                                   const std::array<const GdnProjectionWeights*, 2>& w,
-                                   const std::array<Tensor, 2>& qkv,
-                                   const std::array<Tensor, 2>& output_gate, qwen3_6::TextPhase,
-                                   const std::array<WorkspaceArena*, 2>& workspace,
+void Variant::gdn_input_projection(const TpArray<Tensor>& hidden,
+                                   const TpArray<const GdnProjectionWeights*>& w,
+                                   const TpArray<Tensor>& qkv,
+                                   const TpArray<Tensor>& output_gate, qwen3_6::TextPhase,
+                                   const TpArray<WorkspaceArena*>& workspace,
                                    const ExecutionContext& ec) {
     // The caller holds `z` as [head_dim, value_heads, T]; the Op wants the flat [value_dim, T],
     // exactly as the tp1 leaf above does. The shard's value_dim is read off the tensor rather than
     // assumed, so this stays correct if the head split ever changes.
-    const std::array<Tensor, 2> output_gate_flat = {
-        output_gate[0].view({output_gate[0].ne[0] * output_gate[0].ne[1], hidden[0].ne[1]}),
-        output_gate[1].view({output_gate[1].ne[0] * output_gate[1].ne[1], hidden[1].ne[1]})};
-    const std::array<const GdnInputProjectionPayload*, 2> input = {&w[0]->input_projection,
-                                                                   &w[1]->input_projection};
+    TpArray<Tensor> output_gate_flat;
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        const auto slot    = static_cast<std::size_t>(rank);
+        output_gate_flat[slot] =
+            output_gate[slot].view({output_gate[slot].ne[0] * output_gate[slot].ne[1],
+                                    hidden[slot].ne[1]});
+    }
+    const TpArray<const GdnInputProjectionPayload*> input =
+        rank_shards<const GdnInputProjectionPayload*>(
+            ec, w, [](const GdnProjectionWeights& x) { return &x.input_projection; });
     if (std::holds_alternative<SplitGdnInputProjectionPayload>(*input[0])) {
-        const auto split =
-            require_same_alternative<SplitGdnInputProjectionPayload>(input, "GDN input projection");
-        ops::gdn_input_proj_column_parallel(hidden,
-                                            pair_of(split[0]->query_key, split[1]->query_key),
-                                            pair_of(split[0]->value_z, split[1]->value_z), qkv,
-                                            output_gate_flat, ec);
+        const auto split = require_same_alternative<SplitGdnInputProjectionPayload>(
+            input, "GDN input projection", ec);
+        ops::gdn_input_proj_column_parallel(
+            hidden,
+            rank_shards<Weight>(ec, split,
+                                [](const SplitGdnInputProjectionPayload& p) { return p.query_key; }),
+            rank_shards<Weight>(ec, split,
+                                [](const SplitGdnInputProjectionPayload& p) { return p.value_z; }),
+            qkv, output_gate_flat, ec);
         return;
     }
-    const auto fused =
-        require_same_alternative<FusedGdnInputProjectionPayload>(input, "GDN input projection");
+    const auto fused = require_same_alternative<FusedGdnInputProjectionPayload>(
+        input, "GDN input projection", ec);
     ops::gdn_input_proj_column_parallel(
-        hidden, pair_of(fused[0]->query_key_value_z, fused[1]->query_key_value_z), qkv,
-        output_gate_flat, text_policy(fused[0]->query_key_value_z), workspace, ec);
+        hidden,
+        rank_shards<Weight>(ec, fused,
+                            [](const FusedGdnInputProjectionPayload& p) {
+                                return p.query_key_value_z;
+                            }),
+        qkv, output_gate_flat, text_policy(fused[0]->query_key_value_z), workspace, ec);
 }
 
 void Variant::gdn_input_projection_snapshot(
-    const std::array<Tensor, 2>& hidden, const std::array<const GdnProjectionWeights*, 2>& w,
-    const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
-    const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_slot,
-    const std::array<Tensor, 2>& snapshot_base_slot, const std::array<Tensor, 2>& query,
-    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-    const std::array<Tensor, 2>& output_gate, qwen3_6::TextPhase,
-    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec) {
-    const std::array<const GdnInputProjectionPayload*, 2> input = {&w[0]->input_projection,
-                                                                   &w[1]->input_projection};
+    const TpArray<Tensor>& hidden, const TpArray<const GdnProjectionWeights*>& w,
+    const TpArray<Tensor>& conv_weight, const TpArray<Tensor>& conv_states,
+    const TpArray<Tensor>& valid_columns, const TpArray<Tensor>& initial_slot,
+    const TpArray<Tensor>& snapshot_base_slot, const TpArray<Tensor>& query,
+    const TpArray<Tensor>& key, const TpArray<Tensor>& value,
+    const TpArray<Tensor>& output_gate, qwen3_6::TextPhase,
+    const TpArray<WorkspaceArena*>& workspace, const ExecutionContext& ec) {
+    const TpArray<const GdnInputProjectionPayload*> input =
+        rank_shards<const GdnInputProjectionPayload*>(
+            ec, w, [](const GdnProjectionWeights& x) { return &x.input_projection; });
     if (std::holds_alternative<SplitGdnInputProjectionPayload>(*input[0])) {
         const auto split = require_same_alternative<SplitGdnInputProjectionPayload>(
-            input, "GDN snapshot projection");
+            input, "GDN snapshot projection", ec);
         ops::gdn_input_proj_conv_snapshot_column_parallel(
-            hidden, pair_of(split[0]->query_key, split[1]->query_key),
-            pair_of(split[0]->value_z, split[1]->value_z), conv_weight, conv_states, valid_columns,
-            initial_slot, snapshot_base_slot, query, key, value, output_gate, workspace, ec);
+            hidden,
+            rank_shards<Weight>(ec, split,
+                                [](const SplitGdnInputProjectionPayload& p) { return p.query_key; }),
+            rank_shards<Weight>(ec, split,
+                                [](const SplitGdnInputProjectionPayload& p) { return p.value_z; }),
+            conv_weight, conv_states, valid_columns, initial_slot, snapshot_base_slot, query, key,
+            value, output_gate, workspace, ec);
         return;
     }
-    const auto fused =
-        require_same_alternative<FusedGdnInputProjectionPayload>(input, "GDN snapshot projection");
+    const auto fused = require_same_alternative<FusedGdnInputProjectionPayload>(
+        input, "GDN snapshot projection", ec);
     ops::gdn_input_proj_conv_snapshot_column_parallel(
-        hidden, pair_of(fused[0]->query_key_value_z, fused[1]->query_key_value_z), conv_weight,
-        conv_states, valid_columns, initial_slot, snapshot_base_slot, query, key, value,
-        output_gate, text_policy(fused[0]->query_key_value_z), workspace, ec);
+        hidden,
+        rank_shards<Weight>(ec, fused,
+                            [](const FusedGdnInputProjectionPayload& p) {
+                                return p.query_key_value_z;
+                            }),
+        conv_weight, conv_states, valid_columns, initial_slot, snapshot_base_slot, query, key,
+        value, output_gate, text_policy(fused[0]->query_key_value_z), workspace, ec);
 }
 
-void Variant::gdn_output_projection(const std::array<Tensor, 2>& hidden,
-                                    const std::array<Weight, 2>& weight,
-                                    const std::array<Tensor, 2>& residual,
-                                    const std::array<Tensor, 2>& staging, qwen3_6::TextPhase,
-                                    const std::array<WorkspaceArena*, 2>& workspace,
+void Variant::gdn_output_projection(const TpArray<Tensor>& hidden,
+                                    const TpArray<Weight>& weight,
+                                    const TpArray<Tensor>& residual,
+                                    const TpArray<Tensor>& staging, qwen3_6::TextPhase,
+                                    const TpArray<WorkspaceArena*>& workspace,
                                     const ExecutionContext& ec, const ops::PeerEvents& ev) {
     if (weight[0].qtype == QType::GGML_K) {
         ops::ggml_k_gdn_output(hidden, weight, residual, staging, workspace, ec, ev);
@@ -720,110 +776,152 @@ void Variant::gdn_output_projection(const std::array<Tensor, 2>& hidden,
                                  workspace, ec, ev);
 }
 
-void Variant::gdn_control_projection(const std::array<Tensor, 2>& hidden,
-                                     const std::array<const GdnProjectionWeights*, 2>& w,
-                                     const std::array<Tensor, 2>& g,
-                                     const std::array<Tensor, 2>& beta,
-                                     const std::array<WorkspaceArena*, 2>& workspace,
+void Variant::gdn_control_projection(const TpArray<Tensor>& hidden,
+                                     const TpArray<const GdnProjectionWeights*>& w,
+                                     const TpArray<Tensor>& g,
+                                     const TpArray<Tensor>& beta,
+                                     const TpArray<WorkspaceArena*>& workspace,
                                      const ExecutionContext& ec) {
     // The tp1 leaf fuses the input RMSNorm into the gating GEMM. There is no split form of the
     // fused kernel and no reason for one: the norm is replicated elementwise work over the
     // full-width residual, so the caller runs it per rank and this leaf takes the normalized
     // hidden directly.
-    const std::array<const GdnControlProjectionPayload*, 2> control = {&w[0]->control_projection,
-                                                                       &w[1]->control_projection};
-    const std::array<Tensor, 2> a_log    = {w[0]->a_log, w[1]->a_log};
-    const std::array<Tensor, 2> dt_bias  = {w[0]->dt_bias, w[1]->dt_bias};
+    const TpArray<const GdnControlProjectionPayload*> control =
+        rank_shards<const GdnControlProjectionPayload*>(
+            ec, w, [](const GdnProjectionWeights& x) { return &x.control_projection; });
+    const TpArray<Tensor> a_log =
+        rank_shards<Tensor>(ec, w, [](const GdnProjectionWeights& x) { return x.a_log; });
+    const TpArray<Tensor> dt_bias =
+        rank_shards<Tensor>(ec, w, [](const GdnProjectionWeights& x) { return x.dt_bias; });
     if (std::holds_alternative<SplitGdnControlProjectionPayload>(*control[0])) {
         const auto split = require_same_alternative<SplitGdnControlProjectionPayload>(
-            control, "GDN control projection");
+            control, "GDN control projection", ec);
         ops::gdn_gating_proj_column_parallel(
-            hidden, pair_of(split[0]->a_projection, split[1]->a_projection),
-            pair_of(split[0]->b_projection, split[1]->b_projection), a_log, dt_bias, workspace, g,
-            beta, ec);
+            hidden,
+            rank_shards<Weight>(ec, split,
+                                [](const SplitGdnControlProjectionPayload& p) {
+                                    return p.a_projection;
+                                }),
+            rank_shards<Weight>(ec, split,
+                                [](const SplitGdnControlProjectionPayload& p) {
+                                    return p.b_projection;
+                                }),
+            a_log, dt_bias, workspace, g, beta, ec);
         return;
     }
     const auto fused = require_same_alternative<FusedGdnControlProjectionPayload>(
-        control, "GDN control projection");
+        control, "GDN control projection", ec);
     ops::gdn_gating_proj_column_parallel(
-        hidden, pair_of(fused[0]->a_b_projection, fused[1]->a_b_projection), a_log, dt_bias,
-        workspace, g, beta, ec);
+        hidden,
+        rank_shards<Weight>(ec, fused,
+                            [](const FusedGdnControlProjectionPayload& p) {
+                                return p.a_b_projection;
+                            }),
+        a_log, dt_bias, workspace, g, beta, ec);
 }
 
-void Variant::post_mixer(const std::array<Tensor, 2>& hidden,
-                         const std::array<const PostMixerWeights*, 2>& w,
-                         const std::array<Tensor, 2>& residual,
-                         const std::array<Tensor, 2>& staging, qwen3_6::TextPhase,
-                         const std::array<WorkspaceArena*, 2>& workspace,
+void Variant::post_mixer(const TpArray<Tensor>& hidden,
+                         const TpArray<const PostMixerWeights*>& w,
+                         const TpArray<Tensor>& residual,
+                         const TpArray<Tensor>& staging, qwen3_6::TextPhase,
+                         const TpArray<WorkspaceArena*>& workspace,
                          const ExecutionContext& ec, const ops::PeerEvents& ev) {
     // The activation width is this rank's own gate/up shard, read off the weight rather than
     // assumed: `gate_up` is [2 * intermediate_shard, hidden], so half its rows is the shard.
     const std::int32_t shard_intermediate = w[0]->gate_up.n / 2;
-    if (w[1]->gate_up.n != w[0]->gate_up.n) {
-        throw std::logic_error("post_mixer: tp2 gate/up shards disagree on width");
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        if (w[static_cast<std::size_t>(rank)]->gate_up.n != w[0]->gate_up.n) {
+            throw std::logic_error("post_mixer: ranks' gate/up shards disagree on width");
+        }
     }
-    std::array<Tensor, 2> activation{};
-    std::array<WorkspaceArena::Scope, 2> scopes = {workspace[0]->scope(), workspace[1]->scope()};
-    for (std::size_t rank = 0; rank < 2; ++rank) {
+    TpArray<Tensor> activation{};
+    // Scope guards cannot be default-constructed, so a fixed-width per-rank array would
+// have to name a guard for slots that do not exist; a vector sized by ec.tp does not.
+    std::vector<WorkspaceArena::Scope> scopes;
+    scopes.reserve(static_cast<std::size_t>(ec.tp));
+    for (int r = 0; r < ec.tp; ++r) scopes.push_back(workspace[r]->scope());
+    for (std::size_t rank = 0; rank < static_cast<std::size_t>(ec.tp); ++rank) {
         activation[rank] =
             workspace[rank]->alloc(DType::BF16, {shard_intermediate, hidden[0].ne[1]});
     }
-    ops::linear_swiglu_column_parallel(hidden, pair_of(w[0]->gate_up, w[1]->gate_up), activation,
-                                       text_policy(w[0]->gate_up), workspace, ec);
-    ops::linear_add_row_parallel(activation, pair_of(w[0]->down, w[1]->down), residual, staging,
-                                 text_policy(w[0]->down), workspace, ec, ev);
+    ops::linear_swiglu_column_parallel(
+        hidden, rank_shards<Weight>(ec, w, [](const PostMixerWeights& x) { return x.gate_up; }),
+        activation, text_policy(w[0]->gate_up), workspace, ec);
+    ops::linear_add_row_parallel(
+        activation, rank_shards<Weight>(ec, w, [](const PostMixerWeights& x) { return x.down; }),
+        residual, staging, text_policy(w[0]->down), workspace, ec, ev);
 }
 
 void Variant::gdn_input_projection_record(
-    const std::array<Tensor, 2>& hidden, const std::array<const GdnProjectionWeights*, 2>& w,
-    const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
-    const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_slots,
-    const std::array<Tensor, 2>& conv_record, const std::array<Tensor, 2>& query,
-    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-    const std::array<Tensor, 2>& output_gate, qwen3_6::TextPhase,
-    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec) {
+    const TpArray<Tensor>& hidden, const TpArray<const GdnProjectionWeights*>& w,
+    const TpArray<Tensor>& conv_weight, const TpArray<Tensor>& conv_states,
+    const TpArray<Tensor>& valid_columns, const TpArray<Tensor>& initial_slots,
+    const TpArray<Tensor>& conv_record, const TpArray<Tensor>& query,
+    const TpArray<Tensor>& key, const TpArray<Tensor>& value,
+    const TpArray<Tensor>& output_gate, qwen3_6::TextPhase,
+    const TpArray<WorkspaceArena*>& workspace, const ExecutionContext& ec) {
     // The record twin of `gdn_input_projection_snapshot` above, reached only from the speculative
     // verify round: instead of snapshotting the post-round conv state it writes a per-column
     // `conv_record` that the peer's `ops::gdn_replay_fold` later folds at
     // FoldGeometry<48, 8, 24, 5120>. Everything else -- the shard extents, the weight storage
     // form, the per-rank issue -- is the snapshot leaf's.
-    const std::array<const GdnInputProjectionPayload*, 2> input = {&w[0]->input_projection,
-                                                                   &w[1]->input_projection};
+    const TpArray<const GdnInputProjectionPayload*> input =
+        rank_shards<const GdnInputProjectionPayload*>(
+            ec, w, [](const GdnProjectionWeights& x) { return &x.input_projection; });
     if (std::holds_alternative<SplitGdnInputProjectionPayload>(*input[0])) {
         const auto split = require_same_alternative<SplitGdnInputProjectionPayload>(
-            input, "GDN record projection");
+            input, "GDN record projection", ec);
         ops::gdn_input_proj_conv_record_column_parallel(
-            hidden, pair_of(split[0]->query_key, split[1]->query_key),
-            pair_of(split[0]->value_z, split[1]->value_z), conv_weight, conv_states, valid_columns,
-            initial_slots, conv_record, query, key, value, output_gate, workspace, ec);
+            hidden,
+            rank_shards<Weight>(ec, split,
+                                [](const SplitGdnInputProjectionPayload& p) { return p.query_key; }),
+            rank_shards<Weight>(ec, split,
+                                [](const SplitGdnInputProjectionPayload& p) { return p.value_z; }),
+            conv_weight, conv_states, valid_columns, initial_slots, conv_record, query, key, value,
+            output_gate, workspace, ec);
         return;
     }
-    const auto fused =
-        require_same_alternative<FusedGdnInputProjectionPayload>(input, "GDN record projection");
+    const auto fused = require_same_alternative<FusedGdnInputProjectionPayload>(
+        input, "GDN record projection", ec);
     ops::gdn_input_proj_conv_record_column_parallel(
-        hidden, pair_of(fused[0]->query_key_value_z, fused[1]->query_key_value_z), conv_weight,
-        conv_states, valid_columns, initial_slots, conv_record, query, key, value, output_gate,
-        text_policy(fused[0]->query_key_value_z), workspace, ec);
+        hidden,
+        rank_shards<Weight>(ec, fused,
+                            [](const FusedGdnInputProjectionPayload& p) {
+                                return p.query_key_value_z;
+                            }),
+        conv_weight, conv_states, valid_columns, initial_slots, conv_record, query, key, value,
+        output_gate, text_policy(fused[0]->query_key_value_z), workspace, ec);
 }
 
 void Variant::mtp_attention_projection(
-    const std::array<Tensor, 2>& hidden,
-    const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-    const std::array<Tensor, 2>& query, const std::array<Tensor, 2>& gate,
-    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec) {
-    require_mtp_shard(w[0]->packed, w[1]->packed, "MTP attention projection");
+    const TpArray<Tensor>& hidden,
+    const TpArray<const MtpAttentionProjectionWeights*>& w,
+    const TpArray<Tensor>& query, const TpArray<Tensor>& gate,
+    const TpArray<Tensor>& key, const TpArray<Tensor>& value,
+    const TpArray<WorkspaceArena*>& workspace, const ExecutionContext& ec) {
+    require_agreeing_shards(ec, "MTP attention projection",
+                            [&](int rank) { return w[static_cast<std::size_t>(rank)]->packed; });
     const std::int32_t columns   = hidden[0].ne[1];
     const std::int32_t attn_rows = w[0]->packed.n;
-    if (hidden[1].ne[1] != columns) {
-        throw std::logic_error("MTP attention projection: tp2 ranks disagree on token count");
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        if (hidden[static_cast<std::size_t>(rank)].ne[1] != columns) {
+            throw std::logic_error("MTP attention projection: ranks disagree on token count");
+        }
     }
-    std::array<Tensor, 2> packed{};
-    std::array<WorkspaceArena::Scope, 2> scopes = {workspace[0]->scope(), workspace[1]->scope()};
-    for (std::size_t rank = 0; rank < 2; ++rank) {
+    TpArray<Tensor> packed{};
+    // Scope guards cannot be default-constructed, so a fixed-width per-rank array would
+// have to name a guard for slots that do not exist; a vector sized by ec.tp does not.
+    std::vector<WorkspaceArena::Scope> scopes;
+    scopes.reserve(static_cast<std::size_t>(ec.tp));
+    for (int r = 0; r < ec.tp; ++r) scopes.push_back(workspace[r]->scope());
+    for (std::size_t rank = 0; rank < static_cast<std::size_t>(ec.tp); ++rank) {
         packed[rank] = workspace[rank]->alloc(DType::BF16, {attn_rows, columns});
     }
-    ops::linear_column_parallel(hidden, pair_of(w[0]->packed, w[1]->packed), packed, ec);
+    ops::linear_column_parallel(
+        hidden,
+        rank_shards<Weight>(ec, w,
+                            [](const MtpAttentionProjectionWeights& x) { return x.packed; }),
+        packed, ec);
     // `mtp_split_attn_in` selects its section boundaries from the packed row count alone, so the
     // shard geometry (rows [0,3072) Q | [3072,3584) K | [3584,6656) Gate | [6656,7168) V) needs
     // no rank argument. The resulting head indices are DEVICE-LOCAL, which is exactly what the
@@ -841,36 +939,112 @@ void Variant::mtp_attention_projection(
     });
 }
 
-void Variant::mtp_kv_projection(const std::array<Tensor, 2>& hidden,
-                                const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-                                const std::array<Tensor, 2>& key,
-                                const std::array<Tensor, 2>& value,
-                                const std::array<WorkspaceArena*, 2>&, const ExecutionContext& ec) {
+void Variant::mtp_kv_projection(const TpArray<Tensor>& hidden,
+                                const TpArray<const MtpAttentionProjectionWeights*>& w,
+                                const TpArray<Tensor>& key,
+                                const TpArray<Tensor>& value,
+                                const TpArray<WorkspaceArena*>&, const ExecutionContext& ec) {
     // The tp1 leaf fuses these two into one `linear_pair`; the shard's key and value row views
     // are separate blocks of the same packed shard, so at tp2 they are two column-parallel calls.
-    require_mtp_shard(w[0]->key, w[1]->key, "MTP key projection");
-    require_mtp_shard(w[0]->value, w[1]->value, "MTP value projection");
-    ops::linear_column_parallel(hidden, pair_of(w[0]->key, w[1]->key), key, ec);
-    ops::linear_column_parallel(hidden, pair_of(w[0]->value, w[1]->value), value, ec);
+    require_agreeing_shards(ec, "MTP key projection",
+                            [&](int rank) { return w[static_cast<std::size_t>(rank)]->key; });
+    require_agreeing_shards(ec, "MTP value projection",
+                            [&](int rank) { return w[static_cast<std::size_t>(rank)]->value; });
+    ops::linear_column_parallel(
+        hidden,
+        rank_shards<Weight>(ec, w, [](const MtpAttentionProjectionWeights& x) { return x.key; }),
+        key, ec);
+    ops::linear_column_parallel(
+        hidden,
+        rank_shards<Weight>(ec, w, [](const MtpAttentionProjectionWeights& x) { return x.value; }),
+        value, ec);
 }
 
-void Variant::mtp_q_gate_projection(const std::array<Tensor, 2>& hidden,
-                                    const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-                                    const std::array<Tensor, 2>& query,
-                                    const std::array<Tensor, 2>& gate,
-                                    const std::array<WorkspaceArena*, 2>&,
+void Variant::mtp_q_gate_projection(const TpArray<Tensor>& hidden,
+                                    const TpArray<const MtpAttentionProjectionWeights*>& w,
+                                    const TpArray<Tensor>& query,
+                                    const TpArray<Tensor>& gate,
+                                    const TpArray<WorkspaceArena*>&,
                                     const ExecutionContext& ec) {
-    require_mtp_shard(w[0]->query, w[1]->query, "MTP query projection");
-    require_mtp_shard(w[0]->output_gate, w[1]->output_gate, "MTP gate projection");
-    ops::linear_column_parallel(hidden, pair_of(w[0]->query, w[1]->query), query, ec);
-    ops::linear_column_parallel(hidden, pair_of(w[0]->output_gate, w[1]->output_gate), gate, ec);
+    require_agreeing_shards(ec, "MTP query projection",
+                            [&](int rank) { return w[static_cast<std::size_t>(rank)]->query; });
+    require_agreeing_shards(ec, "MTP gate projection",
+                            [&](int rank) { return w[static_cast<std::size_t>(rank)]->output_gate; });
+    ops::linear_column_parallel(
+        hidden,
+        rank_shards<Weight>(ec, w, [](const MtpAttentionProjectionWeights& x) { return x.query; }),
+        query, ec);
+    ops::linear_column_parallel(
+        hidden,
+        rank_shards<Weight>(ec, w,
+                            [](const MtpAttentionProjectionWeights& x) { return x.output_gate; }),
+        gate, ec);
 }
 
-void Variant::mtp_post_mixer(const std::array<Tensor, 2>& hidden,
-                             const std::array<const MtpPostMixerWeights*, 2>& w,
-                             const std::array<Tensor, 2>& residual,
-                             const std::array<Tensor, 2>& staging,
-                             const std::array<WorkspaceArena*, 2>& workspace,
+// See the call site: per-rank shard dump for the MTP post-mixer. First call only; writes
+// <prefix>.<rank> as [gate_up shard | silu shard] in BF16.
+void mtp_mlp_dump(const ExecutionContext& ec, const TpArray<Tensor>& gate_up,
+                  const TpArray<Tensor>& activation, std::int32_t shard_intermediate) {
+    static const char* prefix = std::getenv("NINFER_TP4_MTP_MLP_DUMP");
+    if (prefix == nullptr) { return; }
+    static bool done = false;
+    if (done) { return; }
+    done = true;
+    const CurrentDevice restore;
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        CUDA_CHECK(cudaSetDevice(ec.dev[slot]->device));
+        const std::size_t first  = static_cast<std::size_t>(gate_up[slot].bytes());
+        const std::size_t second = static_cast<std::size_t>(activation[slot].bytes());
+        std::vector<unsigned char> host(first + second);
+        CUDA_CHECK(cudaMemcpyAsync(host.data(), gate_up[slot].data, first,
+                                   cudaMemcpyDeviceToHost, ec.dev[slot]->stream));
+        CUDA_CHECK(cudaMemcpyAsync(host.data() + first, activation[slot].data, second,
+                                   cudaMemcpyDeviceToHost, ec.dev[slot]->stream));
+        CUDA_CHECK(cudaStreamSynchronize(ec.dev[slot]->stream));
+        const std::string path = std::string(prefix) + "." + std::to_string(rank);
+        FILE* file             = std::fopen(path.c_str(), "wb");
+        if (file == nullptr) { throw std::runtime_error("MTP MLP dump: path unreadable"); }
+        const std::int32_t header[3] = {rank, shard_intermediate,
+                                        static_cast<std::int32_t>(gate_up[slot].ne[1])};
+        std::fwrite(header, sizeof(header), 1, file);
+        std::fwrite(host.data(), 1, host.size(), file);
+        std::fclose(file);
+        std::fprintf(stderr, "[mtp-mlp] rank %d: gate_up rows=%d cols=%d, activation rows=%d\n", rank,
+                     gate_up[slot].ne[0], gate_up[slot].ne[1], activation[slot].ne[0]);
+        // In-process self-check of the pairing this function itself just computed: row i of the
+        // activation must be silu(row i of the shard) * row (si + i) of the shard. Printing the
+        // three raw numbers here rules out any doubt about how the dump file is parsed.
+        {
+            const auto* gu_bits = static_cast<const unsigned short*>(
+                static_cast<const void*>(host.data()));
+            const auto* act_bits = static_cast<const unsigned short*>(
+                static_cast<const void*>(host.data() + first));
+            const auto to_float = [](unsigned short bits) {
+                const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
+                float out                = 0.0F;
+                std::memcpy(&out, &wide, sizeof(out));
+                return out;
+            };
+            const std::int32_t cols = gate_up[slot].ne[1];
+            for (std::int32_t i : {0, 1, 2}) {
+                const float g = to_float(gu_bits[static_cast<std::size_t>(i) * cols]);
+                const float u = to_float(gu_bits[static_cast<std::size_t>(shard_intermediate + i) * cols]);
+                const float a = to_float(act_bits[static_cast<std::size_t>(i) * cols]);
+                const float expect = (g / (1.0F + std::exp(-g))) * u;
+                std::fprintf(stderr,
+                             "[mtp-mlp]   row %d: gate=%+.5f up=%+.5f act=%+.5f silu(g)*u=%+.5f\n", i,
+                             g, u, a, expect);
+            }
+        }
+    }
+}
+
+void Variant::mtp_post_mixer(const TpArray<Tensor>& hidden,
+                             const TpArray<const MtpPostMixerWeights*>& w,
+                             const TpArray<Tensor>& residual,
+                             const TpArray<Tensor>& staging,
+                             const TpArray<WorkspaceArena*>& workspace,
                              const ExecutionContext& ec, const ops::PeerEvents& ev) {
     // The MTP post-mixer is composed exactly the way the tp1 leaf above composes it -- separate
     // `linear` / `silu_mul` / `linear` / `residual_add`, NOT the fused linear_swiglu + linear_add
@@ -880,20 +1054,29 @@ void Variant::mtp_post_mixer(const std::array<Tensor, 2>& hidden,
     // the same reason. `tests/ops/test_mtp_split.cpp`'s Leg A proves this exact composition at
     // tp2 -- column-parallel gate_up, a shard-local silu_mul over the shard's own gate/up halves,
     // then row-parallel down plus the all-reduce.
-    require_mtp_shard(w[0]->gate_up, w[1]->gate_up, "MTP post mixer gate/up");
-    require_mtp_shard(w[0]->down, w[1]->down, "MTP post mixer down");
+    require_agreeing_shards(ec, "MTP post mixer gate/up",
+                            [&](int rank) { return w[static_cast<std::size_t>(rank)]->gate_up; });
+    require_agreeing_shards(ec, "MTP post mixer down",
+                            [&](int rank) { return w[static_cast<std::size_t>(rank)]->down; });
     const std::int32_t shard_intermediate = w[0]->gate_up.n / 2;
     const std::int32_t columns            = hidden[0].ne[1];
-    std::array<Tensor, 2> gate_up{};
-    std::array<Tensor, 2> activation{};
-    std::array<Tensor, 2> delta{};
-    std::array<WorkspaceArena::Scope, 2> scopes = {workspace[0]->scope(), workspace[1]->scope()};
-    for (std::size_t rank = 0; rank < 2; ++rank) {
+    TpArray<Tensor> gate_up{};
+    TpArray<Tensor> activation{};
+    TpArray<Tensor> delta{};
+    // Scope guards cannot be default-constructed, so a fixed-width per-rank array would
+// have to name a guard for slots that do not exist; a vector sized by ec.tp does not.
+    std::vector<WorkspaceArena::Scope> scopes;
+    scopes.reserve(static_cast<std::size_t>(ec.tp));
+    for (int r = 0; r < ec.tp; ++r) scopes.push_back(workspace[r]->scope());
+    for (std::size_t rank = 0; rank < static_cast<std::size_t>(ec.tp); ++rank) {
         gate_up[rank]    = workspace[rank]->alloc(DType::BF16, {w[rank]->gate_up.n, columns});
         activation[rank] = workspace[rank]->alloc(DType::BF16, {shard_intermediate, columns});
         delta[rank]      = workspace[rank]->alloc(DType::BF16, {TextConfig::hidden, columns});
     }
-    ops::linear_column_parallel(hidden, pair_of(w[0]->gate_up, w[1]->gate_up), gate_up, ec);
+    ops::linear_column_parallel(
+        hidden,
+        rank_shards<Weight>(ec, w, [](const MtpPostMixerWeights& x) { return x.gate_up; }), gate_up,
+        ec);
     // Each rank's gate and up halves are its OWN shard's halves -- the ShardPlan splits gate_up
     // as two independent column blocks, so rank r holds gate rows [r*I/2 ...] and up rows in the
     // matching block, and the SiLU pairing is rank-local with nothing to communicate.
@@ -903,7 +1086,51 @@ void Variant::mtp_post_mixer(const std::array<Tensor, 2>& hidden,
                       gate_up[r].slice(0, shard_intermediate, shard_intermediate), activation[r],
                       ec.dev[rank]->stream);
     });
-    ops::linear_row_parallel(activation, pair_of(w[0]->down, w[1]->down), delta, staging, ec, ev);
+    // Debug-only (NINFER_TP4_MTP_MLP_DUMP=<prefix>): one file per rank holding that rank's gate_up
+    // shard and its silu output, so the global vectors can be stitched back together from the
+    // column-parallel ownership (rank r owns gate_up rows [r*n/tp, (r+1)*n/tp), where the shard's
+    // own first/second half are the gate and up blocks). The local identity
+    // activation[i] == silu(gate[i]) * up[i] is then checkable per rank without any cross-width
+    // agreement, which separates a wrong pairing from a wrong GEMM slice.
+    mtp_mlp_dump(ec, gate_up, activation, shard_intermediate);
+    // Debug-only (NINFER_TP4_MTP_WEIGHT_DUMP=<prefix>): each rank's RAW gate_up payload plus its
+    // geometry header. The weight is input-independent, so the same GLOBAL rows can be compared
+    // across widths byte for byte: rank r owns gate rows [r*gate/2/tp, ...) and the up rows in the
+    // shard's second half, so tp4 ranks 0+1 must equal tp2 rank 0. A mismatch here localizes a
+    // wrong per-rank weight image rather than a wrong GEMM.
+    if (const char* wprefix = std::getenv("NINFER_TP4_MTP_WEIGHT_DUMP"); wprefix != nullptr) {
+        static bool weight_done = false;
+        if (!weight_done) {
+            weight_done = true;
+            for (int r = 0; r < ec.tp; ++r) {
+                const auto rslot        = static_cast<std::size_t>(r);
+                const Weight& weight    = w[rslot]->gate_up;
+                const std::size_t bytes = static_cast<std::size_t>(weight.payload_bytes);
+                std::vector<unsigned char> host(bytes);
+                const CurrentDevice restore;
+                CUDA_CHECK(cudaSetDevice(ec.dev[rslot]->device));
+                CUDA_CHECK(cudaMemcpyAsync(host.data(), weight.payload, bytes,
+                                           cudaMemcpyDeviceToHost, ec.dev[rslot]->stream));
+                CUDA_CHECK(cudaStreamSynchronize(ec.dev[rslot]->stream));
+                const std::string path = std::string(wprefix) + "." + std::to_string(r);
+                FILE* file             = std::fopen(path.c_str(), "wb");
+                if (file == nullptr) { throw std::runtime_error("MTP weight dump: unreadable"); }
+                const std::int64_t header[5] = {r, weight.n, weight.k, weight.group,
+                                                static_cast<std::int64_t>(weight.payload_bytes)};
+                std::fwrite(header, sizeof(header), 1, file);
+                std::fwrite(host.data(), 1, host.size(), file);
+                std::fclose(file);
+                std::fprintf(stderr,
+                             "[mtp-weight] rank %d: n=%d k=%d group=%d bytes=%llu qtype=%d\n", r,
+                             weight.n, weight.k, weight.group,
+                             static_cast<unsigned long long>(weight.payload_bytes),
+                             static_cast<int>(weight.qtype));
+            }
+        }
+    }
+    ops::linear_row_parallel(
+        activation, rank_shards<Weight>(ec, w, [](const MtpPostMixerWeights& x) { return x.down; }),
+        delta, staging, ec, ev);
     // `delta` is identical on both ranks after the collective, so the residual fold is replicated
     // elementwise work and keeps the residual bit-identical across devices.
     for_each_rank(ec, [&](int rank) {

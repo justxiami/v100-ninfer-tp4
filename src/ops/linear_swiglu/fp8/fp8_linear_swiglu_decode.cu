@@ -47,6 +47,10 @@ void fp8_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tens
 // halved N (kIntermediate halves too), exactly as NVFP4's own linear_swiglu shard is served.
 void fp8_linear_swiglu_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& out,
                                            cudaStream_t stream) {
+    if (weight.n == Fp8MlpGateUpTp4ColumnGeometry::kOutputRows) {
+        decode_launch<Fp8MlpGateUpTp4ColumnGeometry>(x, weight, out, stream);
+        return;
+    }
     decode_launch<Fp8MlpGateUpTp2ColumnGeometry>(x, weight, out, stream);
 }
 

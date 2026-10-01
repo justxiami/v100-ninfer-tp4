@@ -12,6 +12,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::ops {
 
@@ -85,10 +86,10 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy
 // linear_add_row_parallel.
 void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual,
                        WorkspaceArena& workspace, cudaStream_t stream);
-void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                       const std::array<Tensor, 2>& residual,
-                       const std::array<Tensor, 2>& staging,
-                       const std::array<WorkspaceArena*, 2>& workspace,
+void ggml_k_gdn_output(const TpArray<Tensor>& x, const TpArray<Weight>& w,
+                       const TpArray<Tensor>& residual,
+                       const TpArray<Tensor>& staging,
+                       const TpArray<WorkspaceArena*>& workspace,
                        const ExecutionContext& ec,
                        const PeerEvents& events);
 
@@ -135,16 +136,16 @@ void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 
 // BF16_CTRL is COMPOSED, not extended (see above -- its family has no runtime-K escape hatch).
 // W8G32_F16S is not registered: its own linear_add profile belongs to a different (non-TP2)
 // variant that this repository's ShardPlan never shards.
-void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                             const std::array<Tensor, 2>& residual,
-                             const std::array<Tensor, 2>& staging, LinearPolicy policy,
-                             const std::array<WorkspaceArena*, 2>& workspace,
+void linear_add_row_parallel(const TpArray<Tensor>& x, const TpArray<Weight>& w,
+                             const TpArray<Tensor>& residual,
+                             const TpArray<Tensor>& staging, LinearPolicy policy,
+                             const TpArray<WorkspaceArena*>& workspace,
                              const ExecutionContext& ec, const PeerEvents& events);
 
 /// A16-only convenience form for profiles whose queried transient workspace is zero.
-void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                             const std::array<Tensor, 2>& residual,
-                             const std::array<Tensor, 2>& staging, const ExecutionContext& ec,
+void linear_add_row_parallel(const TpArray<Tensor>& x, const TpArray<Weight>& w,
+                             const TpArray<Tensor>& residual,
+                             const TpArray<Tensor>& staging, const ExecutionContext& ec,
                              const PeerEvents& events);
 
 } // namespace ninfer::ops

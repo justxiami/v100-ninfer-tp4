@@ -24,6 +24,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 using namespace ninfer;
 using namespace ninfer::test;
@@ -103,9 +104,9 @@ int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, st
     buffer_1.copy_from_host(b_bits.data(), bytes);
     staging_1.fill(0);
 
-    const std::array<Tensor, 2> buffer{Tensor(buffer_0.data(), DType::BF16, {ne0, ne1}),
+    const TpArray<Tensor> buffer{Tensor(buffer_0.data(), DType::BF16, {ne0, ne1}),
                                        Tensor(buffer_1.data(), DType::BF16, {ne0, ne1})};
-    const std::array<Tensor, 2> staging{Tensor(staging_0.data(), DType::BF16, {ne0, ne1}),
+    const TpArray<Tensor> staging{Tensor(staging_0.data(), DType::BF16, {ne0, ne1}),
                                         Tensor(staging_1.data(), DType::BF16, {ne0, ne1})};
 
     retire_staging(ec);
@@ -163,10 +164,10 @@ int run_allgather_case(const char* label, std::int32_t rows_0, std::int32_t rows
     source_device_1.copy_from_host(bits_1.data(), source_device_1.bytes());
     destination_1.fill(0xcd);
 
-    const std::array<Tensor, 2> destination{
+    const TpArray<Tensor> destination{
         Tensor(destination_0.data(), DType::BF16, {row_length, rows}),
         Tensor(destination_1.data(), DType::BF16, {row_length, rows})};
-    const std::array<Tensor, 2> part{
+    const TpArray<Tensor> part{
         Tensor(source_device_0.data(), DType::BF16, {row_length, rows_0}),
         Tensor(source_device_1.data(), DType::BF16, {row_length, rows_1})};
 
@@ -226,10 +227,10 @@ int run_gather_columns_rank0_case(const char* label, std::int32_t width_0,
     source_1.copy_from_host(bits_1.data(), source_1.bytes());
     destination_1.fill(0xcd);
 
-    const std::array<Tensor, 2> destination{
+    const TpArray<Tensor> destination{
         Tensor(destination_0.data(), DType::BF16, {width, columns}),
         Tensor(destination_1.data(), DType::BF16, {width, columns})};
-    const std::array<Tensor, 2> part{
+    const TpArray<Tensor> part{
         Tensor(source_0.data(), DType::BF16, {width_0, columns}),
         Tensor(source_1.data(), DType::BF16, {width_1, columns})};
 
@@ -310,13 +311,13 @@ int run_chained_case(const ExecutionContext& ec, const ops::PeerEvents& events) 
     staging_1.fill(0);
     gathered_1.fill(0xcd);
 
-    const std::array<Tensor, 2> buffer{Tensor(buffer_0.data(), DType::BF16, {n}),
+    const TpArray<Tensor> buffer{Tensor(buffer_0.data(), DType::BF16, {n}),
                                        Tensor(buffer_1.data(), DType::BF16, {n})};
-    const std::array<Tensor, 2> staging{Tensor(staging_0.data(), DType::BF16, {n}),
+    const TpArray<Tensor> staging{Tensor(staging_0.data(), DType::BF16, {n}),
                                         Tensor(staging_1.data(), DType::BF16, {n})};
-    const std::array<Tensor, 2> gathered{Tensor(gathered_0.data(), DType::BF16, {n, 2}),
+    const TpArray<Tensor> gathered{Tensor(gathered_0.data(), DType::BF16, {n, 2}),
                                          Tensor(gathered_1.data(), DType::BF16, {n, 2})};
-    const std::array<Tensor, 2> part{Tensor(buffer_0.data(), DType::BF16, {n, 1}),
+    const TpArray<Tensor> part{Tensor(buffer_0.data(), DType::BF16, {n, 1}),
                                      Tensor(buffer_1.data(), DType::BF16, {n, 1})};
 
     retire_staging(ec);
@@ -382,9 +383,9 @@ int run_microbenchmark(const ExecutionContext& ec, const ops::PeerEvents& events
     buffer_1.fill(0);
     staging_1.fill(0);
 
-    const std::array<Tensor, 2> buffer{Tensor(buffer_0.data(), DType::BF16, {n}),
+    const TpArray<Tensor> buffer{Tensor(buffer_0.data(), DType::BF16, {n}),
                                        Tensor(buffer_1.data(), DType::BF16, {n})};
-    const std::array<Tensor, 2> staging{Tensor(staging_0.data(), DType::BF16, {n}),
+    const TpArray<Tensor> staging{Tensor(staging_0.data(), DType::BF16, {n}),
                                         Tensor(staging_1.data(), DType::BF16, {n})};
 
     retire_staging(ec);

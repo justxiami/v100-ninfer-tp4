@@ -90,4 +90,16 @@ void launch_nvfp4_linear_swiglu_w4a4_tma_shard(const std::uint8_t* activation_co
                                                  weight_scales, output, tokens, alpha, stream);
 }
 
+// The tp4 column-shard sibling. This entry point has no weight to select on, so its caller (the
+// plan's launch_tma, which knows the Geometry) picks which one to call.
+void launch_nvfp4_linear_swiglu_w4a4_tma_shard_tp4(const std::uint8_t* activation_codes,
+                                                   const std::uint8_t* activation_scales,
+                                                   const std::uint8_t* weight_codes,
+                                                   const std::uint8_t* weight_scales,
+                                                   __nv_bfloat16* output, std::int32_t tokens,
+                                                   float alpha, cudaStream_t stream) {
+    launch_impl<Nvfp4MlpGateUpTp4ColumnGeometry>(activation_codes, activation_scales, weight_codes,
+                                                 weight_scales, output, tokens, alpha, stream);
+}
+
 } // namespace ninfer::ops::detail

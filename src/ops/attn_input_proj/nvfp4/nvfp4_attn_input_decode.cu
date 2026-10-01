@@ -69,9 +69,19 @@ void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tenso
     decode_launch<Nvfp4AttnInputGeometry>(x, weight, q, gate, k, v, stream);
 }
 
+// The column shard's own row extents select the geometry: 7168 at tp2, 3584 at tp4. Selecting by
+// the weight's actual N is what keeps a tp4 tensor from being read by a tp2 kernel.
 void nvfp4_attn_input_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& q,
                                           Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
-    decode_launch<Nvfp4AttnInputTp2ColumnGeometry>(x, weight, q, gate, k, v, stream);
+    if (weight.n == Nvfp4AttnInputTp2ColumnGeometry::kOutputRows) {
+        decode_launch<Nvfp4AttnInputTp2ColumnGeometry>(x, weight, q, gate, k, v, stream);
+        return;
+    }
+    if (weight.n == Nvfp4AttnInputTp4ColumnGeometry::kOutputRows) {
+        decode_launch<Nvfp4AttnInputTp4ColumnGeometry>(x, weight, q, gate, k, v, stream);
+        return;
+    }
+    throw std::invalid_argument("nvfp4 attn_input_proj column-parallel: unsupported shard rows");
 }
 
 } // namespace ninfer::ops::detail

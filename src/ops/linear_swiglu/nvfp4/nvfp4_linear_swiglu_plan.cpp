@@ -205,6 +205,8 @@ template <class Geometry>
 void launch_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     if constexpr (std::is_same_v<Geometry, Nvfp4MlpGateUpGeometry>) {
         nvfp4_linear_swiglu_decode_launch(x, weight, out, stream);
+    } else if constexpr (std::is_same_v<Geometry, Nvfp4MlpGateUpTp4ColumnGeometry>) {
+        nvfp4_linear_swiglu_decode_launch_shard(x, weight, out, stream);
     } else {
         nvfp4_linear_swiglu_decode_launch_shard(x, weight, out, stream);
     }
@@ -214,6 +216,8 @@ template <class Geometry>
 void launch_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     if constexpr (std::is_same_v<Geometry, Nvfp4MlpGateUpGeometry>) {
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
+    } else if constexpr (std::is_same_v<Geometry, Nvfp4MlpGateUpTp4ColumnGeometry>) {
+        nvfp4_linear_swiglu_small_t_launch_shard(x, weight, out, stream);
     } else {
         nvfp4_linear_swiglu_small_t_launch_shard(x, weight, out, stream);
     }
@@ -224,6 +228,8 @@ void launch_w4a4(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceAr
                  cudaStream_t stream) {
     if constexpr (std::is_same_v<Geometry, Nvfp4MlpGateUpGeometry>) {
         nvfp4_linear_swiglu_w4a4_launch(x, weight, out, workspace, stream);
+    } else if constexpr (std::is_same_v<Geometry, Nvfp4MlpGateUpTp4ColumnGeometry>) {
+        nvfp4_linear_swiglu_w4a4_launch_shard(x, weight, out, workspace, stream);
     } else {
         nvfp4_linear_swiglu_w4a4_launch_shard(x, weight, out, workspace, stream);
     }
@@ -236,6 +242,10 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
     if constexpr (std::is_same_v<Geometry, Nvfp4MlpGateUpGeometry>) {
         launch_nvfp4_linear_swiglu_w4a4_tma(activation_codes, activation_scales, weight_codes,
                                             weight_scales, output, tokens, alpha, stream);
+    } else if constexpr (std::is_same_v<Geometry, Nvfp4MlpGateUpTp4ColumnGeometry>) {
+        launch_nvfp4_linear_swiglu_w4a4_tma_shard_tp4(activation_codes, activation_scales,
+                                                      weight_codes, weight_scales, output, tokens,
+                                                      alpha, stream);
     } else {
         launch_nvfp4_linear_swiglu_w4a4_tma_shard(activation_codes, activation_scales, weight_codes,
                                                   weight_scales, output, tokens, alpha, stream);
@@ -353,6 +363,10 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
 void nvfp4_linear_swiglu_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& out,
                                         LinearPolicy policy, WorkspaceArena* workspace,
                                         cudaStream_t stream) {
+    if (weight.n == Nvfp4MlpGateUpTp4ColumnGeometry::kOutputRows) {
+        dispatch_impl<Nvfp4MlpGateUpTp4ColumnGeometry>(x, weight, out, policy, workspace, stream);
+        return;
+    }
     dispatch_impl<Nvfp4MlpGateUpTp2ColumnGeometry>(x, weight, out, policy, workspace, stream);
 }
 

@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::ops {
 
@@ -161,14 +162,14 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
  * needs none (see linear_workspace_capacity_bytes(), which is evaluated at the SHARD shape).
  * @param[in] ec Execution context holding exactly two distinct devices.
  */
-void linear_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                            const std::array<Tensor, 2>& out, LinearPolicy policy,
-                            const std::array<WorkspaceArena*, 2>& workspace,
+void linear_column_parallel(const TpArray<Tensor>& x, const TpArray<Weight>& w,
+                            const TpArray<Tensor>& out, LinearPolicy policy,
+                            const TpArray<WorkspaceArena*>& workspace,
                             const ExecutionContext& ec);
 
 /// A16-only column-parallel form; requires no transient workspace.
-void linear_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                            const std::array<Tensor, 2>& out, const ExecutionContext& ec);
+void linear_column_parallel(const TpArray<Tensor>& x, const TpArray<Weight>& w,
+                            const TpArray<Tensor>& out, const ExecutionContext& ec);
 
 /**
  * @brief Row-parallel (input-split) linear across two devices, all-reduced.
@@ -206,14 +207,14 @@ void linear_column_parallel(const std::array<Tensor, 2>& x, const std::array<Wei
  * @param[in] ec Execution context holding exactly two distinct devices.
  * @param[in] events Live cross-device ordering events, as for allreduce_sum().
  */
-void linear_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                         const std::array<Tensor, 2>& out, const std::array<Tensor, 2>& staging,
-                         LinearPolicy policy, const std::array<WorkspaceArena*, 2>& workspace,
+void linear_row_parallel(const TpArray<Tensor>& x, const TpArray<Weight>& w,
+                         const TpArray<Tensor>& out, const TpArray<Tensor>& staging,
+                         LinearPolicy policy, const TpArray<WorkspaceArena*>& workspace,
                          const ExecutionContext& ec, const PeerEvents& events);
 
 /// A16-only row-parallel form; requires no transient workspace.
-void linear_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                         const std::array<Tensor, 2>& out, const std::array<Tensor, 2>& staging,
+void linear_row_parallel(const TpArray<Tensor>& x, const TpArray<Weight>& w,
+                         const TpArray<Tensor>& out, const TpArray<Tensor>& staging,
                          const ExecutionContext& ec, const PeerEvents& events);
 
 } // namespace ninfer::ops

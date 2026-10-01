@@ -5,23 +5,40 @@
 namespace ninfer::ops::detail {
 namespace {
 
-// TP2 shard geometries. See the block comment in q5_dispatch.cpp for the rules; in particular W8's
-// small-T table is a set of compile-time exact geometries (attention/GDN/MTP), so a shard uses the
-// generic SIMT/MMA launchers instead. Returns nullptr when (n, k) is not a registered shard
-// extent.
-W8Launch select_w8_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    const bool column_shard = k == 5120 && (n == 512 ||     // 1024   / 2
-                                            n == 3072 ||    // 6144   / 2
-                                            n == 7168 ||    // 14336  / 2 (attention input)
-                                            n == 17408 ||   // 34816  / 2 (mlp/gate_up)
-                                            n == 124160);   // 248320 / 2 (output_head)
-    const bool row_shard    = n == 5120 && (k == 3072 ||    // 6144   / 2 (attention/gdn output)
-                                            k == 5120 ||    // 10240  / 2 (mtp/input_projection)
-                                            k == 8704);     // 17408  / 2 (mlp/down)
+// TP2 and TP4 shard geometries. See the block comment in q5_dispatch.cpp for the rules; in
+// particular W8's small-T table is a set of compile-time exact geometries (attention/GDN/MTP), so a
+// shard uses the generic SIMT/MMA launchers instead. Returns nullptr when (n, k) is not a registered
+// shard extent.
+//
+// Why the TP4 extents are here and not merely "nice to have": this function runs BEFORE the Volta
+// intercept in select_w8_launch, so an unrecognised shard extent THROWS "w8 linear: unsupported
+// shape or T" instead of falling back to the general sliced SIMT path. The MTP objects of the
+// W8G32_F16S artifacts (official nvfp4, ET w4a4w8a8) are W8, and at tp4 the very first warmup round
+// died on that message while the same artifacts run at tp2, whose extents were listed. Measured
+// after adding them: the tp4 load completes. This is a load-unblocking fix, not a tuning change --
+// on Volta every listed launch resolves to the same sliced, T-general SIMT path anyway.
+W8Launch select_w8_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    const bool column_shard =
+        k == 5120 && (n == 512 ||    // 1024   / 2
+                      n == 3072 ||   // 6144   / 2
+                      n == 7168 ||   // 14336  / 2 (attention input)
+                      n == 17408 ||  // 34816  / 2 (mlp/gate_up)
+                      n == 124160 || // 248320 / 2 (output_head)
+                      n == 256 ||    // 1024   / 4
+                      n == 1536 ||   // 6144   / 4
+                      n == 3584 ||   // 14336  / 4 (attention input)
+                      n == 8704 ||   // 34816  / 4 (mlp/gate_up)
+                      n == 62080);   // 248320 / 4 (output_head)
+    const bool row_shard = n == 5120 && (k == 3072 ||  // 6144   / 2 (attention/gdn output)
+                                         k == 5120 ||  // 10240  / 2 (mtp/input_projection)
+                                         k == 8704 ||  // 17408  / 2 (mlp/down)
+                                         k == 1536 ||  // 6144   / 4 (attention/gdn output)
+                                         k == 2560 ||  // 10240  / 4 (mtp/input_projection)
+                                         k == 4352);   // 17408  / 4 (mlp/down)
     if (!column_shard && !row_shard) { return nullptr; }
     if (t <= 4) { return launch_w8_simt_r8_c4; }
     if (t <= 16) { return launch_w8_simt_r8_c8; }
-    return n == 512 ? launch_w8_mma_r32_c128 : launch_w8_mma_r64_c128;
+    return (n == 512 || n == 256) ? launch_w8_mma_r32_c128 : launch_w8_mma_r64_c128;
 }
 
 // The tp1 table, exactly as it was: returns nullptr rather than throwing so the caller
@@ -172,7 +189,7 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (const W8Launch tp1 = select_w8_a16_registered(n, k, t); tp1 != nullptr) {
         return tp1;
     }
-    if (const W8Launch shard = select_w8_tp2_shard_launch(n, k, t); shard != nullptr) {
+    if (const W8Launch shard = select_w8_shard_launch(n, k, t); shard != nullptr) {
         return shard;
     }
     throw std::invalid_argument("w8 linear: unsupported shape or T");

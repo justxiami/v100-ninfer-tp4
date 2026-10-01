@@ -13,11 +13,13 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
+#include "ops/wrapper/shard_extent.h"
 
 #include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::ops {
 namespace {
@@ -166,9 +168,14 @@ void dispatch_linear_add(const Tensor& x, const Weight& w, Tensor& residual_out,
                                      (w.n == detail::Nvfp4Residual6144Tp2RowGeometry::kOutputRows &&
                                       w.k == detail::Nvfp4Residual6144Tp2RowGeometry::kInputRows) ||
                                      (w.n == detail::Nvfp4Residual17408Tp2RowGeometry::kOutputRows &&
-                                      w.k == detail::Nvfp4Residual17408Tp2RowGeometry::kInputRows);
+                                      w.k == detail::Nvfp4Residual17408Tp2RowGeometry::kInputRows) ||
+                                     (w.n == detail::Nvfp4Residual6144Tp4RowGeometry::kOutputRows &&
+                                      w.k == detail::Nvfp4Residual6144Tp4RowGeometry::kInputRows) ||
+                                     (w.n == detail::Nvfp4Residual17408Tp4RowGeometry::kOutputRows &&
+                                      w.k == detail::Nvfp4Residual17408Tp4RowGeometry::kInputRows);
         if (!supported_shape) {
-            throw std::invalid_argument("nvfp4 linear_add: unsupported weight shape");
+            throw std::invalid_argument(
+                "nvfp4 linear_add: unsupported weight shape (n=" + std::to_string(w.n) + ", k=" + std::to_string(w.k) + ")");
         }
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
             throw std::invalid_argument("linear_add: NVFP4 requires 16-byte x/residual alignment");
@@ -191,9 +198,14 @@ void dispatch_linear_add(const Tensor& x, const Weight& w, Tensor& residual_out,
                                      (w.n == detail::Fp8Residual6144Tp2RowGeometry::kOutputRows &&
                                       w.k == detail::Fp8Residual6144Tp2RowGeometry::kInputRows) ||
                                      (w.n == detail::Fp8Residual17408Tp2RowGeometry::kOutputRows &&
-                                      w.k == detail::Fp8Residual17408Tp2RowGeometry::kInputRows);
+                                      w.k == detail::Fp8Residual17408Tp2RowGeometry::kInputRows) ||
+                                     (w.n == detail::Fp8Residual6144Tp4RowGeometry::kOutputRows &&
+                                      w.k == detail::Fp8Residual6144Tp4RowGeometry::kInputRows) ||
+                                     (w.n == detail::Fp8Residual17408Tp4RowGeometry::kOutputRows &&
+                                      w.k == detail::Fp8Residual17408Tp4RowGeometry::kInputRows);
         if (!supported_shape) {
-            throw std::invalid_argument("fp8 linear_add: unsupported weight shape");
+            throw std::invalid_argument(
+                "fp8 linear_add: unsupported weight shape (n=" + std::to_string(w.n) + ", k=" + std::to_string(w.k) + ")");
         }
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
@@ -315,26 +327,30 @@ namespace {
 // Cross-rank agreement only a two-rank call can check; everything a single device can check is
 // already checked by dispatch_linear_add / validate_linear_semantics per rank. The split axis's
 // own per-rank K extents are deliberately NOT required to match, matching linear_row_parallel.
-void validate_add_split_pair(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+void validate_add_split_pair(const TpArray<Tensor>& x, const TpArray<Weight>& w,
                              const ExecutionContext& ec) {
     detail::require_split_context(
         ec, "linear_add split: requires an ExecutionContext with two distinct devices");
-    if (x[0].ne[1] != x[1].ne[1]) {
-        throw std::invalid_argument("linear_add split: both ranks must carry the same token count");
-    }
-    if (w[0].qtype != w[1].qtype || w[0].layout != w[1].layout) {
-        throw std::invalid_argument("linear_add split: both ranks must carry the same weight format");
-    }
-    if (w[0].n != w[1].n) {
-        throw std::invalid_argument(
-            "linear_add split: both ranks must produce the same output extent N");
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        if (x[rank].ne[1] != x[0].ne[1]) {
+            throw std::invalid_argument(
+                "linear_add split: every rank must carry the same token count");
+        }
+        if (w[rank].qtype != w[0].qtype || w[rank].layout != w[0].layout) {
+            throw std::invalid_argument(
+                "linear_add split: every rank must carry the same weight format");
+        }
+        if (w[rank].n != w[0].n) {
+            throw std::invalid_argument(
+                "linear_add split: every rank must produce the same output extent N");
+        }
     }
 }
 
-void validate_add_split_residency(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                                  const std::array<Tensor, 2>& residual,
+void validate_add_split_residency(const TpArray<Tensor>& x, const TpArray<Weight>& w,
+                                  const TpArray<Tensor>& residual,
                                   const ExecutionContext& ec) {
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, w[slot].payload, residual[slot].data,
@@ -385,17 +401,17 @@ void issue_plain_rank(const Tensor& x, const Weight& w, Tensor& residual, Linear
 
 } // namespace
 
-void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                             const std::array<Tensor, 2>& residual,
-                             const std::array<Tensor, 2>& staging, LinearPolicy policy,
-                             const std::array<WorkspaceArena*, 2>& workspace,
+void linear_add_row_parallel(const TpArray<Tensor>& x, const TpArray<Weight>& w,
+                             const TpArray<Tensor>& residual,
+                             const TpArray<Tensor>& staging, LinearPolicy policy,
+                             const TpArray<WorkspaceArena*>& workspace,
                              const ExecutionContext& ec, const PeerEvents& events) {
     validate_policy(policy);
     validate_add_split_pair(x, w, ec);
     validate_add_split_residency(x, w, residual, ec);
 
-    std::array<Tensor, 2> target{residual[0], residual[1]};
-    std::array<Tensor, 2> scratch{staging[0], staging[1]};
+    TpArray<Tensor> target = detail::tp_array_copy(residual, ec.tp);
+    TpArray<Tensor> scratch = detail::tp_array_copy(staging, ec.tp);
     detail::for_each_rank(ec, [&](int rank) {
         const auto slot        = static_cast<std::size_t>(rank);
         const cudaStream_t s   = ec.dev[slot]->stream;
@@ -413,9 +429,9 @@ void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<We
     allreduce_sum(target, staging, ec, events);
 }
 
-void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                             const std::array<Tensor, 2>& residual,
-                             const std::array<Tensor, 2>& staging, const ExecutionContext& ec,
+void linear_add_row_parallel(const TpArray<Tensor>& x, const TpArray<Weight>& w,
+                             const TpArray<Tensor>& residual,
+                             const TpArray<Tensor>& staging, const ExecutionContext& ec,
                              const PeerEvents& events) {
     linear_add_row_parallel(x, w, residual, staging, LinearPolicy::A16Only, {nullptr, nullptr}, ec,
                             events);
@@ -426,10 +442,10 @@ void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual,
     detail::ggml_k_project_split(x, w, &residual, 1, true, stream, true, &workspace);
 }
 
-void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                       const std::array<Tensor, 2>& residual,
-                       const std::array<Tensor, 2>& staging,
-                       const std::array<WorkspaceArena*, 2>& workspace,
+void ggml_k_gdn_output(const TpArray<Tensor>& x, const TpArray<Weight>& w,
+                       const TpArray<Tensor>& residual,
+                       const TpArray<Tensor>& staging,
+                       const TpArray<WorkspaceArena*>& workspace,
                        const ExecutionContext& ec,
                        const PeerEvents& events) {
     validate_add_split_pair(x, w, ec);

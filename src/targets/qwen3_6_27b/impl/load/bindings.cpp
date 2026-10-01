@@ -199,8 +199,16 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
     // Both MLP matrices use the Volta QPN code layout.  The down matrix is row-parallel, but its
     // shard-local K extent is still a complete QPN tile (17408 / tp), so it can use the same
     // prepack transform as gate_up.
+    //
+    // [local patch 2026-09-30] Per-matrix guards. The original guarded both prepacks on
+    // `out.gate_up.qtype`, assuming per-layer-uniform quantization. W4A4W8A8 (per-matrix mixed
+    // NVFP4/FP8) breaks that: layers with gate_up=NVFP4 + down=FP8 sent the FP8 down through the
+    // NVFP4 prepack and tripped validate_nvfp4_weight (`invalid NVFP4 weight`). For per-layer
+    // uniform artifacts (official nvfp4) the two guards are behaviorally identical.
     if (out.gate_up.qtype == QType::NVFP4) {
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.gate_up);
+    }
+    if (out.down.qtype == QType::NVFP4) {
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.down);
     }
 #endif
@@ -387,6 +395,26 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
 
 void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, bool ggml_k) {
     const NumericFormat matrix_format = ggml_k ? NumericFormat::GGML_K : NumericFormat::FP8_E4M3FN_ROW_BF16S;
+    // Every matrix-carrying object is bound by the numeric format the artifact itself declares.
+    // The closed Qwen3.8 NVFP4 profile pairs row-scaled FP8 projections with NVFP4 MLPs (the
+    // W4A4W8A8 derivative), while the pure-W4A4 derivative declares the attention and GDN
+    // projections NVFP4 as well. An NVFP4 object therefore carries its own divisor companion
+    // instead of this profile hardcoding one format for a whole group. The divisor object names
+    // are the ones the engine's own NVFP4 profile already uses (bind_nvfp4_text_layers).
+    const auto declared_nvfp4 = [&binder](const std::string& name) {
+        const artifact::ObjectDescriptor* object = binder.find(name);
+        const artifact::TensorDescriptor* tensor = std::get_if<artifact::TensorDescriptor>(object);
+        return tensor != nullptr && tensor->format == artifact::NumericFormat::NVFP4;
+    };
+    const auto bind_matrix = [&binder, &declared_nvfp4, matrix_format](
+        const std::string& name, std::int32_t rows, std::int32_t columns,
+        const std::string& divisor_name) -> WeightPlan {
+        if (declared_nvfp4(name)) {
+            return bind_nvfp4_weight(binder, name, rows, columns, divisor_name);
+        }
+        return bind_weight(binder, name, matrix_format,
+                           {static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(columns)});
+    };
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
@@ -395,15 +423,17 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, b
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
             target.attention.projection = FusedAttentionProjectionPlan{
-                .query_key_gate_value = bind_weight(
-                    binder, prefix + "attention/query_key_gate_value", matrix_format, {14336, 5120}),
+                .query_key_gate_value =
+                    bind_matrix(prefix + "attention/query_key_gate_value", 14336, 5120,
+                                prefix + "attention/input_projection/input_scale_divisor"),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
             target.attention.output =
-                bind_weight(binder, prefix + "attention/output", matrix_format, {5120, 6144});
+                bind_matrix(prefix + "attention/output", 5120, 6144,
+                            prefix + "attention/output_projection/input_scale_divisor");
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {48});
@@ -417,20 +447,27 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, b
             };
             target.gdn.input_projection = FusedGdnInputProjectionPlan{
                 .query_key_value_z =
-                    bind_weight(binder, prefix + "gdn/query_key_value_z", matrix_format, {16384, 5120}),
+                    bind_matrix(prefix + "gdn/query_key_value_z", 16384, 5120,
+                                prefix + "gdn/input_projection/input_scale_divisor"),
             };
             target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                              NumericFormat::BF16, {128});
-            target.gdn.output = bind_weight(binder, prefix + "gdn/output", matrix_format, {5120, 6144});
+            target.gdn.output = bind_matrix(prefix + "gdn/output", 5120, 6144,
+                                            prefix + "gdn/output_projection/input_scale_divisor");
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
-        if (!ggml_k && layer < 56) {
+        if (!ggml_k) {
+            // The MLP numeric format is declared per-OBJECT by the artifact itself. The closed
+            // Qwen3.8 NVFP4 profile declares layers 0-55 as NVFP4 (both objects) and 56-63 as
+            // row-scaled FP8; mixed-precision derivatives quantize gate_up and down
+            // independently, so each object must follow its own declared format instead of a
+            // hardcoded layer cutoff.
             target.mlp.gate_up =
-                bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
-                                  prefix + "mlp/gate_up_projection/input_scale_divisor");
-            target.mlp.down = bind_nvfp4_weight(binder, prefix + "mlp/down", 5120, 17408,
-                                                prefix + "mlp/down_projection/input_scale_divisor");
+                bind_matrix(prefix + "mlp/gate_up", 34816, 5120,
+                            prefix + "mlp/gate_up_projection/input_scale_divisor");
+            target.mlp.down = bind_matrix(prefix + "mlp/down", 5120, 17408,
+                                          prefix + "mlp/down_projection/input_scale_divisor");
         } else {
             target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", matrix_format, {34816, 5120});
             target.mlp.down    = bind_weight(binder, prefix + "mlp/down", matrix_format, {5120, 17408});
@@ -886,7 +923,7 @@ ShardPlan plan_for(std::string_view object, int tp, const TextConfig& config,
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features, int tp) {
     if (tp < 1 || tp > static_cast<int>(artifact::kMaximumDevices)) {
-        throw std::invalid_argument("qwen3_6_27b: tp must be 1 or 2");
+        throw std::invalid_argument("qwen3_6_27b: tp must be 1, 2, or 4");
     }
     // The binder's arena count and the shard map's device count are two halves of one decision.
     // If they disagree, nothing downstream notices: a tp2 map on a one-device binder would place
@@ -1053,14 +1090,21 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
                                  int tensor_parallel)
     : backing(std::move(materialized)), tp(tensor_parallel) {
-    if (tp != 1 && tp != 2) { throw std::invalid_argument("qwen3_6_27b: tp must be 1 or 2"); }
+    if (tp != 1 && tp != 2 && tp != 4) {
+        throw std::invalid_argument("qwen3_6_27b: tp must be 1, 2, or 4");
+    }
     if (tp > backing.device_count()) {
         throw std::invalid_argument("qwen3_6_27b: tp exceeds the materialized device count");
     }
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     build_device_view(plan, 0, runtime);
-    if (tp == 2) { build_device_view(plan, 1, runtime_peer.emplace()); }
+    // Ranks 1..tp-1 each own their own shard view. Building a view is pure descriptor work (the
+    // weights themselves are already placed by the loader), so this loop is O(tp) metadata, not
+    // O(tp) model copies.
+    for (int rank = 1; rank < tp; ++rank) {
+        build_device_view(plan, rank, runtime_peers[static_cast<std::size_t>(rank)].emplace());
+    }
 }
 
 // Builds `device`'s own model view. At tp == 1 this is the whole model on device 0; at tp == 2

@@ -12,6 +12,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::ops {
 
@@ -181,9 +182,9 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
  * that need none; Q4G64_F16S and GGML_K require an arena for their projected plane.
  * @param[in] ec Execution context holding exactly two distinct devices.
  */
-void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                                   const std::array<Tensor, 2>& out, LinearPolicy policy,
-                                   const std::array<WorkspaceArena*, 2>& workspace,
+void linear_swiglu_column_parallel(const TpArray<Tensor>& x, const TpArray<Weight>& w,
+                                   const TpArray<Tensor>& out, LinearPolicy policy,
+                                   const TpArray<WorkspaceArena*>& workspace,
                                    const ExecutionContext& ec);
 
 /**
@@ -191,7 +192,7 @@ void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::ar
  * profiles whose capacity query returns zero. Use the policy-bearing overload with an allocated
  * arena for every route requiring scratch, including Volta NVFP4 and wide row-scaled FP8.
  */
-void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                                   const std::array<Tensor, 2>& out, const ExecutionContext& ec);
+void linear_swiglu_column_parallel(const TpArray<Tensor>& x, const TpArray<Weight>& w,
+                                   const TpArray<Tensor>& out, const ExecutionContext& ec);
 
 } // namespace ninfer::ops

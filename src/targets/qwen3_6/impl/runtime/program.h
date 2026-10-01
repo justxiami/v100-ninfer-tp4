@@ -23,6 +23,7 @@
 #include <optional>
 #include <span>
 #include <vector>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
@@ -127,14 +128,13 @@ struct RewriteCheckpoint {
 struct SequenceKVBundle {
     PagedKVAllocation text;
     std::optional<PagedKVAllocation> backend;
-    // Rank 1's allocation in ITS OWN text KV pool at tp == 2. The two pools have identical page
-    // geometry (only the per-page byte count differs, because rank 1 holds 2 of the 4 KV heads),
-    // and every pool operation below is issued on both in the same order, so the two allocations
-    // hold the same page ids and publish identical block tables.
-    std::optional<PagedKVAllocation> text_peer;
-    // Rank 1's allocation in ITS OWN MTP (backend) KV pool at tp == 2. Same lockstep argument as
-    // `text_peer`: identical page geometry, every pool operation issued on both in the same order.
-    std::optional<PagedKVAllocation> backend_peer;
+    // Every non-zero rank's allocation in ITS OWN text KV pool, INDEXED BY RANK. All the pools
+    // have identical page geometry (only the per-page byte count differs, because rank r holds
+    // 1/tp of the KV heads), and every pool operation below is issued on all of them in the same
+    // order, so all the allocations hold the same page ids and publish identical block tables.
+    TpArray<std::optional<PagedKVAllocation>> text_peers{};
+    // The same for the MTP (backend) KV pool: identical page geometry, identical issue order.
+    TpArray<std::optional<PagedKVAllocation>> backend_peers{};
 };
 
 struct DecodeGraphProfile {
@@ -208,9 +208,9 @@ struct RequestControl {
     std::optional<Prefill> prefill;
 };
 
-// Rank 1's complete runtime mirror: its own arenas, its own shard of the weights, its own halved
-// decoder state, and its own RoundState. It owns no bookkeeping -- lanes, page accounting,
-// sampling and the pinned host round buffers all live once, on rank 0.
+// One non-zero rank's complete runtime mirror: its own arenas, its own shard of the weights, its
+// own divided decoder state, and its own RoundState. It owns no bookkeeping -- lanes, page
+// accounting, sampling and the pinned host round buffers all live once, on rank 0.
 struct PeerRuntime {
     PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer_model,
                 const SequencePlanImpl& plan);
@@ -242,8 +242,9 @@ struct PeerRuntime {
 
 class ProgramImplCore {
 public:
-    ProgramImplCore(const LoadedModelData& model, const LoadedModelData* peer_model,
-                    const SequencePlanImpl& plan, ExecutionContext& execution);
+    ProgramImplCore(const LoadedModelData& model,
+                    std::span<const LoadedModelData* const> peer_models, const SequencePlanImpl& plan,
+                    ExecutionContext& execution);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan
@@ -302,7 +303,7 @@ public:
     // single cross-device graph materializes driver state on BOTH devices, and each is checked
     // against the SAME per-device allowance -- graph_allowance_bytes is a per-device budget, like
     // every other field in device_reservation_bytes.
-    std::array<std::size_t, 2> graph_observed_bytes{0, 0};
+    TpArray<std::size_t> graph_observed_bytes{0, 0};
     // Node count of ONE captured decode graph (the first profile of the captured family). At tp2
     // one graph holds both devices' nodes, so this is the direct measurement of whether the peer's
     // half of the schedule was captured rather than left out.
@@ -324,16 +325,34 @@ public:
     //
     // `rope_frequency[rank]` is the descriptor every text rope call site reads (through
     // `ExecutionCore::rope_frequency` -> `TextContext`); a null `inv_frequency` IS the native path.
-    std::array<DeviceBuffer, 2> rope_frequency_storage;
-    std::array<ops::RopeFrequencyOverride, 2> rope_frequency{};
+    TpArray<DeviceBuffer> rope_frequency_storage;
+    TpArray<ops::RopeFrequencyOverride> rope_frequency{};
     const RopeMode rope_mode;
     const std::uint32_t effective_max_context;
     const double yarn_mscale;
-    std::optional<PeerRuntime> peer;
+    // One runtime mirror per non-zero rank, INDEXED BY RANK (slot 0 unused, slots at or above the
+    // width empty). `peer()` is the rank-1 accessor the tp2-only paths read.
+    TpArray<std::optional<PeerRuntime>> peers{};
     std::optional<ops::PeerEvents> peer_events;
-    // Created once at tp2 when graphs are on; forks rank 1's stream into rank 0's capture.
+    // Created once at tp2 when graphs are on; forks rank 1's stream into rank 0's capture. The
+    // wider bridge (1 origin + 3 peers) is W4 and not built yet -- tp > 2 runs eagerly.
     std::optional<DecodeGraphPeerBridge> graph_bridge;
-    std::optional<schedule::TpPeerCore> peer_core;
+    TpArray<std::optional<schedule::TpPeerCore>> peer_cores{};
+    [[nodiscard]] PeerRuntime* peer() noexcept {
+        return peers[1].has_value() ? &*peers[1] : nullptr;
+    }
+    [[nodiscard]] const PeerRuntime* peer() const noexcept {
+        return peers[1].has_value() ? &*peers[1] : nullptr;
+    }
+    // The per-rank core table an ExecutionCore is initialised with: one entry per live rank.
+    [[nodiscard]] TpArray<const schedule::TpPeerCore*> peer_lanes() const;
+    // Retire (and optionally reset) EVERY non-zero rank, not just the one `peer()` names. The call
+    // sites in program_impl.h used to spell `if (peer()) { peer()->device.synchronize(); }`, which
+    // at tp > 2 left ranks 2..n-1 neither synchronized nor reset while their streams ran the same
+    // rounds and their arenas were about to be reused. Rank 1 is the historical single-peer case;
+    // with a wider width these two helpers are the only correct form.
+    void synchronize_peers();
+    void reset_peer_works();
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
@@ -378,20 +397,27 @@ public:
     // fault. A separate pinned buffer rather than a patched copy at issue time, for the same
     // reason as `mtp_peer_host_ingress`: the upload is inside the captured decode graph, which
     // re-reads this exact host address at every replay.
-    std::optional<PinnedHostBuffer> ordinary_peer_host;
-    qwen3_6::OrdinaryDecodeIngress* ordinary_peer_host_ingress = nullptr;
+    // One pinned mirror of rank 0's ordinary ingress per NON-ZERO rank, indexed by rank (slot 0
+    // unused, slots at or above the width empty). Each carries the same bytes as rank 0's except
+    // that every row's `sampling[row].token_counts` is nulled -- see publish_peer_ordinary_ingress.
+    TpArray<std::optional<PinnedHostBuffer>> ordinary_peer_host{};
+    TpArray<qwen3_6::OrdinaryDecodeIngress*> ordinary_peer_host_ingress{};
     bool peer_egress_check_enabled     = false;
     std::uint64_t peer_egress_rounds     = 0;
     std::uint64_t peer_egress_mismatches = 0;
     std::optional<PinnedHostBuffer> mtp_host;
     qwen3_6::MtpDecodeIngress* mtp_host_ingress = nullptr;
     qwen3_6::MtpDecodeEgress* mtp_host_egress   = nullptr;
-    // Rank 1's own pinned MTP ingress: byte-for-byte rank 0's record except that each row's
-    // `sampling[row].token_counts` names rank 1's counter lane. It has to be a separate pinned
+    // One pinned MTP ingress mirror per NON-ZERO rank, indexed by rank (slot 0 unused, slots at or
+    // above the width empty). Each is byte-for-byte rank 0's record except that every row's
+    // `sampling[row].token_counts` names THAT rank's counter lane: the MTP round is replicated on
+    // every rank and `speculative_accept_greedy_drafts` reads and atomically writes that pointer on
+    // each of them, so a rank handed another rank's lane is a silent double-increment (and a rank
+    // handed a null one samples without a repetition penalty). It has to be a separate pinned
     // buffer rather than a patched copy made at issue time, because the ingress upload is inside
     // the captured decode graph and the graph re-reads this exact host address at every replay.
-    std::optional<PinnedHostBuffer> mtp_peer_host;
-    qwen3_6::MtpDecodeIngress* mtp_peer_host_ingress = nullptr;
+    TpArray<std::optional<PinnedHostBuffer>> mtp_peer_host{};
+    TpArray<qwen3_6::MtpDecodeIngress*> mtp_peer_host_ingress{};
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
@@ -434,8 +460,8 @@ private:
     // sampled -- the only counter increment that happens on rank 0 and not on rank 1.
     [[nodiscard]] static Tensor token_counts_lane(const Tensor& storage, std::uint32_t lane);
     void publish_peer_token_counts(const SequenceState& sequence);
-    // Mirrors `mtp_host_ingress` into `mtp_peer_host_ingress`, swapping every row's counter
-    // pointer for rank 1's. No-op at tp1 or without MTP.
+    // Mirrors `mtp_host_ingress` into `mtp_peer_host_ingress`, swapping each rank's rows' counter
+    // pointer for THAT rank's lane. No-op at tp1 or without MTP.
     void publish_peer_mtp_ingress(std::span<const std::uint32_t> lanes);
     void publish_peer_dflash_ingress(std::span<const std::uint32_t> lanes);
     // Mirrors `ordinary_host_ingress` into `ordinary_peer_host_ingress` with every row's counter
@@ -447,6 +473,8 @@ private:
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);
+    // The rank-parameterised form: writes `value` into `tensor` on the given stream's device.
+    void set_i32_on(std::int32_t value, Tensor& tensor, cudaStream_t stream);
     void set_peer_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
@@ -485,7 +513,9 @@ private:
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
-    [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view_peer(const SequenceState& sequence) const;
+    // One MTP KV window per non-zero rank, indexed by rank; all-empty when MTP is off.
+    [[nodiscard]] TpArray<qwen3_6::PagedKVCacheView>
+    mtp_kv_views_peer(const SequenceState& sequence) const;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

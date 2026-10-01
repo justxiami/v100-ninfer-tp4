@@ -59,7 +59,15 @@ void require_supported_tp_features(const EngineOptions& options) {
     // The Vision encoder runs entirely on the primary device against replicated weights and has no
     // split path; the target layer states the same rule (layouts_impl.h validate_target_options).
     if (options.enable_vision) {
-        throw std::invalid_argument("--tp 2 does not support Vision in this build; use --tp 1");
+        throw std::invalid_argument("tp > 1 does not support Vision in this build; use --tp 1");
+    }
+    // DFlash's proposal path is rank0-centric by construction (gather_columns_rank0 /
+    // broadcast_rank0, the selector image rank 0 alone consumes). There is no rank0 generalization
+    // above two ranks, so refuse instead of running a two-rank protocol on a four-rank context --
+    // those two ops throw for tp > 2 as a second line of defence. MTP has no such assumption.
+    if (options.tp > 2 && options.speculative.backend == SpeculativeBackend::DFlash) {
+        throw std::invalid_argument(
+            "--spec dflash is a two-rank path; it is not supported at tp > 2 (use --spec mtp)");
     }
 }
 
@@ -67,13 +75,15 @@ void require_supported_tp_features(const EngineOptions& options) {
 // construct. ExecutionContext itself validates that the ids exist, are DISTINCT, and share a
 // compute capability.
 std::vector<int> resolve_execution_device_ids(const EngineOptions& options) {
-    if (options.tp != 1 && options.tp != 2) {
-        throw std::invalid_argument("EngineOptions.tp must be 1 or 2");
+    // The degrees with a shard plan (1, 2, 4). 3 is absent on purpose: it divides neither the
+    // hidden size nor the vocabulary, so no split of the resident model exists for it.
+    if (options.tp != 1 && options.tp != 2 && options.tp != 4) {
+        throw std::invalid_argument("EngineOptions.tp must be 1, 2 or 4");
     }
     require_supported_tp_features(options);
     if (options.devices.empty()) {
         if (options.tp != 1) {
-            throw std::invalid_argument("--tp 2 requires an explicit --devices list");
+            throw std::invalid_argument("tp > 1 requires an explicit --devices list");
         }
         return {options.device};
     }

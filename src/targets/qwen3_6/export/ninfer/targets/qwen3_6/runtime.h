@@ -203,7 +203,7 @@ private:
 
     template <class V>
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
-                                                      const typename V::ModelView*,
+                                                      std::span<const typename V::ModelView* const>,
                                                       typename V::WeightsProfile, SequencePlan<V>&&,
                                                       ExecutionContext&);
 };
@@ -213,13 +213,14 @@ template <class Variant>
 make_sequence_planner(DeviceContext& device, const EngineOptions& options,
                       typename Variant::WeightsProfile weights_profile);
 
-// `peer_model` is rank 1's own model view at tp == 2 and nullptr at tp == 1; `execution` supplies
-// the device contexts (one or two). The two must agree: a non-null peer view with a tp1 execution
-// context, or the reverse, is rejected.
+// `peer_models` is INDEXED BY RANK and has exactly `execution.tp` entries: slot 0 is unused and
+// every slot r > 0 names rank r's own model view. `execution` supplies the device contexts, one per
+// rank. The two must agree -- a span whose size is not the width, or a null view at a live rank, is
+// rejected.
 template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
 create_program(const typename Variant::ModelView& model,
-               const typename Variant::ModelView* peer_model,
+               std::span<const typename Variant::ModelView* const> peer_models,
                typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
                ExecutionContext& execution);
 

@@ -49,6 +49,11 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     case Nvfp4Problem::MlpGateUpTp2Column:
     case Nvfp4Problem::Residual6144Tp2Row:
     case Nvfp4Problem::Residual17408Tp2Row:
+    case Nvfp4Problem::AttnInputTp4Column:
+    case Nvfp4Problem::GdnInputTp4Column:
+    case Nvfp4Problem::MlpGateUpTp4Column:
+    case Nvfp4Problem::Residual6144Tp4Row:
+    case Nvfp4Problem::Residual17408Tp4Row:
         break; // nvfp4_parent_problem never returns a shard problem
     }
     throw std::logic_error("unreachable NVFP4 linear problem");

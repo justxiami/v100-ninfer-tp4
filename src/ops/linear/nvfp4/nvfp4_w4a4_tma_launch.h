@@ -33,6 +33,17 @@ void launch_nvfp4_w4a4_tma_attention_shard(const std::uint8_t* activation_codes,
                                            __nv_bfloat16* value, std::int32_t tokens, float alpha,
                                            cudaStream_t stream);
 
+// The tp4 sibling, instantiated at Nvfp4AttnInputTp4ColumnGeometry (each device's 3584-row
+// quarter: 1536 query | 256 key | 1536 gate | 256 value).
+void launch_nvfp4_w4a4_tma_attention_shard_tp4(const std::uint8_t* activation_codes,
+                                               const std::uint8_t* activation_scales,
+                                               const std::uint8_t* weight_codes,
+                                               const std::uint8_t* weight_scales,
+                                               __nv_bfloat16* query, __nv_bfloat16* gate,
+                                               __nv_bfloat16* key, __nv_bfloat16* value,
+                                               std::int32_t tokens, float alpha,
+                                               cudaStream_t stream);
+
 void launch_nvfp4_w4a4_tma_gdn(const std::uint8_t* activation_codes,
                                const std::uint8_t* activation_scales,
                                const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
@@ -48,6 +59,15 @@ void launch_nvfp4_w4a4_tma_gdn_shard(const std::uint8_t* activation_codes,
                                      const std::uint8_t* weight_scales, __nv_bfloat16* qkv,
                                      __nv_bfloat16* z, std::int32_t tokens, float alpha,
                                      cudaStream_t stream);
+
+// The tp4 sibling, instantiated at Nvfp4GdnInputTp4ColumnGeometry (each device's 4096-row quarter:
+// qkv[2560,T] = 512 query | 512 key | 1536 value, z[1536,T]).
+void launch_nvfp4_w4a4_tma_gdn_shard_tp4(const std::uint8_t* activation_codes,
+                                         const std::uint8_t* activation_scales,
+                                         const std::uint8_t* weight_codes,
+                                         const std::uint8_t* weight_scales, __nv_bfloat16* qkv,
+                                         __nv_bfloat16* z, std::int32_t tokens, float alpha,
+                                         cudaStream_t stream);
 
 void launch_nvfp4_w4a4_tma_linear_add(Nvfp4Problem problem, const std::uint8_t* activation_codes,
                                       const std::uint8_t* activation_scales,

@@ -53,6 +53,13 @@ void launch_nvfp4_linear_swiglu_w4a4_tma_shard(const std::uint8_t*, const std::u
     reject_nvfp4_a4();
 }
 
+void launch_nvfp4_linear_swiglu_w4a4_tma_shard_tp4(const std::uint8_t*, const std::uint8_t*,
+                                                   const std::uint8_t*, const std::uint8_t*,
+                                                   __nv_bfloat16*, std::int32_t, float,
+                                                   cudaStream_t) {
+    reject_nvfp4_a4();
+}
+
 void nvfp4_linear_add_w4a4_launch(const Tensor&, const Weight&, Tensor&, Nvfp4W4a4Workspace,
                                   cudaStream_t) {
     reject_nvfp4_a4();

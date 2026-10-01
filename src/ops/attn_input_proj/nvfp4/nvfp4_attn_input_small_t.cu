@@ -99,6 +99,9 @@ constexpr auto kLaunchers = make_launchers<Nvfp4AttnInputGeometry>(
 constexpr auto kLaunchersShard = make_launchers<Nvfp4AttnInputTp2ColumnGeometry>(
     std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
 
+constexpr auto kLaunchersShardTp4 = make_launchers<Nvfp4AttnInputTp4ColumnGeometry>(
+    std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+
 } // namespace
 
 void nvfp4_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
@@ -108,7 +111,15 @@ void nvfp4_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tens
 
 void nvfp4_attn_input_small_t_launch_shard(const Tensor& x, const Weight& weight, Tensor& q,
                                            Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
-    kLaunchersShard[x.ne[1] - kNvfp4FirstSmallT](x, weight, q, gate, k, v, stream);
+    if (weight.n == Nvfp4AttnInputTp2ColumnGeometry::kOutputRows) {
+        kLaunchersShard[x.ne[1] - kNvfp4FirstSmallT](x, weight, q, gate, k, v, stream);
+        return;
+    }
+    if (weight.n == Nvfp4AttnInputTp4ColumnGeometry::kOutputRows) {
+        kLaunchersShardTp4[x.ne[1] - kNvfp4FirstSmallT](x, weight, q, gate, k, v, stream);
+        return;
+    }
+    throw std::invalid_argument("nvfp4 attn_input_proj column-parallel: unsupported shard rows");
 }
 
 } // namespace ninfer::ops::detail

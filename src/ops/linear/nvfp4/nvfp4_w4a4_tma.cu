@@ -152,6 +152,33 @@ void launch_nvfp4_w4a4_tma_linear(Nvfp4Problem problem, const std::uint8_t* acti
                                                         weight_codes, weight_scales, output, tokens,
                                                         alpha, stream);
         return;
+    // TP4 shards inherit their parent's TMA schedule, exactly as the tp2 shards do.
+    case Nvfp4Problem::AttnInputTp4Column:
+        launch_linear<Nvfp4AttnInputTp4ColumnGeometry>(activation_codes, activation_scales,
+                                                       weight_codes, weight_scales, output, tokens,
+                                                       alpha, stream);
+        return;
+    case Nvfp4Problem::GdnInputTp4Column:
+        launch_linear<Nvfp4GdnInputTp4ColumnGeometry>(activation_codes, activation_scales,
+                                                      weight_codes, weight_scales, output, tokens,
+                                                      alpha, stream);
+        return;
+    case Nvfp4Problem::MlpGateUpTp4Column:
+        launch_tma<Nvfp4MlpGateUpTp4ColumnGeometry, TmaM256N128S2>(
+            activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
+            Nvfp4IdentityEpilogue{},
+            Nvfp4ContiguousOutput{output, Nvfp4MlpGateUpTp4ColumnGeometry::kOutputRows}, stream);
+        return;
+    case Nvfp4Problem::Residual6144Tp4Row:
+        launch_linear<Nvfp4Residual6144Tp4RowGeometry>(activation_codes, activation_scales,
+                                                       weight_codes, weight_scales, output, tokens,
+                                                       alpha, stream);
+        return;
+    case Nvfp4Problem::Residual17408Tp4Row:
+        launch_linear<Nvfp4Residual17408Tp4RowGeometry>(activation_codes, activation_scales,
+                                                        weight_codes, weight_scales, output, tokens,
+                                                        alpha, stream);
+        return;
     }
     // Unlike the launchers in this family that are generated from NINFER_NVFP4_LINEAR_PROBLEMS,
     // this switch is hand-maintained (each problem picks its own TMA schedule), so a newly
@@ -185,6 +212,22 @@ void launch_nvfp4_w4a4_tma_attention_shard(const std::uint8_t* activation_codes,
         Nvfp4IdentityEpilogue{}, AttentionOutputShard{query, key, gate, value}, stream);
 }
 
+// The tp4 column-shard sibling, instantiated at Nvfp4AttnInputTp4ColumnGeometry ([3584,5120], each
+// device's own head-local 1536 query | 256 key | 1536 gate | 256 value). Every section is still a
+// multiple of the 128-row N tile (1536 = 12*128, 256 = 2*128).
+void launch_nvfp4_w4a4_tma_attention_shard_tp4(const std::uint8_t* activation_codes,
+                                               const std::uint8_t* activation_scales,
+                                               const std::uint8_t* weight_codes,
+                                               const std::uint8_t* weight_scales,
+                                               __nv_bfloat16* query, __nv_bfloat16* gate,
+                                               __nv_bfloat16* key, __nv_bfloat16* value,
+                                               std::int32_t tokens, float alpha,
+                                               cudaStream_t stream) {
+    launch_tma<Nvfp4AttnInputTp4ColumnGeometry, TmaM256N128>(
+        activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
+        Nvfp4IdentityEpilogue{}, AttentionOutputShard{query, key, gate, value}, stream);
+}
+
 void launch_nvfp4_w4a4_tma_gdn(const std::uint8_t* activation_codes,
                                const std::uint8_t* activation_scales,
                                const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
@@ -209,6 +252,21 @@ void launch_nvfp4_w4a4_tma_gdn_shard(const std::uint8_t* activation_codes,
         activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
         Nvfp4IdentityEpilogue{},
         Nvfp4GdnInputShardOutput<Nvfp4GdnInputTp2ColumnGeometry>{qkv, z}, stream);
+}
+
+// The tp4 column-shard sibling, instantiated at Nvfp4GdnInputTp4ColumnGeometry ([4096,5120]: each
+// device's qkv[2560,T] packs 512 query | 512 key | 1536 value, z[1536,T]). kBlockN=128 divides
+// every section (512, 1536).
+void launch_nvfp4_w4a4_tma_gdn_shard_tp4(const std::uint8_t* activation_codes,
+                                         const std::uint8_t* activation_scales,
+                                         const std::uint8_t* weight_codes,
+                                         const std::uint8_t* weight_scales, __nv_bfloat16* qkv,
+                                         __nv_bfloat16* z, std::int32_t tokens, float alpha,
+                                         cudaStream_t stream) {
+    launch_tma<Nvfp4GdnInputTp4ColumnGeometry, TmaM256N128>(
+        activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
+        Nvfp4IdentityEpilogue{},
+        Nvfp4GdnInputShardOutput<Nvfp4GdnInputTp4ColumnGeometry>{qkv, z}, stream);
 }
 
 template <class Geometry>
@@ -255,6 +313,16 @@ void launch_nvfp4_w4a4_tma_linear_add(Nvfp4Problem problem, const std::uint8_t* 
                                                             weight_codes, weight_scales, residual,
                                                             tokens, alpha, stream);
         return;
+    case Nvfp4Problem::Residual6144Tp4Row:
+        launch_linear_add<Nvfp4Residual6144Tp4RowGeometry>(activation_codes, activation_scales,
+                                                           weight_codes, weight_scales, residual,
+                                                           tokens, alpha, stream);
+        return;
+    case Nvfp4Problem::Residual17408Tp4Row:
+        launch_linear_add<Nvfp4Residual17408Tp4RowGeometry>(activation_codes, activation_scales,
+                                                            weight_codes, weight_scales, residual,
+                                                            tokens, alpha, stream);
+        return;
     // linear_add is defined only for the residual geometries (tp1 and their tp2 row-parallel
     // halves). Everything else -- the input projections and their tp2 column shards -- is a caller
     // error and must SAY so. These previously fell through a bare `return`, i.e. a silent no-op
@@ -266,6 +334,9 @@ void launch_nvfp4_w4a4_tma_linear_add(Nvfp4Problem problem, const std::uint8_t* 
     case Nvfp4Problem::AttnInputTp2Column:
     case Nvfp4Problem::GdnInputTp2Column:
     case Nvfp4Problem::MlpGateUpTp2Column:
+    case Nvfp4Problem::AttnInputTp4Column:
+    case Nvfp4Problem::GdnInputTp4Column:
+    case Nvfp4Problem::MlpGateUpTp4Column:
         break;
     }
     throw std::invalid_argument("nvfp4 W4A4 TMA linear_add: unsupported problem");

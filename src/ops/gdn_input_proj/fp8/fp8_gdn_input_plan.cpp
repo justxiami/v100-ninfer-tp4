@@ -99,8 +99,11 @@ void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& q
 void fp8_gdn_input_a16_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
                                       Tensor& z, WorkspaceArena* workspace,
                                       cudaStream_t stream) {
-    constexpr std::int32_t kQkvRows = 5120;
-    constexpr std::int32_t kZRows   = 3072;
+    // 5120|3072 at tp2, 2560|1536 at tp4: the row strides of the chunk pointer arithmetic below,
+    // taken from the shard's own registered geometry so a tp4 weight cannot be strided as a tp2 one.
+    const bool tp4                   = weight.n == Fp8GdnInputTp4ColumnGeometry::kOutputRows;
+    const std::int32_t kQkvRows      = tp4 ? 2560 : 5120;
+    const std::int32_t kZRows        = tp4 ? 1536 : 3072;
 #ifdef NINFER_VOLTA_BUILD
     if (x.ne[1] >= kVoltaCutlassMinT && workspace != nullptr) {
         fp8_gdn_input_cutlass_sm70_launch_shard(x, weight, qkv, z, *workspace, stream);

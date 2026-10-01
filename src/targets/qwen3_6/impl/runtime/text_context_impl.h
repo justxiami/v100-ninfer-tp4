@@ -1,4 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
+
+#include <cmath>
+#include <cstring>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
@@ -41,6 +44,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
@@ -139,6 +143,39 @@ private:
     T previous_;
 };
 
+// Binds one per-call control tensor on every non-zero rank for the enclosing scope, restoring the
+// previous bindings on exit. `member` names the TextRankBinding field; `values[r]` is rank r's own
+// tensor. At tp == 1 there are no peers and this is a no-op.
+class ScopedRankTensorBinding {
+public:
+    ScopedRankTensorBinding(std::int32_t tp, std::array<TextRankBinding, kMaximumDevices>& ranks,
+                            const Tensor* TextRankBinding::*member,
+                            const std::array<const Tensor*, kMaximumDevices>& values)
+        : tp_(tp), ranks_(&ranks), member_(member) {
+        for (std::int32_t r = 1; r < tp_; ++r) {
+            const auto slot         = static_cast<std::size_t>(r);
+            previous_[slot]         = (*ranks_)[slot].*member_;
+            (*ranks_)[slot].*member_ = values[slot];
+        }
+    }
+
+    ScopedRankTensorBinding(const ScopedRankTensorBinding&)            = delete;
+    ScopedRankTensorBinding& operator=(const ScopedRankTensorBinding&) = delete;
+
+    ~ScopedRankTensorBinding() {
+        for (std::int32_t r = 1; r < tp_; ++r) {
+            const auto slot         = static_cast<std::size_t>(r);
+            (*ranks_)[slot].*member_ = previous_[slot];
+        }
+    }
+
+private:
+    std::int32_t tp_;
+    std::array<TextRankBinding, kMaximumDevices>* ranks_;
+    const Tensor* TextRankBinding::*member_;
+    std::array<const Tensor*, kMaximumDevices> previous_{};
+};
+
 } // namespace
 
 void DFlashFeatureSink::begin(const Tensor& value) {
@@ -220,21 +257,36 @@ void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_
 
 TextContext::TextContext(
     DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
-    const std::array<ops::RopeFrequencyOverride, kTensorParallelWidth>& rope_frequency,
+    const TpArray<ops::RopeFrequencyOverride>& rope_frequency,
     qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state, qwen3_6::RoundState& io,
     Tensor& prefill_hidden, std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
     qwen3_6::PagedKVCacheView mtp_kv, const qwen3_6::PagedKVCache* batch_text_kv,
-    const qwen3_6::PagedKVCache* batch_mtp_kv, const TpExecution* tp)
+    const qwen3_6::PagedKVCache* batch_mtp_kv, const TpPeers& peers)
     : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
       prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base),
-      rope_frequency_(rope_frequency), batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv),
-      tp_(tp) {
-    if (tp_ != nullptr) {
-        if (!tp_->complete() || tp_->execution->tp != 2 || !tp_->events->live()) {
-            throw std::invalid_argument("tensor-parallel TextContext binding is incomplete");
-        }
-        if (mtp_enabled() != (tp_->mtp_kv.valid() || tp_->batch_mtp_kv != nullptr)) {
-            throw std::invalid_argument("tensor-parallel MTP storage disagrees between ranks");
+      rope_frequency_(rope_frequency), batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv) {
+    // One lane per non-zero rank, in order. All slots empty is tp == 1, where nothing below changes.
+    for (std::int32_t r = 1; r < static_cast<std::int32_t>(kMaximumDevices); ++r) {
+        const auto slot = static_cast<std::size_t>(r);
+        if (!peers[slot].has_value()) { break; }
+        ranks_[slot].execution = *peers[slot];
+        tp_count_              = r + 1;
+    }
+    if (tp_count_ > 1) {
+        for (std::int32_t r = 1; r < tp_count_; ++r) {
+            const TpExecution& lane = ranks_[static_cast<std::size_t>(r)].execution;
+            if (!lane.complete() || lane.execution == nullptr || lane.execution->tp != tp_count_) {
+                throw std::invalid_argument("tensor-parallel TextContext binding is incomplete");
+            }
+            // The pull protocol's event choreography only exists at a width of exactly two.
+            if (tp_count_ == 2 && !(lane.events != nullptr && lane.events->live())) {
+                throw std::invalid_argument("tensor-parallel TextContext binding is incomplete");
+            }
+            // Every rank must agree about the MTP KV storage: one rank carrying an MTP window while
+            // another does not would have them run different schedules.
+            if (mtp_enabled() != (lane.mtp_kv.valid() || lane.batch_mtp_kv != nullptr)) {
+                throw std::invalid_argument("tensor-parallel MTP storage disagrees between ranks");
+            }
         }
     }
     if (prefill_chunk_ == 0 ||
@@ -277,18 +329,19 @@ void TextContext::bind() {
     embed_      = &weights_.token_embedding;
     final_norm_ = &weights_.final_norm;
     lm_head_    = &weights_.output_head;
-    if (tp_ != nullptr) {
-        // Rank 1's bindings point into ITS OWN model view, whose sharded extents are already
-        // halved by the loader. Norms and the embedding table are replicated, so both ranks bind
-        // structurally identical -- but physically distinct, per-device -- objects.
-        const LoadedModelData& peer = *tp_->weights;
-        embed_peer_                 = &peer.token_embedding;
-        final_norm_peer_            = &peer.final_norm;
-        lm_head_peer_               = &peer.output_head;
+    // Every non-zero rank's bindings point into ITS OWN model view, whose sharded extents are
+    // already divided by the loader. Norms and the embedding table are replicated, so all ranks
+    // bind structurally identical -- but physically distinct, per-device -- objects.
+    for (std::int32_t r = 1; r < tp_count_; ++r) {
+        TextRankBinding& binding    = ranks_[static_cast<std::size_t>(r)];
+        const LoadedModelData& peer = *binding.execution.weights;
+        binding.embed               = &peer.token_embedding;
+        binding.final_norm          = &peer.final_norm;
+        binding.lm_head             = &peer.output_head;
         for (int layer = 0; layer < kCfg.n_layers; ++layer) {
             if (ModelConfig::is_full(layer)) {
                 const std::size_t fidx = static_cast<std::size_t>(ModelConfig::full_idx(layer));
-                FullLayerW& out        = full_peer_[fidx];
+                FullLayerW& out        = binding.full[fidx];
                 const auto& source     = peer.full_layers[fidx];
                 out.input_norm         = &source.input_norm;
                 out.projection         = &source.projection;
@@ -299,7 +352,7 @@ void TextContext::bind() {
                 out.mlp                = bind_mlp(source.post_mixer);
             } else {
                 const std::size_t gidx = static_cast<std::size_t>(ModelConfig::gdn_idx(layer));
-                GdnLayerW& out         = gdn_peer_[gidx];
+                GdnLayerW& out         = binding.gdn[gidx];
                 const auto& source     = peer.gdn_layers[gidx];
                 out.input_norm         = &source.input_norm;
                 out.projection         = &source.projection;
@@ -315,20 +368,21 @@ void TextContext::bind() {
         const auto& proposal = *weights_.optimized_proposal;
         set_proposal_head(&proposal.head, static_cast<const std::int32_t*>(proposal.token_ids.data),
                           proposal.head.n);
-        if (tp_ != nullptr) {
-            if (!tp_->weights->optimized_proposal) {
+        for (std::int32_t r = 1; r < tp_count_; ++r) {
+            TextRankBinding& binding = ranks_[static_cast<std::size_t>(r)];
+            if (!binding.execution.weights->optimized_proposal) {
                 throw std::invalid_argument("tensor-parallel peer has no proposal head shard");
             }
-            const auto& peer_proposal = *tp_->weights->optimized_proposal;
-            proposal_head_peer_       = &peer_proposal.head;
+            const auto& peer_proposal = *binding.execution.weights->optimized_proposal;
+            binding.proposal_head     = &peer_proposal.head;
             // `draft_head_token_ids` is REPLICATED, so this is the peer's own device copy of
-            // the whole [131072] map, not a 65536-entry slice. Rank 1's copy
+            // the whole [131072] map, not a 65536-entry slice. A non-zero rank's copy
             // is DEAD STORAGE in this build: the remap runs where the argmax runs, which is rank
             // 0. It is bound anyway, and its presence checked below, because that check is what
             // proves the loader actually replicated the map rather than sharding it -- 512 KiB
             // against a ~400 MiB draft head, and the alternative is a loader special case whose
             // only effect would be to make the placement asymmetric.
-            proposal_head_ids_peer_ =
+            binding.proposal_head_ids =
                 static_cast<const std::int32_t*>(peer_proposal.token_ids.data);
         }
     }
@@ -350,11 +404,12 @@ void TextContext::bind() {
             throw std::invalid_argument("MTP state was enabled without materialized MTP weights");
         }
         mtp_ = bind_mtp_weights(*weights_.mtp);
-        if (tp_ != nullptr) {
-            if (!tp_->weights->mtp) {
+        for (std::int32_t r = 1; r < tp_count_; ++r) {
+            TextRankBinding& binding = ranks_[static_cast<std::size_t>(r)];
+            if (!binding.execution.weights->mtp) {
                 throw std::invalid_argument("tensor-parallel peer has no MTP weight shard");
             }
-            mtp_peer_ = bind_mtp_weights(*tp_->weights->mtp);
+            binding.mtp = bind_mtp_weights(*binding.execution.weights->mtp);
         }
     }
 
@@ -393,21 +448,22 @@ const MtpW& TextContext::mtp_weights() const {
 const MtpW& TextContext::mtp_weights_for(int rank) const {
     if (!mtp_enabled()) { throw std::runtime_error("MTP draft weights are not enabled"); }
     if (rank == 0) { return mtp_; }
-    if (mtp_peer_.payload == nullptr) {
+    const MtpW& weights = rank_binding(rank).mtp;
+    if (weights.payload == nullptr) {
         throw std::logic_error("tensor-parallel peer MTP weights are unbound");
     }
-    return mtp_peer_;
+    return weights;
 }
 
 const GdnReplayRecords* TextContext::replay_records_for(int rank) const {
     if (rank == 0) { return replay_records_; }
-    if (tp_ == nullptr) { throw std::logic_error("TextContext has no tensor-parallel context"); }
-    // The two ranks must agree: a peer with no record storage while rank 0 records would fold a
-    // stale half of the GDN state on device 1 and diverge silently from the next round on.
-    if ((replay_records_ == nullptr) != (tp_->replay_records == nullptr)) {
+    if (tp_count_ < 2) { throw std::logic_error("TextContext has no tensor-parallel context"); }
+    // The ranks must agree: a peer with no record storage while rank 0 records would fold a
+    // stale half of the GDN state on its device and diverge silently from the next round on.
+    if ((replay_records_ == nullptr) != (rank_binding(1).execution.replay_records == nullptr)) {
         throw std::logic_error("tensor-parallel replay-record bindings disagree between ranks");
     }
-    return tp_->replay_records;
+    return rank_binding(rank).execution.replay_records;
 }
 
 void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
@@ -1478,62 +1534,242 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData&
 // chunk boundaries are driven by the token count alone, so both ranks also see the same chunks.
 
 const ExecutionContext& TextContext::ec() const {
-    if (tp_ == nullptr) { throw std::logic_error("TextContext has no tensor-parallel context"); }
-    return *tp_->execution;
+    if (tp_count_ < 2) { throw std::logic_error("TextContext has no tensor-parallel context"); }
+    return *ranks_[1].execution.execution;
 }
 
-std::array<WorkspaceArena*, 2> TextContext::workspaces() const { return {&work_, tp_->work}; }
+const ops::PeerEvents& TextContext::peer_events() const {
+    if (tp_count_ < 2 || ranks_[1].execution.events == nullptr) {
+        throw std::logic_error("TextContext has no tensor-parallel PeerEvents");
+    }
+    return *ranks_[1].execution.events;
+}
+
+TpArray<WorkspaceArena*> TextContext::workspaces() const {
+    TpArray<WorkspaceArena*> arenas{};
+    arenas[0] = &work_;
+    for (std::int32_t r = 1; r < tp_count_; ++r) {
+        arenas[static_cast<std::size_t>(r)] = ranks_[static_cast<std::size_t>(r)].execution.work;
+    }
+    return arenas;
+}
+
+TextContext::RankScopes TextContext::rank_scopes() const {
+    RankScopes scopes;
+    const TpArray<WorkspaceArena*> arenas = workspaces();
+    for (std::int32_t r = 0; r < tp_count_; ++r) {
+        const auto slot = static_cast<std::size_t>(r);
+        scopes[slot].emplace(arenas[slot]->scope());
+    }
+    return scopes;
+}
 
 void TextContext::synchronize_all() const {
     ctx_.synchronize();
-    if (tp_ != nullptr) { tp_->device->synchronize(); }
+    for (std::int32_t r = 1; r < tp_count_; ++r) {
+        ranks_[static_cast<std::size_t>(r)].execution.device->synchronize();
+    }
+}
+
+// --- per-rank shard views ------------------------------------------------------------------------
+//
+// Every one of these mirrors rank 0's own `*_` member at rank r. They exist so an Op that takes a
+// TpArray gets a complete argument list at any width; nothing below is allowed to assume two ranks.
+
+TpArray<const Weight*> TextContext::embed_weights() const {
+    TpArray<const Weight*> out{};
+    out[0] = embed_;
+    for (std::int32_t r = 1; r < tp_count_; ++r) { out[r] = ranks_[r].embed; }
+    return out;
+}
+
+TpArray<const Tensor*> TextContext::final_norms() const {
+    TpArray<const Tensor*> out{};
+    out[0] = final_norm_;
+    for (std::int32_t r = 1; r < tp_count_; ++r) { out[r] = ranks_[r].final_norm; }
+    return out;
+}
+
+TpArray<Weight> TextContext::lm_heads() const {
+    TpArray<Weight> out{};
+    out[0] = *lm_head_;
+    for (std::int32_t r = 1; r < tp_count_; ++r) { out[r] = *ranks_[r].lm_head; }
+    return out;
+}
+
+TpArray<const FullLayerW*> TextContext::full_layers(int index) const {
+    const auto idx = static_cast<std::size_t>(index);
+    TpArray<const FullLayerW*> out{};
+    out[0] = &full_[idx];
+    for (std::int32_t r = 1; r < tp_count_; ++r) { out[r] = &ranks_[r].full[idx]; }
+    return out;
+}
+
+TpArray<const GdnLayerW*> TextContext::gdn_layers(int index) const {
+    const auto idx = static_cast<std::size_t>(index);
+    TpArray<const GdnLayerW*> out{};
+    out[0] = &gdn_[idx];
+    for (std::int32_t r = 1; r < tp_count_; ++r) { out[r] = &ranks_[r].gdn[idx]; }
+    return out;
+}
+
+TpArray<const FullAttentionProjectionWeights*>
+TextContext::attention_projections(int index) const {
+    const TpArray<const FullLayerW*> layers = full_layers(index);
+    TpArray<const FullAttentionProjectionWeights*> out{};
+    for (std::int32_t r = 0; r < tp_count_; ++r) { out[r] = layers[r]->projection; }
+    return out;
+}
+
+TpArray<Weight> TextContext::attention_output_weights(int index) const {
+    const TpArray<const FullLayerW*> layers = full_layers(index);
+    TpArray<Weight> out{};
+    for (std::int32_t r = 0; r < tp_count_; ++r) { out[r] = *layers[r]->o_proj; }
+    return out;
+}
+
+TpArray<const GdnProjectionWeights*> TextContext::gdn_projections(int index) const {
+    const TpArray<const GdnLayerW*> layers = gdn_layers(index);
+    TpArray<const GdnProjectionWeights*> out{};
+    for (std::int32_t r = 0; r < tp_count_; ++r) { out[r] = layers[r]->projection; }
+    return out;
+}
+
+TpArray<Weight> TextContext::gdn_output_weights(int index) const {
+    const TpArray<const GdnLayerW*> layers = gdn_layers(index);
+    TpArray<Weight> out{};
+    for (std::int32_t r = 0; r < tp_count_; ++r) { out[r] = *layers[r]->out_proj; }
+    return out;
+}
+
+TpArray<const MlpWeights*> TextContext::full_post_mixers(int index) const {
+    const TpArray<const FullLayerW*> layers = full_layers(index);
+    TpArray<const MlpWeights*> out{};
+    for (std::int32_t r = 0; r < tp_count_; ++r) { out[r] = layers[r]->mlp.payload; }
+    return out;
+}
+
+TpArray<const MlpWeights*> TextContext::gdn_post_mixers(int index) const {
+    const TpArray<const GdnLayerW*> layers = gdn_layers(index);
+    TpArray<const MlpWeights*> out{};
+    for (std::int32_t r = 0; r < tp_count_; ++r) { out[r] = layers[r]->mlp.payload; }
+    return out;
+}
+
+TpArray<Weight> TextContext::proposal_heads() const {
+    TpArray<Weight> out{};
+    out[0] = *proposal_head_;
+    for (std::int32_t r = 1; r < tp_count_; ++r) { out[r] = *ranks_[r].proposal_head; }
+    return out;
+}
+
+TpArray<const std::int32_t*> TextContext::proposal_head_id_maps() const {
+    TpArray<const std::int32_t*> out{};
+    out[0] = proposal_head_ids_;
+    for (std::int32_t r = 1; r < tp_count_; ++r) { out[r] = ranks_[r].proposal_head_ids; }
+    return out;
+}
+
+TpArray<const typename Variant::MtpAttentionProjectionWeights*>
+TextContext::mtp_attention_weights() const {
+    TpArray<const typename Variant::MtpAttentionProjectionWeights*> out{};
+    for (std::int32_t r = 0; r < tp_count_; ++r) {
+        out[static_cast<std::size_t>(r)] = &mtp_weights_for(r).payload->attention;
+    }
+    return out;
+}
+
+TpArray<Weight> TextContext::mtp_output_weights() const {
+    TpArray<Weight> out{};
+    for (std::int32_t r = 0; r < tp_count_; ++r) {
+        out[static_cast<std::size_t>(r)] = *mtp_weights_for(r).o_proj;
+    }
+    return out;
+}
+
+TpArray<const typename Variant::MtpPostMixerWeights*> TextContext::mtp_post_mixer_weights() const {
+    TpArray<const typename Variant::MtpPostMixerWeights*> out{};
+    for (std::int32_t r = 0; r < tp_count_; ++r) {
+        out[static_cast<std::size_t>(r)] = &mtp_weights_for(r).payload->post_mixer;
+    }
+    return out;
+}
+
+TpArray<Tensor> TextContext::attention_flat(const TpArray<Tensor>& a, std::int32_t tokens) const {
+    TpArray<Tensor> out{};
+    for (std::int32_t r = 0; r < tp_count_; ++r) {
+        const auto slot = static_cast<std::size_t>(r);
+        out[slot]        = a[slot].view({shard_q_size(), tokens});
+    }
+    return out;
+}
+
+TpArray<qwen3_6::RoundState*> TextContext::rank_ios() const {
+    TpArray<qwen3_6::RoundState*> out{};
+    out[0] = &io_;
+    for (std::int32_t r = 1; r < tp_count_; ++r) { out[r] = ranks_[r].execution.io; }
+    return out;
+}
+
+TpArray<LinearAttentionStatePool*> TextContext::rank_states() const {
+    TpArray<LinearAttentionStatePool*> out{};
+    out[0] = &state_;
+    for (std::int32_t r = 1; r < tp_count_; ++r) { out[r] = ranks_[r].execution.state; }
+    return out;
 }
 
 const Tensor& TextContext::rank_cache_positions(int rank) const {
     if (rank == 0) {
         return active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     }
-    if (peer_cache_positions_ == nullptr) {
+    const Tensor* binding = ranks_[static_cast<std::size_t>(rank)].cache_positions;
+    if (binding == nullptr) {
         throw std::logic_error("tensor-parallel peer cache positions are unbound");
     }
-    return *peer_cache_positions_;
+    return *binding;
 }
 
 const Tensor& TextContext::rank_rope_positions(int rank) const {
     if (rank == 0) {
         return active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     }
-    if (peer_rope_positions_ == nullptr) {
+    const Tensor* binding = ranks_[static_cast<std::size_t>(rank)].rope_positions;
+    if (binding == nullptr) {
         throw std::logic_error("tensor-parallel peer RoPE positions are unbound");
     }
-    return *peer_rope_positions_;
+    return *binding;
 }
 
 const Tensor& TextContext::rank_kv_table_rows(int rank) const {
     if (rank == 0) {
         return active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
     }
-    if (peer_kv_table_rows_ == nullptr) {
+    const Tensor* binding = ranks_[static_cast<std::size_t>(rank)].kv_table_rows;
+    if (binding == nullptr) {
         throw std::logic_error("tensor-parallel peer KV table rows are unbound");
     }
-    return *peer_kv_table_rows_;
+    return *binding;
 }
 
 Tensor TextContext::rank_valid_columns(int rank) const {
     // Unlike its siblings, an ABSENT binding is legal here: the prefill and ordinary-decode paths
     // never bind valid columns, and every consumer reads an empty Tensor as "every column counts".
-    // What is not legal is the two ranks DISAGREEING -- a peer binding present while rank 0's is
-    // absent (or the reverse) would have the two devices mask different columns and diverge
-    // silently, which is exactly the trap the sibling accessors' throws exist to prevent. The
-    // paths that do bind it (speculative verify, MTP) are guarded off at tp2 today; this keeps the
-    // invariant checked rather than assumed for whoever lifts that guard.
-    if ((active_valid_columns_ == nullptr) != (peer_valid_columns_ == nullptr)) {
+    // What is not legal is the ranks DISAGREEING -- a peer binding present while rank 0's is absent
+    // (or the reverse) would have the devices mask different columns and diverge silently, which is
+    // exactly the trap the sibling accessors' throws exist to prevent.
+    if ((active_valid_columns_ == nullptr) != (ranks_[1].valid_columns == nullptr)) {
         throw std::logic_error("tensor-parallel valid-column bindings disagree between ranks");
+    }
+    for (std::int32_t r = 2; r < tp_count_; ++r) {
+        if ((ranks_[r].valid_columns == nullptr) != (ranks_[1].valid_columns == nullptr)) {
+            throw std::logic_error("tensor-parallel valid-column bindings disagree between ranks");
+        }
     }
     if (rank == 0) {
         return active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
     }
-    return peer_valid_columns_ != nullptr ? *peer_valid_columns_ : Tensor{};
+    const Tensor* binding = ranks_[static_cast<std::size_t>(rank)].valid_columns;
+    return binding != nullptr ? *binding : Tensor{};
 }
 
 const Tensor& TextContext::rank_backend_kv_table_rows(int rank) const {
@@ -1543,10 +1779,11 @@ const Tensor& TextContext::rank_backend_kv_table_rows(int rank) const {
         }
         return *active_backend_kv_table_rows_;
     }
-    if (peer_backend_kv_table_rows_ == nullptr) {
+    const Tensor* binding = ranks_[static_cast<std::size_t>(rank)].backend_kv_table_rows;
+    if (binding == nullptr) {
         throw std::logic_error("tensor-parallel peer backend KV table rows are unbound");
     }
-    return *peer_backend_kv_table_rows_;
+    return *binding;
 }
 
 const Tensor& TextContext::rank_linear_state_slots(int rank) const {
@@ -1556,61 +1793,62 @@ const Tensor& TextContext::rank_linear_state_slots(int rank) const {
         }
         return *active_linear_state_slots_;
     }
-    if (peer_linear_state_slots_ == nullptr) {
+    const Tensor* binding = ranks_[static_cast<std::size_t>(rank)].linear_state_slots;
+    if (binding == nullptr) {
         throw std::logic_error("tensor-parallel peer state slots are unbound");
     }
-    return *peer_linear_state_slots_;
+    return *binding;
 }
 
-void TextContext::attn_mix_tp2(const FullLayerW& w0, const FullLayerW& w1, std::array<Tensor, 2>& x,
-                               int fidx, Phase ph, const std::array<Tensor, 2>& staging) {
+void TextContext::attn_mix_tp2(TpArray<Tensor>& x, int fidx, Phase ph,
+                               const TpArray<Tensor>& staging) {
     const ExecutionContext& execution = ec();
     const int T                       = x[0].ne[1];
     if (active_gqa_envelope_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
-    const std::array<const FullLayerW*, 2> w = {&w0, &w1};
-    const std::array<WorkspaceArena*, 2> ws  = workspaces();
+    const TpArray<const FullLayerW*> w = full_layers(fidx);
+    const TpArray<WorkspaceArena*> ws  = workspaces();
 
-    std::array<Tensor, 2> h;
-    std::array<Tensor, 2> q;
-    std::array<Tensor, 2> gate;
-    std::array<Tensor, 2> k;
-    std::array<Tensor, 2> v;
-    std::array<Tensor, 2> q_flat;
-    std::array<Tensor, 2> gate_flat;
-    std::array<Tensor, 2> k_flat;
-    std::array<Tensor, 2> v_flat;
-    for (std::size_t r = 0; r < 2; ++r) {
+    TpArray<Tensor> h;
+    TpArray<Tensor> q;
+    TpArray<Tensor> gate;
+    TpArray<Tensor> k;
+    TpArray<Tensor> v;
+    TpArray<Tensor> q_flat;
+    TpArray<Tensor> gate_flat;
+    TpArray<Tensor> k_flat;
+    TpArray<Tensor> v_flat;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         const auto projection =
             workspace_recipe::text_attention_projection<TextConfig>(*ws[r], T,
-                                                                    kTensorParallelWidth);
+                                                                    ec().tp);
         h[r]         = projection.hidden;
-        q[r]         = projection.query.view({kCfg.head_dim, kShardQHeads, T});
-        gate[r]      = projection.gate.view({kCfg.head_dim, kShardQHeads, T});
-        k[r]         = projection.key.view({kCfg.head_dim, kShardKvHeads, T});
-        v[r]         = projection.value.view({kCfg.head_dim, kShardKvHeads, T});
-        q_flat[r]    = q[r].view({kShardQSize, T});
-        gate_flat[r] = gate[r].view({kShardQSize, T});
-        k_flat[r]    = k[r].view({kShardKvSize, T});
-        v_flat[r]    = v[r].view({kShardKvSize, T});
+        q[r]         = projection.query.view({kCfg.head_dim, shard_q_heads(), T});
+        gate[r]      = projection.gate.view({kCfg.head_dim, shard_q_heads(), T});
+        k[r]         = projection.key.view({kCfg.head_dim, shard_kv_heads(), T});
+        v[r]         = projection.value.view({kCfg.head_dim, shard_kv_heads(), T});
+        q_flat[r]    = q[r].view({shard_q_size(), T});
+        gate_flat[r] = gate[r].view({shard_q_size(), T});
+        k_flat[r]    = k[r].view({shard_kv_size(), T});
+        v_flat[r]    = v[r].view({shard_kv_size(), T});
     }
     for_each_rank(execution, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
         ops::rmsnorm(x[r], *w[r]->input_norm, kCfg.rms_eps, true, h[r], stream_for(rank));
     });
-    Variant::attention_projection(h, {w0.projection, w1.projection}, q_flat, gate_flat, k_flat,
-                                  v_flat, ph, ws, execution);
+    Variant::attention_projection(h, attention_projections(fidx), q_flat, gate_flat, k_flat, v_flat,
+                                  ph, ws, execution);
 
-    std::array<Tensor, 2> qn;
-    std::array<Tensor, 2> kn;
-    std::array<Tensor, 2> a;
-    for (std::size_t r = 0; r < 2; ++r) {
+    TpArray<Tensor> qn;
+    TpArray<Tensor> kn;
+    TpArray<Tensor> a;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         const auto results =
-            workspace_recipe::text_attention_results<TextConfig>(*ws[r], T, kTensorParallelWidth);
-        qn[r] = results.normalized_query.view({kCfg.head_dim, kShardQHeads, T});
-        kn[r] = results.normalized_key.view({kCfg.head_dim, kShardKvHeads, T});
-        a[r]  = results.attention.view({kCfg.head_dim, kShardQHeads, T});
+            workspace_recipe::text_attention_results<TextConfig>(*ws[r], T, ec().tp);
+        qn[r] = results.normalized_query.view({kCfg.head_dim, shard_q_heads(), T});
+        kn[r] = results.normalized_key.view({kCfg.head_dim, shard_kv_heads(), T});
+        a[r]  = results.attention.view({kCfg.head_dim, shard_q_heads(), T});
     }
     for_each_rank(execution, [&](int rank) {
         const auto r        = static_cast<std::size_t>(rank);
@@ -1623,7 +1861,7 @@ void TextContext::attn_mix_tp2(const FullLayerW& w0, const FullLayerW& w1, std::
         ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn[r], kn[r],
                   rope_frequency_[r], s);
 
-        const qwen3_6::PagedKVCache& pages = rank == 0 ? *batch_text_kv_ : *tp_->batch_kv;
+        const qwen3_6::PagedKVCache& pages = rank_batch_kv(rank);
         if (active_sequence_batch_ != 0) {
             const std::int32_t width = active_sequence_width_;
             if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -1631,13 +1869,13 @@ void TextContext::attn_mix_tp2(const FullLayerW& w0, const FullLayerW& w1, std::
                     "Text sequence batch binding does not match aggregate columns");
             }
             Tensor q_batch =
-                qn[r].view({kCfg.head_dim, kShardQHeads, width, active_sequence_batch_});
+                qn[r].view({kCfg.head_dim, shard_q_heads(), width, active_sequence_batch_});
             Tensor k_batch =
-                kn[r].view({kCfg.head_dim, kShardKvHeads, width, active_sequence_batch_});
+                kn[r].view({kCfg.head_dim, shard_kv_heads(), width, active_sequence_batch_});
             Tensor v_batch =
-                v[r].view({kCfg.head_dim, kShardKvHeads, width, active_sequence_batch_});
+                v[r].view({kCfg.head_dim, shard_kv_heads(), width, active_sequence_batch_});
             Tensor a_batch =
-                a[r].view({kCfg.head_dim, kShardQHeads, width, active_sequence_batch_});
+                a[r].view({kCfg.head_dim, shard_q_heads(), width, active_sequence_batch_});
             Tensor position_batch = cache.view({width, active_sequence_batch_});
             ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, rank_valid_columns(rank),
                                rank_kv_table_rows(rank), kAttnScale, pages.batch_layer_view(fidx),
@@ -1650,34 +1888,37 @@ void TextContext::attn_mix_tp2(const FullLayerW& w0, const FullLayerW& w1, std::
         ops::sigmoid_mul(gate[r], a[r], s);
     });
 
-    Variant::attention_output_projection({a[0].view({kShardQSize, T}), a[1].view({kShardQSize, T})},
-                                         {*w0.o_proj, *w1.o_proj}, x, staging, ph, ws, execution,
-                                         *tp_->events);
+    TpArray<Tensor> a_flat;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+        a_flat[r] = a[r].view({shard_q_size(), T});
+    }
+    Variant::attention_output_projection(a_flat, attention_output_weights(fidx), x, staging, ph, ws,
+                                         execution, peer_events());
 }
 
-void TextContext::gdn_mix_tp2(const GdnLayerW& w0, const GdnLayerW& w1, std::array<Tensor, 2>& x,
-                              int gidx, Phase ph, const std::array<Tensor, 2>& staging) {
-    const ExecutionContext& execution       = ec();
-    const int T                             = x[0].ne[1];
-    const std::array<const GdnLayerW*, 2> w = {&w0, &w1};
-    const std::array<WorkspaceArena*, 2> ws = workspaces();
+void TextContext::gdn_mix_tp2(TpArray<Tensor>& x, int gidx, Phase ph,
+                              const TpArray<Tensor>& staging) {
+    const ExecutionContext& execution = ec();
+    const int T                       = x[0].ne[1];
+    const TpArray<const GdnLayerW*> w = gdn_layers(gidx);
+    const TpArray<WorkspaceArena*> ws = workspaces();
 
-    std::array<Tensor, 2> h;
-    std::array<Tensor, 2> g;
-    std::array<Tensor, 2> beta;
-    std::array<Tensor, 2> z;
-    std::array<Tensor, 2> qc;
-    std::array<Tensor, 2> kc;
-    std::array<Tensor, 2> vc;
-    for (std::size_t r = 0; r < 2; ++r) {
+    TpArray<Tensor> h;
+    TpArray<Tensor> g;
+    TpArray<Tensor> beta;
+    TpArray<Tensor> z;
+    TpArray<Tensor> qc;
+    TpArray<Tensor> kc;
+    TpArray<Tensor> vc;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         const auto control = workspace_recipe::gdn_control<TextConfig>(*ws[r], T,
-                                                                      kTensorParallelWidth);
+                                                                      ec().tp);
         h[r]               = control.hidden;
         g[r]               = control.g;
         beta[r]            = control.beta;
         const auto projection =
-            workspace_recipe::gdn_projection<TextConfig>(*ws[r], T, kTensorParallelWidth);
-        z[r]  = projection.output_gate.view({kCfg.gdn_v_dim, kShardGdnVHeads, T});
+            workspace_recipe::gdn_projection<TextConfig>(*ws[r], T, ec().tp);
+        z[r]  = projection.output_gate.view({kCfg.gdn_v_dim, shard_gdn_v_heads(), T});
         qc[r] = projection.query;
         kc[r] = projection.key;
         vc[r] = projection.value;
@@ -1689,7 +1930,7 @@ void TextContext::gdn_mix_tp2(const GdnLayerW& w0, const GdnLayerW& w1, std::arr
         const auto r = static_cast<std::size_t>(rank);
         ops::rmsnorm(x[r], *w[r]->input_norm, kCfg.rms_eps, true, h[r], stream_for(rank));
     });
-    Variant::gdn_control_projection(h, {w0.projection, w1.projection}, g, beta, ws, execution);
+    Variant::gdn_control_projection(h, gdn_projections(gidx), g, beta, ws, execution);
 
     if (ph == Phase::Verify) {
         if (active_sequence_batch_ == 0) {
@@ -1699,22 +1940,22 @@ void TextContext::gdn_mix_tp2(const GdnLayerW& w0, const GdnLayerW& w1, std::arr
         if (width <= 0 || width * active_sequence_batch_ != T) {
             throw std::logic_error("GDN sequence batch binding does not match aggregate columns");
         }
-        std::array<Tensor, 2> projection_input;
-        std::array<Tensor, 2> query_output;
-        std::array<Tensor, 2> key_output;
-        std::array<Tensor, 2> value_output;
-        std::array<Tensor, 2> gate_output;
-        std::array<Tensor, 2> conv_weight;
-        std::array<Tensor, 2> conv_states;
-        std::array<Tensor, 2> valid;
-        std::array<Tensor, 2> slots;
-        for (std::size_t r = 0; r < 2; ++r) {
+        TpArray<Tensor> projection_input;
+        TpArray<Tensor> query_output;
+        TpArray<Tensor> key_output;
+        TpArray<Tensor> value_output;
+        TpArray<Tensor> gate_output;
+        TpArray<Tensor> conv_weight;
+        TpArray<Tensor> conv_states;
+        TpArray<Tensor> valid;
+        TpArray<Tensor> slots;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
             const int rank      = static_cast<int>(r);
             projection_input[r] = h[r].view({kCfg.hidden, width, active_sequence_batch_});
-            query_output[r]     = qc[r].view({kShardKeyDim, width, active_sequence_batch_});
-            key_output[r]       = kc[r].view({kShardKeyDim, width, active_sequence_batch_});
-            value_output[r]     = vc[r].view({kShardValueDim, width, active_sequence_batch_});
-            gate_output[r]      = z[r].view({kShardValueDim, width, active_sequence_batch_});
+            query_output[r]     = qc[r].view({shard_key_dim(), width, active_sequence_batch_});
+            key_output[r]       = kc[r].view({shard_key_dim(), width, active_sequence_batch_});
+            value_output[r]     = vc[r].view({shard_value_dim(), width, active_sequence_batch_});
+            gate_output[r]      = z[r].view({shard_value_dim(), width, active_sequence_batch_});
             conv_weight[r]      = *w[r]->conv1d;
             conv_states[r]      = state_for(rank).conv.at(static_cast<std::size_t>(gidx));
             valid[r]            = rank_valid_columns(rank);
@@ -1728,8 +1969,8 @@ void TextContext::gdn_mix_tp2(const GdnLayerW& w0, const GdnLayerW& w1, std::arr
             // FoldGeometry<48, 8, 24, 5120>. Both ranks record the same
             // columns of the same rows -- only the head range differs -- so the two folds commit
             // the same accepted prefix without any agreement protocol.
-            std::array<Tensor, 2> conv_record;
-            for (std::size_t r = 0; r < 2; ++r) {
+            TpArray<Tensor> conv_record;
+            for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
                 const GdnReplayRecords* records = replay_records_for(static_cast<int>(r));
                 if (records == nullptr) {
                     throw std::logic_error("Replay-record GDN has no record storage");
@@ -1737,26 +1978,25 @@ void TextContext::gdn_mix_tp2(const GdnLayerW& w0, const GdnLayerW& w1, std::arr
                 conv_record[r] =
                     records->layer(gidx, active_sequence_batch_).conv;
             }
-            Variant::gdn_input_projection_record(projection_input, {w0.projection, w1.projection},
+            Variant::gdn_input_projection_record(projection_input, gdn_projections(gidx),
                                                  conv_weight, conv_states, valid, slots,
                                                  conv_record, query_output, key_output,
                                                  value_output, gate_output, ph, ws, execution);
         } else {
             Variant::gdn_input_projection_snapshot(
-                projection_input, {w0.projection, w1.projection}, conv_weight, conv_states, valid,
-                slots, slots, query_output, key_output, value_output, gate_output, ph, ws,
-                execution);
+                projection_input, gdn_projections(gidx), conv_weight, conv_states, valid, slots,
+                slots, query_output, key_output, value_output, gate_output, ph, ws, execution);
         }
     } else {
-        std::array<Tensor, 2> qkv;
-        std::array<Tensor, 2> qkv_c;
-        for (std::size_t r = 0; r < 2; ++r) {
+        TpArray<Tensor> qkv;
+        TpArray<Tensor> qkv_c;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
             const auto conv =
-                workspace_recipe::gdn_prefill_conv<TextConfig>(*ws[r], T, kTensorParallelWidth);
+                workspace_recipe::gdn_prefill_conv<TextConfig>(*ws[r], T, ec().tp);
             qkv[r]   = conv.projected;
             qkv_c[r] = conv.convolved;
         }
-        Variant::gdn_input_projection(h, {w0.projection, w1.projection}, qkv, z, ph, ws, execution);
+        Variant::gdn_input_projection(h, gdn_projections(gidx), qkv, z, ph, ws, execution);
         for_each_rank(execution, [&](int rank) {
             const auto r      = static_cast<std::size_t>(rank);
             cudaStream_t s    = stream_for(rank);
@@ -1766,38 +2006,38 @@ void TextContext::gdn_mix_tp2(const GdnLayerW& w0, const GdnLayerW& w1, std::arr
             // Shard-local section offsets: this device's convolved block is its own
             // q(1024) | k(1024) | v(3072), not the model's 2048 | 2048 | 6144.
             ops::extract_bf16_columns(qkv_c[r], 0, qc[r], s);
-            ops::extract_bf16_columns(qkv_c[r], kShardKeyDim, kc[r], s);
-            ops::extract_bf16_columns(qkv_c[r], 2 * kShardKeyDim, vc[r], s);
+            ops::extract_bf16_columns(qkv_c[r], shard_key_dim(), kc[r], s);
+            ops::extract_bf16_columns(qkv_c[r], 2 * shard_key_dim(), vc[r], s);
         });
     }
 
-    std::array<Tensor, 2> o;
-    std::array<Tensor, 2> on;
-    for (std::size_t r = 0; r < 2; ++r) {
-        o[r] = workspace_recipe::gdn_recurrent_output<TextConfig>(*ws[r], T, kTensorParallelWidth)
-                   .view({kCfg.gdn_v_dim, kShardGdnVHeads, T});
-        on[r] = workspace_recipe::gdn_normalized_output<TextConfig>(*ws[r], T, kTensorParallelWidth)
-                    .view({kCfg.gdn_v_dim, kShardGdnVHeads, T});
+    TpArray<Tensor> o;
+    TpArray<Tensor> on;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+        o[r] = workspace_recipe::gdn_recurrent_output<TextConfig>(*ws[r], T, ec().tp)
+                   .view({kCfg.gdn_v_dim, shard_gdn_v_heads(), T});
+        on[r] = workspace_recipe::gdn_normalized_output<TextConfig>(*ws[r], T, ec().tp)
+                    .view({kCfg.gdn_v_dim, shard_gdn_v_heads(), T});
     }
     for_each_rank(execution, [&](int rank) {
         const auto r       = static_cast<std::size_t>(rank);
         cudaStream_t s     = stream_for(rank);
-        Tensor q_recurrent = qc[r].view({kCfg.gdn_k_dim, kShardGdnKHeads, T});
-        Tensor k_recurrent = kc[r].view({kCfg.gdn_k_dim, kShardGdnKHeads, T});
-        Tensor vv          = vc[r].view({kCfg.gdn_v_dim, kShardGdnVHeads, T});
+        Tensor q_recurrent = qc[r].view({kCfg.gdn_k_dim, shard_gdn_k_heads(), T});
+        Tensor k_recurrent = kc[r].view({kCfg.gdn_k_dim, shard_gdn_k_heads(), T});
+        Tensor vv          = vc[r].view({kCfg.gdn_v_dim, shard_gdn_v_heads(), T});
         if (ph == Phase::Verify) {
             Tensor& recurrent_states = state_for(rank).recurrent.at(static_cast<std::size_t>(gidx));
             const std::int32_t width = active_sequence_width_;
             Tensor q_batch =
-                q_recurrent.view({kCfg.gdn_k_dim, kShardGdnKHeads, width, active_sequence_batch_});
+                q_recurrent.view({kCfg.gdn_k_dim, shard_gdn_k_heads(), width, active_sequence_batch_});
             Tensor k_batch =
-                k_recurrent.view({kCfg.gdn_k_dim, kShardGdnKHeads, width, active_sequence_batch_});
+                k_recurrent.view({kCfg.gdn_k_dim, shard_gdn_k_heads(), width, active_sequence_batch_});
             Tensor v_batch =
-                vv.view({kCfg.gdn_v_dim, kShardGdnVHeads, width, active_sequence_batch_});
-            Tensor g_batch    = g[r].view({kShardGdnVHeads, width, active_sequence_batch_});
-            Tensor beta_batch = beta[r].view({kShardGdnVHeads, width, active_sequence_batch_});
+                vv.view({kCfg.gdn_v_dim, shard_gdn_v_heads(), width, active_sequence_batch_});
+            Tensor g_batch    = g[r].view({shard_gdn_v_heads(), width, active_sequence_batch_});
+            Tensor beta_batch = beta[r].view({shard_gdn_v_heads(), width, active_sequence_batch_});
             Tensor out_batch =
-                o[r].view({kCfg.gdn_v_dim, kShardGdnVHeads, width, active_sequence_batch_});
+                o[r].view({kCfg.gdn_v_dim, shard_gdn_v_heads(), width, active_sequence_batch_});
             const Tensor valid = rank_valid_columns(rank);
             const Tensor slots = rank_linear_state_slots(rank);
             if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
@@ -1824,39 +2064,45 @@ void TextContext::gdn_mix_tp2(const GdnLayerW& w0, const GdnLayerW& w1, std::arr
         ops::gated_rmsnorm(o[r], *w[r]->gdn_norm, z[r], kCfg.rms_eps, on[r], s);
     });
 
-    Variant::gdn_output_projection(
-        {on[0].view({kShardValueDim, T}), on[1].view({kShardValueDim, T})},
-        {*w0.out_proj, *w1.out_proj}, x, staging, ph, ws, execution, *tp_->events);
+    TpArray<Tensor> on_flat;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+        on_flat[r] = on[r].view({shard_value_dim(), T});
+    }
+    Variant::gdn_output_projection(on_flat, gdn_output_weights(gidx), x, staging, ph, ws, execution,
+                                   peer_events());
 }
 
-void TextContext::mlp_tail_tp2(const Tensor* post_norm_0, const Tensor* post_norm_1, const MlpW& m0,
-                               const MlpW& m1, std::array<Tensor, 2>& x, Phase ph,
-                               const std::array<Tensor, 2>& staging) {
-    const ExecutionContext& execution       = ec();
-    const int T                             = x[0].ne[1];
-    const std::array<WorkspaceArena*, 2> ws = workspaces();
-    const std::array<const Tensor*, 2> norm = {post_norm_0, post_norm_1};
-    std::array<Tensor, 2> h;
-    for (std::size_t r = 0; r < 2; ++r) {
+void TextContext::mlp_tail_tp2(TpArray<Tensor>& x, int index, bool full_attention, Phase ph,
+                               const TpArray<Tensor>& staging) {
+    const ExecutionContext& execution     = ec();
+    const int T                           = x[0].ne[1];
+    const TpArray<WorkspaceArena*> ws     = workspaces();
+    const TpArray<const FullLayerW*> full = full_layers(index);
+    const TpArray<const GdnLayerW*> gdn   = gdn_layers(index);
+    TpArray<const Tensor*> norm;
+    for (std::int32_t r = 0; r < execution.tp; ++r) {
+        norm[r] = full_attention ? full[r]->post_attn_norm : gdn[r]->post_attn_norm;
+    }
+    TpArray<Tensor> h;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         h[r] = workspace_recipe::post_mixer_hidden<TextConfig>(*ws[r], T);
     }
     for_each_rank(execution, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
         ops::rmsnorm(x[r], *norm[r], kCfg.rms_eps, true, h[r], stream_for(rank));
     });
-    Variant::post_mixer(h, {m0.payload, m1.payload}, x, staging, ph, ws, execution, *tp_->events);
+    const TpArray<const MlpWeights*> mixers =
+        full_attention ? full_post_mixers(index) : gdn_post_mixers(index);
+    Variant::post_mixer(h, mixers, x, staging, ph, ws, execution, peer_events());
 }
-
-void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
-                                 const std::array<Tensor, 2>& staging,
+void TextContext::run_layers_tp2(TpArray<Tensor>& x, Phase ph,
+                                 const TpArray<Tensor>& staging,
                                  DFlashFeatureSink* dflash_sink) {
     if (dflash_sink != nullptr) { dflash_sink->begin(x[0]); }
     const bool prefill = ph == Phase::Prefill;
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
-            const auto fidx     = static_cast<std::size_t>(ModelConfig::full_idx(layer));
-            const FullLayerW& a = full_.at(fidx);
-            const FullLayerW& b = full_peer_.at(fidx);
+            const auto fidx = static_cast<std::size_t>(ModelConfig::full_idx(layer));
             nvtx::ScopedRange layer_range(
                 prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull,
                 nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
@@ -1864,22 +2110,18 @@ void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
                 nvtx::ScopedRange mixer_range(
                     prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
-                auto scope_0 = work_.scope();
-                auto scope_1 = tp_->work->scope();
-                attn_mix_tp2(a, b, x, static_cast<int>(fidx), ph, staging);
+                auto scopes = rank_scopes();
+                attn_mix_tp2(x, static_cast<int>(fidx), ph, staging);
             }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
-                auto scope_0 = work_.scope();
-                auto scope_1 = tp_->work->scope();
-                mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, x, ph, staging);
+                auto scopes = rank_scopes();
+                mlp_tail_tp2(x, static_cast<int>(fidx), true, ph, staging);
             }
         } else {
-            const auto gidx    = static_cast<std::size_t>(ModelConfig::gdn_idx(layer));
-            const GdnLayerW& a = gdn_.at(gidx);
-            const GdnLayerW& b = gdn_peer_.at(gidx);
+            const auto gidx = static_cast<std::size_t>(ModelConfig::gdn_idx(layer));
             nvtx::ScopedRange layer_range(prefill ? nvtx::Name::PrefillLayerGdn
                                                   : nvtx::Name::VerifyLayerGdn,
                                           nvtx::Category::Gdn, static_cast<std::uint64_t>(layer));
@@ -1887,17 +2129,15 @@ void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
                 nvtx::ScopedRange mixer_range(
                     prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn, nvtx::Category::Gdn,
                     static_cast<std::uint64_t>(layer));
-                auto scope_0 = work_.scope();
-                auto scope_1 = tp_->work->scope();
-                gdn_mix_tp2(a, b, x, static_cast<int>(gidx), ph, staging);
+                auto scopes = rank_scopes();
+                gdn_mix_tp2(x, static_cast<int>(gidx), ph, staging);
             }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
-                auto scope_0 = work_.scope();
-                auto scope_1 = tp_->work->scope();
-                mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, x, ph, staging);
+                auto scopes = rank_scopes();
+                mlp_tail_tp2(x, static_cast<int>(gidx), false, ph, staging);
             }
         }
         if (dflash_sink != nullptr) {
@@ -1909,60 +2149,65 @@ void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
     }
 }
 
-void TextContext::target_logits(const std::array<Tensor, 2>& hidden,
-                                const std::array<Tensor, 2>& logits) {
+void TextContext::target_logits(const TpArray<Tensor>& hidden,
+                                const TpArray<Tensor>& logits) {
     if (!tp2()) { throw std::logic_error("tensor-parallel target logits require a peer"); }
     const std::int32_t columns = hidden[0].ne[1];
     if (columns <= 0) {
         throw std::invalid_argument("target logits require at least one hidden column");
     }
-    for (std::size_t r = 0; r < 2; ++r) {
+    for (std::size_t r = 0; r < static_cast<std::size_t>(ec().tp); ++r) {
         require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, columns},
                              "target logits hidden");
     }
-    Tensor root_logits = logits[0];
-    Tensor peer_logits = logits[1];
-    logits_tp2(hidden, root_logits, peer_logits);
+    logits_tp2(hidden, logits);
 }
 
-void TextContext::logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits,
-                             Tensor& peer_logits) {
-    const ExecutionContext& execution       = ec();
-    const std::array<WorkspaceArena*, 2> ws = workspaces();
-    const std::int32_t columns              = hidden[0].ne[1];
-    // Both destinations are caller-supplied because there is no single "the logits buffer": the
+void TextContext::logits_tp2(const TpArray<Tensor>& hidden,
+                             const TpArray<Tensor>& logits) {
+    const ExecutionContext& execution = ec();
+    const TpArray<WorkspaceArena*> ws = workspaces();
+    const std::int32_t columns        = hidden[0].ne[1];
+    // Every destination is caller-supplied because there is no single "the logits buffer": the
     // prefill path writes RoundState's one-column scalar logits, the decode path writes the
-    // ordinary frame's [vocab, batch] logits. Validating both, rather than reaching for one of
-    // them here, is what keeps rank 1's write in bounds -- an undersized peer destination is an
-    // out-of-bounds write on the OTHER device, which nothing local would notice.
-    const auto require_destination = [&](const Tensor& destination, const char* label) {
+    // ordinary frame's [vocab, batch] logits. Validating all of them, rather than reaching for one
+    // here, is what keeps a non-zero rank's write in bounds -- an undersized destination is an
+    // out-of-bounds write on ANOTHER device, which nothing local would notice.
+    for (std::int32_t r = 0; r < execution.tp; ++r) {
+        const Tensor& destination = logits[r];
         if (destination.dtype != DType::BF16 || destination.ne[0] != kCfg.vocab ||
             destination.ne[1] != columns || destination.ne[2] != 1 || destination.ne[3] != 1 ||
             !destination.is_contiguous() || destination.data == nullptr) {
-            throw std::logic_error(std::string("tensor-parallel ") + label +
-                                   " logits destination does not match the vocabulary");
+            throw std::logic_error(
+                "tensor-parallel logits destination does not match the vocabulary");
         }
-    };
-    require_destination(logits, "rank 0");
-    require_destination(peer_logits, "peer");
-    auto scope_0 = work_.scope();
-    auto scope_1 = tp_->work->scope();
-    std::array<Tensor, 2> part;
-    for (std::size_t r = 0; r < 2; ++r) {
-        part[r] = ws[r]->alloc(DType::BF16, {kShardVocab, columns});
     }
-    ops::linear_column_parallel(hidden, {*lm_head_, *lm_head_peer_}, part, execution);
+    auto scope_0 = work_.scope();
+    auto scope_1 = rank_scopes();
+    TpArray<Tensor> part;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+        part[r] = ws[r]->alloc(DType::BF16, {shard_vocab(), columns});
+    }
+    ops::linear_column_parallel(hidden, lm_heads(), part, execution);
 
     // `allgather_rows` gathers along ne[1] and the vocabulary is ne[0], so the gather runs one
     // column at a time -- which needs no transpose: one column of a [V, C] BF16 matrix is a
     // contiguous V-element run, and viewed as [1, V] that is exactly the Op's [row length 1,
     // row count V] layout. C is 1 in prefill and the decode batch size (at most 8) otherwise.
     for (std::int32_t column = 0; column < columns; ++column) {
-        const std::array<Tensor, 2> piece = {part[0].slice(1, column, 1).view({1, kShardVocab}),
-                                             part[1].slice(1, column, 1).view({1, kShardVocab})};
-        const std::array<Tensor, 2> whole = {logits.slice(1, column, 1).view({1, kCfg.vocab}),
-                                             peer_logits.slice(1, column, 1).view({1, kCfg.vocab})};
-        ops::allgather_rows(whole, piece, execution, *tp_->events);
+        TpArray<Tensor> piece;
+        TpArray<Tensor> whole;
+        for (std::int32_t r = 0; r < execution.tp; ++r) {
+            piece[r] = part[r].slice(1, column, 1).view({1, shard_vocab()});
+            whole[r] = logits[r].slice(1, column, 1).view({1, kCfg.vocab});
+        }
+        ops::allgather_rows(whole, piece, execution, peer_events());
+    }
+}
+
+void TextContext::reset_peer_workspaces() const {
+    for (std::int32_t r = 1; r < tp_count_; ++r) {
+        ranks_[static_cast<std::size_t>(r)].execution.work->reset();
     }
 }
 
@@ -1981,7 +2226,7 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         throw std::invalid_argument("text prefill chunk does not match its full prompt");
     }
     const ExecutionContext& execution       = ec();
-    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    const TpArray<WorkspaceArena*> ws = workspaces();
     const int T                             = static_cast<int>(ids.size());
     const int chunk                         = static_cast<int>(prefill_chunk_);
     // Prefix-append prefill continues an existing cache, so positions are absolute and can leave
@@ -2015,15 +2260,15 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
     nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                   static_cast<std::uint64_t>(len));
     work_.reset();
-    tp_->work->reset();
+    reset_peer_workspaces();
     {
         auto scope_0 = work_.scope();
-        auto scope_1 = tp_->work->scope();
-        std::array<Tensor, 2> ids_device;
-        std::array<Tensor, 2> positions;
-        std::array<Tensor, 2> x;
-        std::array<Tensor, 2> staging;
-        for (std::size_t r = 0; r < 2; ++r) {
+        auto scope_1 = rank_scopes();
+        TpArray<Tensor> ids_device;
+        TpArray<Tensor> positions;
+        TpArray<Tensor> x;
+        TpArray<Tensor> staging;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
             const auto roots = workspace_recipe::text_prefill_roots<TextConfig>(*ws[r], len, 0, 0);
             ids_device[r]    = roots.ids;
             positions[r]     = roots.positions;
@@ -2035,13 +2280,22 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
             cudaStream_t s = stream_for(rank);
             copy_i32(ids.data(), ids_device[r], s);
             ops::fill_i32_positions(positions[r], base_i, s);
-            ops::embedding(ids_device[r], rank == 0 ? *embed_ : *embed_peer_, x[r], s);
+            ops::embedding(ids_device[r], rank_embed(rank), x[r], s);
         });
 
-        ScopedValue<const Tensor*> peer_cache(peer_cache_positions_, &positions[1]);
-        ScopedValue<const Tensor*> peer_rope(peer_rope_positions_, &positions[1]);
-        ScopedValue<const Tensor*> peer_rows(peer_kv_table_rows_,
-                                             &tp_->io->text_kv_table_row);
+        std::array<const Tensor*, kMaximumDevices> peer_cache_values{};
+        std::array<const Tensor*, kMaximumDevices> peer_row_values{};
+        for (std::int32_t r = 1; r < tp_count_; ++r) {
+            peer_cache_values[static_cast<std::size_t>(r)] = &positions[r];
+            peer_row_values[static_cast<std::size_t>(r)] =
+                &ranks_[static_cast<std::size_t>(r)].execution.io->text_kv_table_row;
+        }
+        ScopedRankTensorBinding peer_cache(tp_count_, ranks_, &TextRankBinding::cache_positions,
+                                           peer_cache_values);
+        ScopedRankTensorBinding peer_rope(tp_count_, ranks_, &TextRankBinding::rope_positions,
+                                          peer_cache_values);
+        ScopedRankTensorBinding peer_rows(tp_count_, ranks_, &TextRankBinding::kv_table_rows,
+                                          peer_row_values);
         ScopedPositions scoped_cache(active_cache_positions_, positions[0]);
         ScopedPositions scoped_rope(active_rope_positions_, positions[0]);
         const auto visible = static_cast<std::uint32_t>(base_i + len);
@@ -2050,24 +2304,28 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
 
         run_layers_tp2(x, Phase::Prefill, staging, dflash_sink);
 
-        std::array<Tensor, 2> xf;
-        xf[0] = prefill_hidden_.data != nullptr ? matrix_window(prefill_hidden_, len)
-                                                : ws[0]->alloc(DType::BF16, {kCfg.hidden, len});
-        xf[1] = tp_->prefill_hidden != nullptr && tp_->prefill_hidden->data != nullptr
-                    ? matrix_window(*tp_->prefill_hidden, len)
-                    : ws[1]->alloc(DType::BF16, {kCfg.hidden, len});
+        TpArray<Tensor> xf;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+            const int rank = static_cast<int>(r);
+            const Tensor& retention = rank == 0 ? prefill_hidden_ : rank_prefill_hidden(rank);
+            xf[r] = retention.data != nullptr ? matrix_window(retention, len)
+                                              : ws[r]->alloc(DType::BF16, {kCfg.hidden, len});
+        }
         for_each_rank(execution, [&](int rank) {
             const auto r = static_cast<std::size_t>(rank);
-            ops::rmsnorm(x[r], rank == 0 ? *final_norm_ : *final_norm_peer_, kCfg.rms_eps, true,
+            ops::rmsnorm(x[r], rank_final_norm(rank), kCfg.rms_eps, true,
                          xf[r], stream_for(rank));
         });
 
         if (is_last) {
-            const std::array<Tensor, 2> last = {xf[0].slice(1, len - 1, 1),
-                                                xf[1].slice(1, len - 1, 1)};
-            Tensor logits      = matrix_window(io_.logits, 1);
-            Tensor peer_logits = matrix_window(tp_->io->logits, 1);
-            logits_tp2(last, logits, peer_logits);
+            TpArray<Tensor> last;
+            TpArray<Tensor> chunk_logits;
+            for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+                const int rank  = static_cast<int>(r);
+                last[r]         = xf[r].slice(1, len - 1, 1);
+                chunk_logits[r] = matrix_window(io_for(rank).logits, 1);
+            }
+            logits_tp2(last, chunk_logits);
             // Sampling belongs to rank 0 alone: it consumes the reconstructed FULL logits and
             // writes the single committed token.
             const CurrentDevice restore;
@@ -2075,10 +2333,10 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
             ops::set_i32_scalar(io_.pos, base_i + T, ctx_.stream);
             ops::set_i32_scalar(io_.rope_pos, base_i + T, ctx_.stream);
             if (sampling_config_ != nullptr) {
-                ops::sample(logits, io_.token, kCfg.token_domain, sampling_config_, io_.pos,
-                            ops::kSamplePurposePrefill, work_, ctx_.stream);
+                ops::sample(chunk_logits[0], io_.token, kCfg.token_domain, sampling_config_,
+                            io_.pos, ops::kSamplePurposePrefill, work_, ctx_.stream);
             } else {
-                ops::argmax(logits, io_.token, kCfg.token_domain, ctx_.stream);
+                ops::argmax(chunk_logits[0], io_.token, kCfg.token_domain, ctx_.stream);
             }
         }
 
@@ -2088,8 +2346,11 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         // is built one column behind the target's. Only rank 0 needs the shifted ids (its fc
         // shard is the embedding half); rank 1 works from its own copy of the final hidden.
         if (prepare_mtp_prompt) {
-            if (!tp_->io->mtp.has_value()) {
-                throw std::logic_error("tensor-parallel MTP prefill requires a peer MTP frame");
+            for (int rank = 1; rank < tp_count_; ++rank) {
+                if (!io_for(rank).mtp.has_value()) {
+                    throw std::logic_error(
+                        "tensor-parallel MTP prefill requires an MTP frame on every rank");
+                }
             }
             const auto alignment_tokens = static_cast<std::uint32_t>(text_prefill.token_ids.size());
             const qwen3_6::MtpAlignmentWindow mtp_window = qwen3_6::plan_mtp_alignment_window(
@@ -2117,10 +2378,13 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                 copy_i32(mtp_ids_host.data(), mtp_ids, ctx_.stream);
             }
 
-            const std::array<Tensor, 2> ar_hidden = {io_.mtp->ar_hidden,
-                                                     tp_->io->mtp->ar_hidden};
-            const std::array<Tensor, 2> mtp_logits = {matrix_window(io_.logits, 1),
-                                                      matrix_window(tp_->io->logits, 1)};
+            TpArray<Tensor> ar_hidden;
+            TpArray<Tensor> mtp_logits;
+            for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+                const int rank = static_cast<int>(r);
+                ar_hidden[r]   = io_for(rank).mtp->ar_hidden;
+                mtp_logits[r]  = matrix_window(io_for(rank).logits, 1);
+            }
             if (is_last && mtp_proposal_extent_ != 0) {
                 if (mtp_proposal_extent_ >
                     static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
@@ -2130,8 +2394,10 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                 mtp_prefill_chunk_tp2(mtp_ids, xf, positions, positions, chunk_envelope,
                                       /*final_chunk=*/true, &ar_hidden, &mtp_logits, &draft0);
 
-                const std::array<Tensor, 2> ar_position = {
-                    io_.mtp->position.slice(0, 0, 1), tp_->io->mtp->position.slice(0, 0, 1)};
+                TpArray<Tensor> ar_position;
+                for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+                    ar_position[r] = io_for(static_cast<int>(r)).mtp->position.slice(0, 0, 1);
+                }
                 for_each_rank(execution, [&](int rank) {
                     const auto r = static_cast<std::size_t>(rank);
                     ops::set_i32_scalar(const_cast<Tensor&>(ar_position[r]), base_i + T,
@@ -2139,11 +2405,11 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                 });
                 for (int i = 1; i < static_cast<int>(mtp_proposal_extent_); ++i) {
                     auto ar_scope_0 = work_.scope();
-                    auto ar_scope_1 = tp_->work->scope();
+                    auto ar_scope_1 = rank_scopes();
                     Tensor prev_token = io_.mtp->draft_tokens.slice(0, i - 1, 1);
                     Tensor next_token = io_.mtp->draft_tokens.slice(0, i, 1);
-                    std::array<Tensor, 2> next_hidden;
-                    for (std::size_t r = 0; r < 2; ++r) {
+                    TpArray<Tensor> next_hidden;
+                    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
                         next_hidden[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
                     }
                     const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
@@ -2192,7 +2458,7 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         synchronize_all();
     }
     work_.reset();
-    tp_->work->reset();
+    reset_peer_workspaces();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(len),
                               .finalized        = finalize_at_end && len == T};
 }
@@ -2204,7 +2470,7 @@ void TextContext::ordinary_decode_batch_tp2(const Tensor& ids, const Tensor& cac
                                             ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                             Tensor& logits) {
     const ExecutionContext& execution       = ec();
-    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    const TpArray<WorkspaceArena*> ws = workspaces();
     const std::int32_t batch                = ids.ne[0];
     if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("ordinary decode batch size must be in [1,8]");
@@ -2212,8 +2478,11 @@ void TextContext::ordinary_decode_batch_tp2(const Tensor& ids, const Tensor& cac
     require_tensor_shape(ids, DType::I32, {batch}, "ordinary decode ids");
     require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, batch}, "ordinary decode hidden");
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, batch}, "ordinary decode logits");
-    if (!tp_->io->ordinary.has_value()) {
-        throw std::logic_error("tensor-parallel decode requires a peer ordinary frame");
+    for (int rank = 1; rank < tp_count_; ++rank) {
+        if (!io_for(rank).ordinary.has_value()) {
+            throw std::logic_error(
+                "tensor-parallel decode requires an ordinary frame on every rank");
+        }
     }
     // Rank 1's control tensors are its OWN mirror of the decode frame. The Program uploads a
     // SEPARATE pinned record into it (`ordinary_peer_host_ingress`), byte-for-byte rank 0's except
@@ -2222,7 +2491,7 @@ void TextContext::ordinary_decode_batch_tp2(const Tensor& ids, const Tensor& cac
     // vocabulary-split output head gathers to rank 0, which is where `ops::sample` runs -- so the
     // fields read below (tokens, positions, KV rows, lanes) are the ones that matter, and they
     // agree by construction because both records are written from the same host state.
-    qwen3_6::OrdinaryDecodeState& peer = *tp_->io->ordinary;
+    qwen3_6::OrdinaryDecodeState& peer = *io_for(1).ordinary;
     const Tensor peer_ids              = peer.tokens.slice(0, 0, batch);
     const Tensor peer_cache            = peer.cache_positions.slice(0, 0, batch);
     const Tensor peer_rope             = peer.rope_positions.slice(0, 0, batch);
@@ -2231,7 +2500,7 @@ void TextContext::ordinary_decode_batch_tp2(const Tensor& ids, const Tensor& cac
     Tensor peer_hidden                 = peer.hidden.slice(1, 0, batch);
 
     work_.reset();
-    tp_->work->reset();
+    reset_peer_workspaces();
     {
         ScopedPositions cache_binding(active_cache_positions_, cache_positions);
         ScopedPositions rope_binding(active_rope_positions_, rope_positions);
@@ -2240,41 +2509,70 @@ void TextContext::ordinary_decode_batch_tp2(const Tensor& ids, const Tensor& cac
         ScopedValue<const Tensor*> state_binding(active_linear_state_slots_, &linear_state_slots);
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
-        ScopedValue<const Tensor*> peer_cache_binding(peer_cache_positions_, &peer_cache);
-        ScopedValue<const Tensor*> peer_rope_binding(peer_rope_positions_, &peer_rope);
-        ScopedValue<const Tensor*> peer_rows_binding(peer_kv_table_rows_, &peer_rows);
-        ScopedValue<const Tensor*> peer_slots_binding(peer_linear_state_slots_, &peer_lanes);
+        // Every non-zero rank's own mirror of the decode frame, bound for this round and restored
+        // on exit. Rank r's is a SEPARATE pinned record uploaded into rank r's device.
+        std::array<const Tensor*, kMaximumDevices> peer_cache_values{};
+        std::array<const Tensor*, kMaximumDevices> peer_row_values{};
+        std::array<const Tensor*, kMaximumDevices> peer_slot_values{};
+        for (std::int32_t r = 1; r < tp_count_; ++r) {
+            const auto slot = static_cast<std::size_t>(r);
+            peer_cache_values[slot] = &ranks_[slot].execution.io->ordinary->cache_positions;
+            peer_row_values[slot]   = &ranks_[slot].execution.io->ordinary->text_kv_table_rows;
+            peer_slot_values[slot]  = &ranks_[slot].execution.io->ordinary->lanes;
+        }
+        ScopedRankTensorBinding peer_cache_binding(tp_count_, ranks_,
+                                                   &TextRankBinding::cache_positions,
+                                                   peer_cache_values);
+        ScopedRankTensorBinding peer_rope_binding(tp_count_, ranks_, &TextRankBinding::rope_positions,
+                                                  peer_cache_values);
+        ScopedRankTensorBinding peer_rows_binding(tp_count_, ranks_, &TextRankBinding::kv_table_rows,
+                                                  peer_row_values);
+        ScopedRankTensorBinding peer_slots_binding(tp_count_, ranks_,
+                                                   &TextRankBinding::linear_state_slots,
+                                                   peer_slot_values);
 
         auto scope_0 = work_.scope();
-        auto scope_1 = tp_->work->scope();
-        std::array<Tensor, 2> x;
-        std::array<Tensor, 2> staging;
-        for (std::size_t r = 0; r < 2; ++r) {
+        auto scope_1 = rank_scopes();
+        TpArray<Tensor> x;
+        TpArray<Tensor> staging;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
             x[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, batch});
             staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, batch});
         }
-        const std::array<const Tensor*, 2> rank_ids = {&ids, &peer_ids};
+        TpArray<Tensor> rank_ids;
+        rank_ids[0] = ids;
+        for (std::int32_t r = 1; r < tp_count_; ++r) {
+            rank_ids[r] = ranks_[static_cast<std::size_t>(r)].execution.io->ordinary->tokens.slice(
+                0, 0, batch);
+        }
         for_each_rank(execution, [&](int rank) {
             const auto r = static_cast<std::size_t>(rank);
-            ops::embedding(*rank_ids[r], rank == 0 ? *embed_ : *embed_peer_, x[r],
-                           stream_for(rank));
+            ops::embedding(rank_ids[r], rank_embed(rank), x[r], stream_for(rank));
         });
         run_layers_tp2(x, Phase::Verify, staging);
 
-        const std::array<Tensor, 2> flat_hidden = {hidden, peer_hidden};
+        TpArray<Tensor> flat_hidden;
+        TpArray<Tensor> flat_logits;
+        flat_hidden[0] = hidden;
+        flat_logits[0] = logits;
+        for (std::int32_t r = 1; r < tp_count_; ++r) {
+            const auto slot = static_cast<std::size_t>(r);
+            flat_hidden[slot] = ranks_[slot].execution.io->ordinary->hidden.slice(1, 0, batch);
+            // A non-zero rank's destination is ITS ordinary frame's logits, not its scalar
+            // RoundState logits: the decode round produces one column per lane, and
+            // RoundState::logits is a single column. Getting this wrong is an out-of-bounds write
+            // on that device at any batch above 1.
+            flat_logits[slot] = ranks_[slot].execution.io->ordinary->logits.slice(1, 0, batch);
+        }
         for_each_rank(execution, [&](int rank) {
             const auto r = static_cast<std::size_t>(rank);
-            ops::rmsnorm(x[r], rank == 0 ? *final_norm_ : *final_norm_peer_, kCfg.rms_eps, true,
-                         const_cast<Tensor&>(flat_hidden[r]), stream_for(rank));
+            ops::rmsnorm(x[r], rank_final_norm(rank), kCfg.rms_eps, true, flat_hidden[r],
+                         stream_for(rank));
         });
-        // Rank 1's destination is ITS ordinary frame's logits, not its scalar RoundState logits:
-        // the decode round produces one column per lane, and RoundState::logits is a single
-        // column. Getting this wrong is an out-of-bounds write on device 1 at any batch above 1.
-        Tensor peer_logits = peer.logits.slice(1, 0, batch);
-        logits_tp2(flat_hidden, logits, peer_logits);
+        logits_tp2(flat_hidden, flat_logits);
     }
     work_.reset();
-    tp_->work->reset();
+    reset_peer_workspaces();
 }
 
 // --- tp == 2 MTP -------------------------------------------------------------------------------
@@ -2286,16 +2584,185 @@ void TextContext::ordinary_decode_batch_tp2(const Tensor& ids, const Tensor& cac
 // them, exactly as in the text layers, which is what keeps the MTP KV pages and the proposal
 // argmax in lockstep without any further agreement protocol.
 
-void TextContext::mtp_forward_stem_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                                       std::array<Tensor, 2>& x, std::array<Tensor, 2>& ah,
-                                       const std::array<Tensor, 2>& staging) {
+// Debug-only (NINFER_TP4_MTP_STEM_REF_DUMP=<prefix>): everything a HOST-side reference needs to
+// recompute the MTP stem, captured from the SAME call -- the call's ids, the target hidden, the
+// looked-up embedding, the stem's outputs x/ah, the three norms, and every rank's fc weight payload.
+// Recomputing in fp32 on the host and diffing against x/ah localizes a stem defect with no
+// cross-width A/B and no pin (see work/ninfer-tp4-m2/README_tp4_mtp_rca_2026-10-01.md section 10).
+// File layout, little endian:
+//   header[8] i32 = {version, T, hidden, tp, half, ids_bytes, embedding_bytes, x_bytes}
+//   ids | hidden | embedding | x | ah | norm_embedding | norm_hidden | norm_input
+//   per rank: {rank, n, k, group, payload_bytes} i64[5] | fc payload
+void mtp_stem_reference_dump(const ExecutionContext& ec, const Tensor& ids,
+                             const TpArray<Tensor>& hidden,
+                             const TpArray<workspace_recipe::MtpStemRoots>& roots,
+                             const TpArray<Tensor>& x, const TpArray<Tensor>& ah, const MtpW& mtp0,
+                             const TpArray<const Weight*>& fc_weights,
+                             const TpArray<Tensor>& fc_input, std::int32_t half) {
+    static const char* prefix = std::getenv("NINFER_TP4_MTP_STEM_REF_DUMP");
+    if (prefix == nullptr) { return; }
+    static bool done = false;
+    if (done) { return; }
+    done = true;
+    const std::int32_t T = ids.ne[0] * ids.ne[1];
+    const CurrentDevice restore;
+    const auto read_device = [&](const void* data, std::size_t bytes, int device) {
+        std::vector<unsigned char> out(bytes);
+        CUDA_CHECK(cudaSetDevice(device));
+        CUDA_CHECK(cudaMemcpyAsync(out.data(), data, bytes, cudaMemcpyDeviceToHost,
+                                   ec.dev[0]->stream));
+        CUDA_CHECK(cudaStreamSynchronize(ec.dev[0]->stream));
+        return out;
+    };
+    const auto read_tensor = [&](const Tensor& t) {
+        return read_device(t.data, static_cast<std::size_t>(t.bytes()), ec.dev[0]->device);
+    };
+    const auto ids_bytes    = read_device(ids.data, static_cast<std::size_t>(ids.bytes()),
+                                          ec.dev[0]->device);
+    const auto hidden_bytes = read_tensor(hidden[0]);
+    const auto embed_bytes =
+        roots[0].embedding.data != nullptr ? read_tensor(roots[0].embedding)
+                                           : std::vector<unsigned char>{};
+    const auto x_bytes  = read_tensor(x[0]);
+    const auto ah_bytes = read_tensor(ah[0]);
+    // PER RANK, because the embedding side and the hidden side write different buffers: at tp2 only
+    // rank 0's normalized_embedding and rank 1's normalized_hidden are ever written, so dumping
+    // rank 0's pair and assuming both are meaningful compares a real buffer against garbage.
+    std::vector<std::vector<unsigned char>> norm_emb_out(static_cast<std::size_t>(ec.tp));
+    std::vector<std::vector<unsigned char>> norm_hid_out(static_cast<std::size_t>(ec.tp));
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        const int device = ec.dev[slot]->device;
+        if (roots[slot].normalized_embedding.data != nullptr) {
+            norm_emb_out[slot] = read_device(roots[slot].normalized_embedding.data,
+                                             static_cast<std::size_t>(
+                                                 roots[slot].normalized_embedding.bytes()),
+                                             device);
+        }
+        if (roots[slot].normalized_hidden.data != nullptr) {
+            norm_hid_out[slot] = read_device(
+                roots[slot].normalized_hidden.data,
+                static_cast<std::size_t>(roots[slot].normalized_hidden.bytes()), device);
+        }
+    }
+    std::vector<std::vector<unsigned char>> fc_input_bytes(static_cast<std::size_t>(ec.tp));
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        if (fc_input[static_cast<std::size_t>(rank)].data != nullptr) {
+            fc_input_bytes[static_cast<std::size_t>(rank)] =
+                read_tensor(fc_input[static_cast<std::size_t>(rank)]);
+        }
+    }
+    const auto norm_e   = read_tensor(*mtp0.pre_fc_norm_embedding);
+    const auto norm_h   = read_tensor(*mtp0.pre_fc_norm_hidden);
+    const auto norm_i   = read_tensor(*mtp0.input_norm);
+    FILE* file = std::fopen(prefix, "wb");
+    if (file == nullptr) { throw std::runtime_error("MTP stem reference dump: unreadable"); }
+    const std::int32_t header[8] = {1, T, kCfg.hidden, ec.tp, half,
+                                    static_cast<std::int32_t>(ids_bytes.size()),
+                                    static_cast<std::int32_t>(embed_bytes.size()),
+                                    static_cast<std::int32_t>(x_bytes.size())};
+    std::fwrite(header, sizeof(header), 1, file);
+    std::fwrite(ids_bytes.data(), 1, ids_bytes.size(), file);
+    // Self-describing sections: a 8-byte ASCII tag then the length, so a reader can never mistake
+    // one buffer for another (an earlier revision relied on write order and mis-parsed a buffer that
+    // the engine never wrote at this width).
+    const auto write_tagged = [&](const char* tag, const std::vector<unsigned char>& blob) {
+        // Exactly 8 bytes, space padded: a shorter c_str would write whatever follows the NUL and a
+        // reader that keys on the tag would then miss the section.
+        char padded[8] = {' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '};
+        for (int i = 0; i < 8 && tag[i] != '\0'; ++i) { padded[i] = tag[i]; }
+        std::fwrite(padded, 1, sizeof(padded), file);
+        const std::int64_t length = static_cast<std::int64_t>(blob.size());
+        std::fwrite(&length, sizeof(length), 1, file);
+        std::fwrite(blob.data(), 1, blob.size(), file);
+    };
+    write_tagged("hidden  ", hidden_bytes);
+    write_tagged("embed   ", embed_bytes);
+    write_tagged("stemX   ", x_bytes);
+    write_tagged("stemAH  ", ah_bytes);
+    write_tagged("normE   ", norm_e);
+    write_tagged("normH   ", norm_h);
+    write_tagged("normI   ", norm_i);
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        write_tagged(("nEmb" + std::to_string(rank)).c_str(),
+                     norm_emb_out[static_cast<std::size_t>(rank)]);
+        write_tagged(("nHid" + std::to_string(rank)).c_str(),
+                     norm_hid_out[static_cast<std::size_t>(rank)]);
+    }
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        const auto& blob = fc_input_bytes[static_cast<std::size_t>(rank)];
+        const std::string tag = "fcIn" + std::to_string(rank);
+        write_tagged(tag.c_str(), blob);
+    }
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        const Weight& fc  = *fc_weights[static_cast<std::size_t>(rank)];
+        const int device  = ec.dev[static_cast<std::size_t>(rank)]->device;
+        const auto payload =
+            read_device(fc.payload, static_cast<std::size_t>(fc.payload_bytes), device);
+        const std::string fctag = "fcShard" + std::to_string(rank);
+        std::fwrite(fctag.c_str(), 1, fctag.size(), file);
+        const std::int64_t fcheader[5] = {rank, fc.n, fc.k, fc.group,
+                                          static_cast<std::int64_t>(fc.payload_bytes)};
+        std::fwrite(fcheader, sizeof(fcheader), 1, file);
+        std::fwrite(payload.data(), 1, payload.size(), file);
+    }
+    std::fclose(file);
+    std::fprintf(stderr,
+                 "[mtp-stem-ref] T=%d half=%d hidden=%zuB embed=%zuB x=%zuB ah=%zuB roots=%zu\n", T,
+                 half, hidden_bytes.size(), embed_bytes.size(), x_bytes.size(), ah_bytes.size(),
+                 static_cast<std::size_t>(roots.size()));
+    // In-process trio check: shapes plus a few (raw, weight, out) values, so "which buffer is which"
+    // cannot be an artefact of how the dump file is interpreted.
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        const auto slot    = static_cast<std::size_t>(rank);
+        const bool embedside = rank < half;
+        const Tensor& raw = embedside ? roots[slot].embedding : hidden[slot];
+        const Tensor& out = embedside ? roots[slot].normalized_embedding
+                                      : roots[slot].normalized_hidden;
+        const Tensor& weight = embedside ? *mtp0.pre_fc_norm_embedding : *mtp0.pre_fc_norm_hidden;
+        if (raw.data == nullptr || out.data == nullptr) { continue; }
+        const auto raw_v  = read_device(raw.data, static_cast<std::size_t>(raw.bytes()),
+                                        ec.dev[slot]->device);
+        const auto out_v  = read_device(out.data, static_cast<std::size_t>(out.bytes()),
+                                        ec.dev[slot]->device);
+        const auto w_v    = read_device(weight.data, static_cast<std::size_t>(weight.bytes()),
+                                        ec.dev[slot]->device);
+        const auto to_f = [](unsigned short bits) {
+            const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
+            float value              = 0.0F;
+            std::memcpy(&value, &wide, sizeof(value));
+            return value;
+        };
+        const auto* raw_b = reinterpret_cast<const unsigned short*>(raw_v.data());
+        const auto* out_b = reinterpret_cast<const unsigned short*>(out_v.data());
+        const auto* w_b   = reinterpret_cast<const unsigned short*>(w_v.data());
+        const std::int32_t rows = embedside ? raw.ne[0] : raw.ne[0];
+        double sum = 0.0;
+        for (std::int32_t i = 0; i < raw.ne[0]; ++i) {
+            const double v = to_f(raw_b[i]);
+            sum += v * v;
+        }
+        const double inv = 1.0 / std::sqrt(sum / static_cast<double>(raw.ne[0]) + kCfg.rms_eps);
+        const double g0  = to_f(w_b[0]) + 1.0;
+        std::fprintf(stderr,
+                     "[mtp-trio] rank %d %s: raw.ne=%d,%d out.ne=%d,%d  raw[0]=%+.5f w[0]=%+.5f "
+                     "out[0]=%+.5f  expected(raw*inv*gain)=%+.5f  inv=%.5f  rows=%d\n",
+                     rank, embedside ? "embed" : "hidden", raw.ne[0], raw.ne[1], out.ne[0],
+                     out.ne[1], to_f(raw_b[0]), to_f(w_b[0]), to_f(out_b[0]),
+                     to_f(raw_b[0]) * inv * g0, inv, rows);
+    }
+}
+
+void TextContext::mtp_forward_stem_tp2(const Tensor& ids, const TpArray<Tensor>& hidden,
+                                       TpArray<Tensor>& x, TpArray<Tensor>& ah,
+                                       const TpArray<Tensor>& staging) {
     const ExecutionContext& execution       = ec();
-    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    const TpArray<WorkspaceArena*> ws = workspaces();
     const int T                             = ids.ne[0] * ids.ne[1];
     // The caller's hidden is [hidden, T] in the AR/bridge shapes and [hidden, width, batch] in the
     // decode-batch one, so the aggregate column count is what has to match -- comparing ne[1]
     // alone silently accepts a batch>1 frame and then reads only its first lane.
-    for (std::size_t r = 0; r < 2; ++r) {
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         if (hidden[r].ne[0] != kCfg.hidden || !hidden[r].is_contiguous() ||
             hidden[r].numel() != static_cast<std::int64_t>(kCfg.hidden) * T) {
             throw std::logic_error(
@@ -2304,15 +2771,55 @@ void TextContext::mtp_forward_stem_tp2(const Tensor& ids, const std::array<Tenso
     }
     Tensor flat_ids = ids.view({T});
 
-    // Rank 1 gets no embedding root: it never embeds a token here (see below), so allocating one
-    // would reserve hidden*T BF16 per MTP call for nothing. The startup capacity query plans one
-    // for both devices, which over-plans rank 1 rather than under-planning it.
-    std::array<workspace_recipe::MtpStemRoots, 2> roots{
-        workspace_recipe::mtp_stem<TextConfig>(*ws[0], T, /*allocate_embedding=*/true,
-                                               kTensorParallelWidth),
-        workspace_recipe::mtp_stem<TextConfig>(*ws[1], T, /*allocate_embedding=*/false,
-                                               kTensorParallelWidth)};
-    for (std::size_t r = 0; r < 2; ++r) {
+    // The packed fc input is [embedding_norm (hidden rows) | hidden_norm (hidden rows)], and
+    // `append_row_parallel` hands rank r packed rows [r*K/tp, (r+1)*K/tp). With half = tp/2 that is
+    //   ranks [0, half):   the r-th 1/half slice of embedding_norm
+    //   ranks [half, tp):  the (r - half)-th 1/half slice of hidden_norm
+    // so an embedding-side rank embeds a token and normalizes the EMBEDDING, a hidden-side rank
+    // normalizes the HIDDEN, and each then contracts only its own slice. At tp == 2 this degenerates
+    // to "rank 0 the embedding, rank 1 the hidden", which is the mapping the tp2 shard always used.
+    //
+    // Only the embedding-side ranks need an embedding root; the others never embed a token here.
+    // The startup capacity query plans for the embedding side on every rank, which over-plans the
+    // hidden-side ranks rather than under-planning them.
+    const std::int32_t half       = tp_count_ / 2;
+    const std::int32_t shard_rows = kCfg.hidden / half;
+    // `ids` is ONE buffer on rank 0 for every rank (one model input, one host copy per chunk), but
+    // only the EMBEDDING-side ranks read it -- and at tp > 2 that set is wider than rank 0. With
+    // half = tp/2 the embedding side is ranks [0, half), so at tp4 rank 1 embeds the same token
+    // stream out of rank 0's buffer.
+    //
+    // Rank 0 wrote that buffer on ITS OWN stream (the shifted-token copy in the prefill, the
+    // alignment ids of a decode round, the draft token of an AR step, the bridge token). A peer
+    // stream has no implicit ordering against it, so without the handshake below the peer's
+    // embedding gather can read the buffer's PREVIOUS contents -- and a garbage token id is an
+    // out-of-bounds read of the embedding table, i.e. a sticky illegal-access fault rather than a
+    // wrong token. Measured: at tp4 that fault fired on roughly every second load-time warmup, and
+    // one synchronize anywhere inside the stem made it disappear, which is the signature of a
+    // missing cross-stream edge rather than of a bad address computation.
+    //
+    // At tp == 2 half == 1: rank 0 is the only reader, on the stream that wrote it, which is why
+    // the tp2 path never needed this. The record is enqueued on the WRITING stream, so it is also
+    // a barrier for every earlier write on rank 0's stream, and it is capture-safe (an event wait
+    // becomes a graph edge), unlike the synchronize it replaces.
+    if (half > 1) {
+        const ops::PeerEvents& events = peer_events();
+        const CurrentDevice restore;
+        CUDA_CHECK(cudaSetDevice(ec().dev[0]->device));
+        CUDA_CHECK(cudaEventRecord(events.inputs_ready(0), stream_for(0)));
+        for (std::int32_t rank = 1; rank < half; ++rank) {
+            CUDA_CHECK(cudaSetDevice(ec().dev[static_cast<std::size_t>(rank)]->device));
+            CUDA_CHECK(cudaStreamWaitEvent(stream_for(rank), events.inputs_ready(0), 0));
+        }
+    }
+    TpArray<workspace_recipe::MtpStemRoots> roots;
+    for (std::int32_t r = 0; r < tp_count_; ++r) {
+        const auto slot = static_cast<std::size_t>(r);
+        roots[slot]     = workspace_recipe::mtp_stem<TextConfig>(*ws[slot], T,
+                                                                 /*allocate_embedding=*/r < half,
+                                                                 ec().tp);
+    }
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         x[r]  = roots[r].residual;
         ah[r] = roots[r].attention_hidden;
     }
@@ -2323,74 +2830,195 @@ void TextContext::mtp_forward_stem_tp2(const Tensor& ids, const std::array<Tenso
     // rank 1 (bindings.cpp `ends("mtp/input_projection")` -> append_row_parallel, whose
     // even_chunk gives device 0 the low half). So each rank computes only the half it will
     // contract, and one all-reduce completes the product.
-    const std::array<Tensor, 2> fc_input = {roots[0].normalized_embedding,
-                                            roots[1].normalized_hidden};
     for_each_rank(execution, [&](int rank) {
-        cudaStream_t s = stream_for(rank);
-        if (rank == 0) {
-            Tensor emb = roots[0].embedding;
-            ops::embedding(flat_ids, *embed_, emb, s);
-            ops::rmsnorm(emb, *mtp_weights_for(0).pre_fc_norm_embedding, kCfg.rms_eps, true,
-                         const_cast<Tensor&>(fc_input[0]), s);
+        const auto slot = static_cast<std::size_t>(rank);
+        cudaStream_t s  = stream_for(rank);
+        if (rank < half) {
+            ops::embedding(flat_ids, rank_embed(rank), roots[slot].embedding, s);
+            ops::rmsnorm(roots[slot].embedding, *mtp_weights_for(rank).pre_fc_norm_embedding,
+                         kCfg.rms_eps, true, roots[slot].normalized_embedding, s);
         } else {
-            const Tensor flat_hidden = hidden[1].view({kCfg.hidden, T});
-            ops::rmsnorm(flat_hidden, *mtp_weights_for(1).pre_fc_norm_hidden, kCfg.rms_eps, true,
-                         const_cast<Tensor&>(fc_input[1]), s);
+            const Tensor flat_hidden = hidden[slot].view({kCfg.hidden, T});
+            ops::rmsnorm(flat_hidden, *mtp_weights_for(rank).pre_fc_norm_hidden, kCfg.rms_eps, true,
+                         roots[slot].normalized_hidden, s);
         }
     });
-    ops::linear_row_parallel(fc_input, {*mtp_weights_for(0).fc, *mtp_weights_for(1).fc}, x,
-                             staging, execution, *tp_->events);
+    TpArray<Tensor> fc_input;
+    TpArray<Weight> fc;
+    for (std::int32_t r = 0; r < tp_count_; ++r) {
+        const auto slot           = static_cast<std::size_t>(r);
+        const bool embedding_side = r < half;
+        const std::int32_t within = embedding_side ? r : r - half;
+        const Tensor source       = embedding_side ? roots[slot].normalized_embedding
+                                                   : roots[slot].normalized_hidden;
+        fc[slot]                  = *mtp_weights_for(r).fc;
+        if (half == 1) {
+            // tp 2: the rank's K-slice IS the whole normalized buffer, already contiguous.
+            fc_input[slot] = source;
+            continue;
+        }
+        // tp > 2: the rank's K-slice is a ROW RANGE of one normalized buffer. Those rows are
+        // adjacent, so the range is one contiguous run of bytes -- but the [K/tp, T] view of it is
+        // strided as a whole and the GEMM needs a compact activation. Copy the run once.
+        //
+        // ONE COPY PER COLUMN, because the buffer is COLUMN-MAJOR: ne[0] (= hidden) is the FAST
+        // axis, so rows [a, a + shard_rows) of every column are strided by `hidden`, NOT one
+        // contiguous run. The single memcpy this replaced read the range as if rows were
+        // contiguous, which handed every tp > 2 rank a slice of the wrong elements -- a silent
+        // defect, since the values are still real activations. tp2 never ran it (the `half == 1`
+        // shortcut below assigns the whole normalized buffer), which is why only the tp4 MTP was
+        // degraded; measured against a host reference: fc_input rel_l2 1.2-1.36 at tp4 versus
+        // 0.0018 at tp2, and every downstream stage inherits it.
+        constexpr std::int64_t kElementBytes = sizeof(std::uint16_t);
+        Tensor slice = ws[slot]->alloc(DType::BF16, {shard_rows, T});
+        {
+            const CurrentDevice restore;
+            // `ranks_` holds slots 1..tp-1 only, so rank 0's device comes from the context.
+            CUDA_CHECK(cudaSetDevice(
+                ec().dev[static_cast<std::size_t>(r)]->device));
+            for (std::int32_t column = 0; column < T; ++column) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<std::uint8_t*>(slice.data) +
+                        static_cast<std::int64_t>(column) * shard_rows * kElementBytes,
+                    static_cast<const std::uint8_t*>(source.data) +
+                        (static_cast<std::int64_t>(column) * kCfg.hidden +
+                         static_cast<std::int64_t>(within) * shard_rows) * kElementBytes,
+                    static_cast<std::size_t>(shard_rows) *
+                        static_cast<std::size_t>(kElementBytes),
+                    cudaMemcpyDeviceToDevice, stream_for(r)));
+            }
+        }
+        fc_input[slot] = slice;
+    }
+    ops::linear_row_parallel(fc_input, fc, x, staging, execution, peer_events());
     for_each_rank(execution, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
         ops::rmsnorm(x[r], *mtp_weights_for(rank).input_norm, kCfg.rms_eps, true, ah[r],
                      stream_for(rank));
     });
+    {
+        TpArray<const Weight*> fc_weights{};
+        for (int r = 0; r < ec().tp; ++r) {
+            fc_weights[static_cast<std::size_t>(r)] = mtp_weights_for(r).fc;
+        }
+        mtp_stem_reference_dump(ec(), ids, hidden, roots, x, ah, mtp_weights_for(0), fc_weights,
+                                fc_input, static_cast<std::int32_t>(half));
+    }
 }
 
-void TextContext::mtp_forward_tail_tp2(std::array<Tensor, 2>& x, const std::array<Tensor, 2>& ah,
-                                       const std::array<Tensor, 2>& positions,
-                                       const std::array<Tensor, 2>& rope_positions,
+// See mtp_stem_probe; this one dumps the upper half of the tail's output for elementwise diffing.
+void mtp_tail_output_probe(const ExecutionContext& ec, const TpArray<Tensor>& mtp_hidden) {
+    static const char* dump_path = std::getenv("NINFER_TP4_MTP_TAILOUT_DUMP");
+    if (dump_path == nullptr) { return; }
+    static bool done = false;
+    if (done) { return; }
+    done = true;
+    const Tensor& source  = mtp_hidden[0];
+    const std::size_t one = static_cast<std::size_t>(source.bytes());
+    std::vector<unsigned char> host(one);
+    const CurrentDevice restore;
+    CUDA_CHECK(cudaSetDevice(ec.dev[0]->device));
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), source.data, one, cudaMemcpyDeviceToHost,
+                               ec.dev[0]->stream));
+    CUDA_CHECK(cudaStreamSynchronize(ec.dev[0]->stream));
+    FILE* file = std::fopen(dump_path, "wb");
+    if (file == nullptr) { throw std::runtime_error("MTP tailout probe: dump path unreadable"); }
+    std::fwrite(host.data(), 1, host.size(), file);
+    std::fclose(file);
+    std::fprintf(stderr, "[mtp-tailout] dumped %zu bytes (ne=%d,%d,%d,%d)\n", host.size(),
+                 source.ne[0], source.ne[1], source.ne[2], source.ne[3]);
+}
+
+// See mtp_stem_probe: same idea one stage later, over the post-mixer's (residual, hidden) pair.
+void mtp_post_mixer_probe(const ExecutionContext& ec, const TpArray<Tensor>& residual,
+                          const TpArray<Tensor>& hidden, std::int32_t rank_count) {
+    static const char* dump_path = std::getenv("NINFER_TP4_MTP_POSTMIX_DUMP");
+    static const char* load_path = std::getenv("NINFER_TP4_MTP_POSTMIX_LOAD");
+    if (dump_path == nullptr && load_path == nullptr) { return; }
+    static bool done = false;
+    if (done) { return; }
+    done = true;
+    const std::size_t one = static_cast<std::size_t>(residual[0].bytes());
+    std::vector<unsigned char> host(2 * one);
+    const CurrentDevice restore;
+    if (dump_path != nullptr) {
+        CUDA_CHECK(cudaSetDevice(ec.dev[0]->device));
+        CUDA_CHECK(cudaMemcpyAsync(host.data(), residual[0].data, one, cudaMemcpyDeviceToHost,
+                                   ec.dev[0]->stream));
+        CUDA_CHECK(cudaMemcpyAsync(host.data() + one, hidden[0].data, one, cudaMemcpyDeviceToHost,
+                                   ec.dev[0]->stream));
+        CUDA_CHECK(cudaStreamSynchronize(ec.dev[0]->stream));
+        FILE* file = std::fopen(dump_path, "wb");
+        if (file == nullptr) { throw std::runtime_error("MTP postmix probe: dump unreadable"); }
+        std::fwrite(host.data(), 1, host.size(), file);
+        std::fclose(file);
+        std::fprintf(stderr, "[mtp-postmix] dumped x+mh = %zu bytes\n", host.size());
+    }
+    if (load_path != nullptr) {
+        FILE* file = std::fopen(load_path, "rb");
+        if (file == nullptr) { throw std::runtime_error("MTP postmix probe: load unreadable"); }
+        const std::size_t got = std::fread(host.data(), 1, host.size(), file);
+        std::fclose(file);
+        if (got != host.size()) {
+            throw std::runtime_error("MTP postmix probe: file size does not match this frame");
+        }
+        for (int rank = 0; rank < rank_count; ++rank) {
+            const auto slot = static_cast<std::size_t>(rank);
+            CUDA_CHECK(cudaSetDevice(ec.dev[slot]->device));
+            CUDA_CHECK(cudaMemcpyAsync(residual[slot].data, host.data(), one,
+                                       cudaMemcpyHostToDevice, ec.dev[slot]->stream));
+            CUDA_CHECK(cudaMemcpyAsync(hidden[slot].data, host.data() + one, one,
+                                       cudaMemcpyHostToDevice, ec.dev[slot]->stream));
+        }
+        std::fprintf(stderr, "[mtp-postmix] loaded x+mh = %zu bytes into every rank\n",
+                     host.size());
+    }
+}
+
+void TextContext::mtp_forward_tail_tp2(TpArray<Tensor>& x, const TpArray<Tensor>& ah,
+                                       const TpArray<Tensor>& positions,
+                                       const TpArray<Tensor>& rope_positions,
                                        ops::GqaExecutionEnvelope envelope,
-                                       const std::array<Tensor, 2>& mtp_hidden,
-                                       const std::array<Tensor, 2>& staging) {
+                                       const TpArray<Tensor>& mtp_hidden,
+                                       const TpArray<Tensor>& staging) {
     const ExecutionContext& execution       = ec();
-    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    const TpArray<WorkspaceArena*> ws = workspaces();
     const int T                             = x[0].ne[1];
 
-    std::array<Tensor, 2> q;
-    std::array<Tensor, 2> k;
-    std::array<Tensor, 2> gate;
-    std::array<Tensor, 2> v;
-    std::array<Tensor, 2> q_flat;
-    std::array<Tensor, 2> gate_flat;
-    std::array<Tensor, 2> k_flat;
-    std::array<Tensor, 2> v_flat;
-    for (std::size_t r = 0; r < 2; ++r) {
+    TpArray<Tensor> q;
+    TpArray<Tensor> k;
+    TpArray<Tensor> gate;
+    TpArray<Tensor> v;
+    TpArray<Tensor> q_flat;
+    TpArray<Tensor> gate_flat;
+    TpArray<Tensor> k_flat;
+    TpArray<Tensor> v_flat;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         const auto projection =
             workspace_recipe::mtp_attention_projection<TextConfig>(*ws[r], T,
-                                                                   kTensorParallelWidth);
-        q[r]         = projection.query.view({kCfg.head_dim, kShardQHeads, T});
-        k[r]         = projection.key.view({kCfg.head_dim, kShardKvHeads, T});
-        gate[r]      = projection.gate.view({kCfg.head_dim, kShardQHeads, T});
-        v[r]         = projection.value.view({kCfg.head_dim, kShardKvHeads, T});
-        q_flat[r]    = q[r].view({kShardQSize, T});
-        gate_flat[r] = gate[r].view({kShardQSize, T});
-        k_flat[r]    = k[r].view({kShardKvSize, T});
-        v_flat[r]    = v[r].view({kShardKvSize, T});
+                                                                   ec().tp);
+        q[r]         = projection.query.view({kCfg.head_dim, shard_q_heads(), T});
+        k[r]         = projection.key.view({kCfg.head_dim, shard_kv_heads(), T});
+        gate[r]      = projection.gate.view({kCfg.head_dim, shard_q_heads(), T});
+        v[r]         = projection.value.view({kCfg.head_dim, shard_kv_heads(), T});
+        q_flat[r]    = q[r].view({shard_q_size(), T});
+        gate_flat[r] = gate[r].view({shard_q_size(), T});
+        k_flat[r]    = k[r].view({shard_kv_size(), T});
+        v_flat[r]    = v[r].view({shard_kv_size(), T});
     }
     Variant::mtp_attention_projection(
-        ah, {&mtp_weights_for(0).payload->attention, &mtp_weights_for(1).payload->attention},
+        ah, mtp_attention_weights(),
         q_flat, gate_flat, k_flat, v_flat, ws, execution);
 
-    std::array<Tensor, 2> qn;
-    std::array<Tensor, 2> kn;
-    std::array<Tensor, 2> a;
-    for (std::size_t r = 0; r < 2; ++r) {
+    TpArray<Tensor> qn;
+    TpArray<Tensor> kn;
+    TpArray<Tensor> a;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         const auto results =
-            workspace_recipe::mtp_attention_results<TextConfig>(*ws[r], T, kTensorParallelWidth);
-        qn[r] = results.normalized_query.view({kCfg.head_dim, kShardQHeads, T});
-        kn[r] = results.normalized_key.view({kCfg.head_dim, kShardKvHeads, T});
-        a[r]  = results.attention.view({kCfg.head_dim, kShardQHeads, T});
+            workspace_recipe::mtp_attention_results<TextConfig>(*ws[r], T, ec().tp);
+        qn[r] = results.normalized_query.view({kCfg.head_dim, shard_q_heads(), T});
+        kn[r] = results.normalized_key.view({kCfg.head_dim, shard_kv_heads(), T});
+        a[r]  = results.attention.view({kCfg.head_dim, shard_q_heads(), T});
     }
     for_each_rank(execution, [&](int rank) {
         const auto r    = static_cast<std::size_t>(rank);
@@ -2403,20 +3031,20 @@ void TextContext::mtp_forward_tail_tp2(std::array<Tensor, 2>& x, const std::arra
         ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn[r], kn[r],
                   rope_frequency_[r], s);
 
-        const qwen3_6::PagedKVCache& pages = rank == 0 ? *batch_mtp_kv_ : *tp_->batch_mtp_kv;
+        const qwen3_6::PagedKVCache& pages = rank_batch_mtp_kv(rank);
         if (active_sequence_batch_ != 0) {
             const std::int32_t width = active_sequence_width_;
             if (width <= 0 || width * active_sequence_batch_ != T) {
                 throw std::logic_error("MTP sequence batch binding is incomplete");
             }
             Tensor q_batch =
-                qn[r].view({kCfg.head_dim, kShardQHeads, width, active_sequence_batch_});
+                qn[r].view({kCfg.head_dim, shard_q_heads(), width, active_sequence_batch_});
             Tensor k_batch =
-                kn[r].view({kCfg.head_dim, kShardKvHeads, width, active_sequence_batch_});
+                kn[r].view({kCfg.head_dim, shard_kv_heads(), width, active_sequence_batch_});
             Tensor v_batch =
-                v[r].view({kCfg.head_dim, kShardKvHeads, width, active_sequence_batch_});
+                v[r].view({kCfg.head_dim, shard_kv_heads(), width, active_sequence_batch_});
             Tensor a_batch =
-                a[r].view({kCfg.head_dim, kShardQHeads, width, active_sequence_batch_});
+                a[r].view({kCfg.head_dim, shard_q_heads(), width, active_sequence_batch_});
             Tensor position_batch = positions[r].view({width, active_sequence_batch_});
             ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, rank_valid_columns(rank),
                                rank_backend_kv_table_rows(rank), kAttnScale,
@@ -2433,16 +3061,16 @@ void TextContext::mtp_forward_tail_tp2(std::array<Tensor, 2>& x, const std::arra
     // layers use -- the tp1 MTP leaf composes it the same way, because W8G32_F16S has no
     // linear_add profile. So the row-parallel split is `linear_row_parallel` + a replicated
     // per-rank `residual_add` over the all-reduced result.
-    std::array<Tensor, 2> o;
-    std::array<Tensor, 2> mh;
-    for (std::size_t r = 0; r < 2; ++r) {
+    TpArray<Tensor> o;
+    TpArray<Tensor> mh;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         const auto post   = workspace_recipe::mtp_post_attention<TextConfig>(*ws[r], T);
         o[r]              = post.output;
         mh[r]             = post.post_mixer_hidden;
     }
-    ops::linear_row_parallel({a[0].view({kShardQSize, T}), a[1].view({kShardQSize, T})},
-                             {*mtp_weights_for(0).o_proj, *mtp_weights_for(1).o_proj}, o, staging,
-                             execution, *tp_->events);
+    ops::linear_row_parallel(attention_flat(a, T),
+                             mtp_output_weights(), o, staging,
+                             execution, peer_events());
     for_each_rank(execution, [&](int rank) {
         const auto r   = static_cast<std::size_t>(rank);
         cudaStream_t s = stream_for(rank);
@@ -2450,12 +3078,18 @@ void TextContext::mtp_forward_tail_tp2(std::array<Tensor, 2>& x, const std::arra
         ops::rmsnorm(x[r], *mtp_weights_for(rank).post_attn_norm, kCfg.rms_eps, true, mh[r], s);
     });
 
+    // Debug-only (NINFER_TP4_MTP_POSTMIX_DUMP=path / ..._LOAD=path): pins the post-mixer's input --
+    // the residual `x` and the post-attention hidden `mh`, both replicated [hidden, T] because the
+    // output projection's all-reduce has already run. The pair splits the tail in two: if the same
+    // pinned pair yields the same proposal at tp2 and tp4, the post-mixer is fine and the
+    // attention stage above it is the defective half.
+    mtp_post_mixer_probe(ec(), x, mh, ec().tp);
     {
         auto scope_0 = work_.scope();
-        auto scope_1 = tp_->work->scope();
+        auto scope_1 = rank_scopes();
         Variant::mtp_post_mixer(
-            mh, {&mtp_weights_for(0).payload->post_mixer, &mtp_weights_for(1).payload->post_mixer},
-            x, staging, ws, execution, *tp_->events);
+            mh, mtp_post_mixer_weights(),
+            x, staging, ws, execution, peer_events());
     }
 
     for_each_rank(execution, [&](int rank) {
@@ -2464,82 +3098,152 @@ void TextContext::mtp_forward_tail_tp2(std::array<Tensor, 2>& x, const std::arra
         ops::rmsnorm(x[r], *mtp_weights_for(rank).norm, kCfg.rms_eps, true, flat_mtp_hidden,
                      stream_for(rank));
     });
+    // Debug-only (NINFER_TP4_MTP_TAILOUT_DUMP=path): the tail's output AFTER the final norm, which
+    // is replicated, so the tp2 and tp4 images are directly comparable elementwise. Comparing the
+    // proposal argmax instead is confounded: the argmax is taken over the column the VERIFY's
+    // accepted count selects, and the verify's own batched logits differ slightly between widths,
+    // so a different column can be selected for reasons that have nothing to do with the tail.
+    mtp_tail_output_probe(ec(), mtp_hidden);
 }
 
-void TextContext::mtp_forward_core_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                                       const std::array<Tensor, 2>& positions,
-                                       const std::array<Tensor, 2>& rope_positions,
-                                       ops::GqaExecutionEnvelope envelope,
-                                       const std::array<Tensor, 2>& mtp_hidden) {
-    if (batch_mtp_kv_ == nullptr || tp_->batch_mtp_kv == nullptr) {
-        throw std::runtime_error("MTP forward is not enabled");
+// Debug-only (NINFER_TP4_MTP_STEM_DUMP=path / ..._LOAD=path): pins the MTP module's stem OUTPUT --
+// the residual `x` and the attention input `ah`, both replicated [hidden, T] -- so the tail
+// (attention + post-mixer) can be exercised at two widths on one identical activation. Together
+// with mtp_proposal_input_probe this splits the MTP module into stem / tail / head, one A/B each.
+// The stem consumes `ids` and the target hidden (both rank-invariant for the hidden side), so a
+// per-rank difference here is a shard-geometry defect, not a data difference.
+void mtp_stem_probe(const ExecutionContext& ec, const TpArray<Tensor>& x, const TpArray<Tensor>& ah,
+                    std::int32_t rank_count) {
+    static const char* dump_path = std::getenv("NINFER_TP4_MTP_STEM_DUMP");
+    static const char* load_path = std::getenv("NINFER_TP4_MTP_STEM_LOAD");
+    if (dump_path == nullptr && load_path == nullptr) { return; }
+    static bool done = false;
+    if (done) { return; }
+    done = true;
+    const std::size_t one = static_cast<std::size_t>(x[0].bytes());
+    std::vector<unsigned char> host(2 * one);
+    const CurrentDevice restore;
+    if (dump_path != nullptr) {
+        CUDA_CHECK(cudaSetDevice(ec.dev[0]->device));
+        CUDA_CHECK(cudaMemcpyAsync(host.data(), x[0].data, one, cudaMemcpyDeviceToHost,
+                                   ec.dev[0]->stream));
+        CUDA_CHECK(cudaMemcpyAsync(host.data() + one, ah[0].data, one, cudaMemcpyDeviceToHost,
+                                   ec.dev[0]->stream));
+        CUDA_CHECK(cudaStreamSynchronize(ec.dev[0]->stream));
+        FILE* file = std::fopen(dump_path, "wb");
+        if (file == nullptr) { throw std::runtime_error("MTP stem probe: dump path unreadable"); }
+        std::fwrite(host.data(), 1, host.size(), file);
+        std::fclose(file);
+        std::fprintf(stderr, "[mtp-stem] dumped x+ah = %zu bytes\n", host.size());
     }
-    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    if (load_path != nullptr) {
+        FILE* file = std::fopen(load_path, "rb");
+        if (file == nullptr) { throw std::runtime_error("MTP stem probe: load path unreadable"); }
+        const std::size_t got = std::fread(host.data(), 1, host.size(), file);
+        std::fclose(file);
+        if (got != host.size()) {
+            throw std::runtime_error(
+                "MTP stem probe: file size does not match this round's x+ah (same --draft-tokens?)");
+        }
+        for (int rank = 0; rank < rank_count; ++rank) {
+            const auto slot = static_cast<std::size_t>(rank);
+            CUDA_CHECK(cudaSetDevice(ec.dev[slot]->device));
+            CUDA_CHECK(cudaMemcpyAsync(x[slot].data, host.data(), one, cudaMemcpyHostToDevice,
+                                       ec.dev[slot]->stream));
+            CUDA_CHECK(cudaMemcpyAsync(ah[slot].data, host.data() + one, one, cudaMemcpyHostToDevice,
+                                       ec.dev[slot]->stream));
+        }
+        std::fprintf(stderr, "[mtp-stem] loaded x+ah = %zu bytes into every rank\n", host.size());
+    }
+}
+
+void TextContext::mtp_forward_core_tp2(const Tensor& ids, const TpArray<Tensor>& hidden,
+                                       const TpArray<Tensor>& positions,
+                                       const TpArray<Tensor>& rope_positions,
+                                       ops::GqaExecutionEnvelope envelope,
+                                       const TpArray<Tensor>& mtp_hidden) {
+    if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    for (int rank = 1; rank < tp_count_; ++rank) {
+        if (rank_binding(rank).execution.batch_mtp_kv == nullptr) {
+            throw std::runtime_error("MTP forward is not enabled on every rank");
+        }
+    }
+    const TpArray<WorkspaceArena*> ws = workspaces();
     auto scope_0                            = work_.scope();
-    auto scope_1                            = tp_->work->scope();
+    auto scope_1 = rank_scopes();
     const int T                             = ids.ne[0] * ids.ne[1];
-    std::array<Tensor, 2> staging;
-    for (std::size_t r = 0; r < 2; ++r) {
+    TpArray<Tensor> staging;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(ec().tp); ++r) {
         staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, T});
     }
-    std::array<Tensor, 2> x;
-    std::array<Tensor, 2> ah;
+    TpArray<Tensor> x;
+    TpArray<Tensor> ah;
     mtp_forward_stem_tp2(ids, hidden, x, ah, staging);
+    mtp_stem_probe(ec(), x, ah, ec().tp);
     mtp_forward_tail_tp2(x, ah, positions, rope_positions, envelope, mtp_hidden, staging);
 }
 
-void TextContext::proposal_argmax_tp2(const std::array<Tensor, 2>& hidden,
-                                      const std::array<Tensor, 2>& logits,
+void TextContext::proposal_argmax_tp2(const TpArray<Tensor>& hidden,
+                                      const TpArray<Tensor>& logits,
                                       Tensor& proposal_tokens) {
     const ExecutionContext& execution       = ec();
-    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    const TpArray<WorkspaceArena*> ws = workspaces();
     const std::int32_t T                    = hidden[0].ne[1];
     require_tensor_shape(proposal_tokens, DType::I32, {T}, "proposal tokens");
-    for (std::size_t r = 0; r < 2; ++r) {
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, T}, "proposal hidden");
         require_tensor_window(logits[r], DType::BF16, kCfg.vocab, T, "proposal logits");
     }
     if (proposal_head_ == nullptr) {
         // Full LM head: the gathered [vocab, T] logits ARE the caller's destinations, so this is
         // the ordinary logits path plus rank 0's argmax.
-        Tensor output_logits = matrix_window(logits[0], T);
-        Tensor peer_logits   = matrix_window(logits[1], T);
-        logits_tp2(hidden, output_logits, peer_logits);
+        TpArray<Tensor> output_logits;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+            output_logits[r] = matrix_window(logits[r], T);
+        }
+        logits_tp2(hidden, output_logits);
         const CurrentDevice restore;
         CUDA_CHECK(cudaSetDevice(ctx_.device));
-        ops::argmax(output_logits, proposal_tokens, kCfg.token_domain, ctx_.stream);
+        ops::argmax(output_logits[0], proposal_tokens, kCfg.token_domain, ctx_.stream);
         return;
     }
-    if (proposal_head_peer_ == nullptr || proposal_head_ids_peer_ == nullptr) {
-        throw std::logic_error("tensor-parallel proposal head bindings disagree between ranks");
-    }
     const std::int32_t shard_rows = proposal_head_->n;
-    if (proposal_head_peer_->n != shard_rows) {
-        throw std::logic_error("tensor-parallel proposal head shards disagree on width");
+    for (int rank = 1; rank < tp_count_; ++rank) {
+        const TextRankBinding& binding = rank_binding(rank);
+        if (binding.proposal_head == nullptr || binding.proposal_head_ids == nullptr) {
+            throw std::logic_error("tensor-parallel proposal head bindings disagree between ranks");
+        }
+        if (binding.proposal_head->n != shard_rows) {
+            throw std::logic_error("tensor-parallel proposal head shards disagree on width");
+        }
     }
     // `proposal_head_n_` is THIS RANK'S shard row count -- `set_proposal_head` is called with
     // `proposal.head.n`, which the loader already halved -- so the logical vocabulary of the draft
     // head is the two shards summed. The winning index is a global row in that logical space,
     // which is why the gather has to run before the argmax and why `draft_head_token_ids` is
     // replicated.
-    const std::int32_t total_rows = proposal_head_n_ + proposal_head_peer_->n;
+    const std::int32_t total_rows = proposal_head_n_ * tp_count_;
     auto scope_0                  = work_.scope();
-    auto scope_1                  = tp_->work->scope();
-    std::array<Tensor, 2> part;
-    std::array<Tensor, 2> whole;
-    for (std::size_t r = 0; r < 2; ++r) {
+    auto scope_1 = rank_scopes();
+    TpArray<Tensor> part;
+    TpArray<Tensor> whole;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         part[r]  = ws[r]->alloc(DType::BF16, {shard_rows, T});
         whole[r] = ws[r]->alloc(DType::BF16, {total_rows, T});
     }
-    ops::linear_column_parallel(hidden, {*proposal_head_, *proposal_head_peer_}, part, execution);
+    ops::linear_column_parallel(hidden, proposal_heads(), part, execution);
     // As in logits_tp2: allgather_rows gathers along ne[1] while the vocabulary is ne[0], so the
     // gather runs one column at a time over contiguous V-element runs -- no transpose.
     for (std::int32_t column = 0; column < T; ++column) {
-        const std::array<Tensor, 2> piece = {part[0].slice(1, column, 1).view({1, shard_rows}),
-                                             part[1].slice(1, column, 1).view({1, shard_rows})};
-        const std::array<Tensor, 2> full  = {whole[0].slice(1, column, 1).view({1, total_rows}),
-                                             whole[1].slice(1, column, 1).view({1, total_rows})};
-        ops::allgather_rows(full, piece, execution, *tp_->events);
+        TpArray<Tensor> piece;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+            piece[r] = part[r].slice(1, column, 1).view({1, shard_rows});
+        }
+        TpArray<Tensor> full;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+            full[r] = whole[r].slice(1, column, 1).view({1, total_rows});
+        }
+        ops::allgather_rows(full, piece, execution, peer_events());
     }
     const CurrentDevice restore;
     CUDA_CHECK(cudaSetDevice(ctx_.device));
@@ -2547,19 +3251,19 @@ void TextContext::proposal_argmax_tp2(const std::array<Tensor, 2>& hidden,
     ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, total_rows, ctx_.stream);
 }
 
-void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
-                                      const std::array<Tensor, 2>& cache_positions,
-                                      const std::array<Tensor, 2>& rope_positions,
-                                      const std::array<Tensor, 2>& valid_columns,
-                                      const std::array<Tensor, 2>& kv_table_rows,
-                                      const std::array<Tensor, 2>& linear_state_slots,
+void TextContext::target_verify_batch(const TpArray<Tensor>& ids,
+                                      const TpArray<Tensor>& cache_positions,
+                                      const TpArray<Tensor>& rope_positions,
+                                      const TpArray<Tensor>& valid_columns,
+                                      const TpArray<Tensor>& kv_table_rows,
+                                      const TpArray<Tensor>& linear_state_slots,
                                       ops::GqaExecutionEnvelope envelope,
-                                      const std::array<Tensor, 2>& hidden,
-                                      const std::array<Tensor, 2>& logits,
-                                      const std::array<Tensor, 2>& target_tokens) {
+                                      const TpArray<Tensor>& hidden,
+                                      const TpArray<Tensor>& logits,
+                                      const TpArray<Tensor>& target_tokens) {
     if (!tp2()) { throw std::logic_error("tensor-parallel target verify requires a peer"); }
     const ExecutionContext& execution       = ec();
-    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    const TpArray<WorkspaceArena*> ws = workspaces();
     const std::int32_t width                = ids[0].ne[0];
     const std::int32_t batch                = ids[0].ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
@@ -2570,7 +3274,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
     // Both ranks' extents are validated, not just rank 0's: rank 1's destinations live on the
     // other device, where an undersized buffer is a silent out-of-bounds write -- a defect of
     // exactly this class was once live here, invisible at batch 1 and out of bounds at batch > 1.
-    for (std::size_t r = 0; r < 2; ++r) {
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         require_tensor_shape(ids[r], DType::I32, {width, batch}, "target verify batch ids");
         require_tensor_shape(cache_positions[r], DType::I32, {width, batch},
                              "target verify batch cache positions");
@@ -2590,7 +3294,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
     }
 
     work_.reset();
-    tp_->work->reset();
+    reset_peer_workspaces();
     {
         ScopedPositions cache_binding(active_cache_positions_, cache_positions[0]);
         ScopedPositions rope_binding(active_rope_positions_, rope_positions[0]);
@@ -2604,40 +3308,58 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
         // SYMMETRIC valid-column binding. `rank_valid_columns` throws if only one rank is bound,
         // precisely because two devices masking different columns would diverge silently; that
         // invariant is only exercised from here.
-        ScopedValue<const Tensor*> peer_cache_binding(peer_cache_positions_, &cache_positions[1]);
-        ScopedValue<const Tensor*> peer_rope_binding(peer_rope_positions_, &rope_positions[1]);
-        ScopedValue<const Tensor*> peer_rows_binding(peer_kv_table_rows_, &kv_table_rows[1]);
-        ScopedValue<const Tensor*> peer_slots_binding(peer_linear_state_slots_,
-                                                      &linear_state_slots[1]);
-        ScopedValue<const Tensor*> peer_valid_binding(peer_valid_columns_, &valid_columns[1]);
+        std::array<const Tensor*, kMaximumDevices> peer_cache_values{};
+        std::array<const Tensor*, kMaximumDevices> peer_row_values{};
+        std::array<const Tensor*, kMaximumDevices> peer_slot_values{};
+        std::array<const Tensor*, kMaximumDevices> peer_valid_values{};
+        for (std::int32_t r = 1; r < tp_count_; ++r) {
+            const auto slot         = static_cast<std::size_t>(r);
+            peer_cache_values[slot] = &cache_positions[slot];
+            peer_row_values[slot]   = &kv_table_rows[slot];
+            peer_slot_values[slot]  = &linear_state_slots[slot];
+            peer_valid_values[slot] = &valid_columns[slot];
+        }
+        ScopedRankTensorBinding peer_cache_binding(tp_count_, ranks_,
+                                                   &TextRankBinding::cache_positions,
+                                                   peer_cache_values);
+        ScopedRankTensorBinding peer_rope_binding(tp_count_, ranks_, &TextRankBinding::rope_positions,
+                                                  peer_cache_values);
+        ScopedRankTensorBinding peer_rows_binding(tp_count_, ranks_, &TextRankBinding::kv_table_rows,
+                                                  peer_row_values);
+        ScopedRankTensorBinding peer_slots_binding(tp_count_, ranks_,
+                                                   &TextRankBinding::linear_state_slots,
+                                                   peer_slot_values);
+        ScopedRankTensorBinding peer_valid_binding(tp_count_, ranks_,
+                                                   &TextRankBinding::valid_columns,
+                                                   peer_valid_values);
 
         auto scope_0 = work_.scope();
-        auto scope_1 = tp_->work->scope();
-        std::array<Tensor, 2> x;
-        std::array<Tensor, 2> staging;
-        for (std::size_t r = 0; r < 2; ++r) {
+        auto scope_1 = rank_scopes();
+        TpArray<Tensor> x;
+        TpArray<Tensor> staging;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
             x[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, columns});
             staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, columns});
         }
         for_each_rank(execution, [&](int rank) {
             const auto r    = static_cast<std::size_t>(rank);
             Tensor flat_ids = ids[r].view({columns});
-            ops::embedding(flat_ids, rank == 0 ? *embed_ : *embed_peer_, x[r], stream_for(rank));
+            ops::embedding(flat_ids, rank_embed(rank), x[r], stream_for(rank));
         });
         run_layers_tp2(x, Phase::Verify, staging);
 
-        std::array<Tensor, 2> flat_hidden;
-        std::array<Tensor, 2> flat_logits;
-        for (std::size_t r = 0; r < 2; ++r) {
+        TpArray<Tensor> flat_hidden;
+        TpArray<Tensor> flat_logits;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
             flat_hidden[r] = hidden[r].view({kCfg.hidden, columns});
             flat_logits[r] = logits[r].view({kCfg.vocab, columns});
         }
         for_each_rank(execution, [&](int rank) {
             const auto r = static_cast<std::size_t>(rank);
-            ops::rmsnorm(x[r], rank == 0 ? *final_norm_ : *final_norm_peer_, kCfg.rms_eps, true,
+            ops::rmsnorm(x[r], rank_final_norm(rank), kCfg.rms_eps, true,
                          flat_hidden[r], stream_for(rank));
         });
-        logits_tp2(flat_hidden, flat_logits[0], flat_logits[1]);
+        logits_tp2(flat_hidden, flat_logits);
         // The argmax is REPLICATED, not rank 0's alone: both ranks hold the identical gathered
         // logits (the gather is an exact relocation and IEEE addition is commutative, so the two
         // buffers are bit-identical), and rank 1 needs its own target tokens to run the same
@@ -2649,30 +3371,30 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
         });
     }
     work_.reset();
-    tp_->work->reset();
+    reset_peer_workspaces();
 }
 
-void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
-                                      const std::array<Tensor, 2>& cache_positions,
-                                      const std::array<Tensor, 2>& rope_positions,
-                                      const std::array<Tensor, 2>& valid_columns,
-                                      const std::array<Tensor, 2>& kv_table_rows,
-                                      const std::array<Tensor, 2>& linear_state_slots,
+void TextContext::target_verify_batch(const TpArray<Tensor>& ids,
+                                      const TpArray<Tensor>& cache_positions,
+                                      const TpArray<Tensor>& rope_positions,
+                                      const TpArray<Tensor>& valid_columns,
+                                      const TpArray<Tensor>& kv_table_rows,
+                                      const TpArray<Tensor>& linear_state_slots,
                                       ops::GqaExecutionEnvelope envelope,
-                                      const std::array<Tensor, 2>& hidden,
-                                      const std::array<Tensor, 2>& logits,
-                                      const std::array<Tensor, 2>& target_tokens,
+                                      const TpArray<Tensor>& hidden,
+                                      const TpArray<Tensor>& logits,
+                                      const TpArray<Tensor>& target_tokens,
                                       DFlashFeatureSink& sink) {
     if (!tp2()) { throw std::logic_error("tensor-parallel target verify requires a peer"); }
     const ExecutionContext& execution = ec();
-    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    const TpArray<WorkspaceArena*> ws = workspaces();
     const std::int32_t width = ids[0].ne[0];
     const std::int32_t batch = ids[0].ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
         batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("tensor-parallel DFlash target verify shape is invalid");
     }
-    for (std::size_t r = 0; r < 2; ++r) {
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         require_tensor_shape(ids[r], DType::I32, {width, batch}, "DFlash target verify ids");
         require_tensor_shape(cache_positions[r], DType::I32, {width, batch},
                              "DFlash target verify cache positions");
@@ -2692,7 +3414,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
                              "DFlash target verify tokens");
     }
     work_.reset();
-    tp_->work->reset();
+    reset_peer_workspaces();
     {
         ScopedPositions cache_binding(active_cache_positions_, cache_positions[0]);
         ScopedPositions rope_binding(active_rope_positions_, rope_positions[0]);
@@ -2702,38 +3424,57 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
         ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns[0]);
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
-        ScopedValue<const Tensor*> peer_cache_binding(peer_cache_positions_, &cache_positions[1]);
-        ScopedValue<const Tensor*> peer_rope_binding(peer_rope_positions_, &rope_positions[1]);
-        ScopedValue<const Tensor*> peer_rows_binding(peer_kv_table_rows_, &kv_table_rows[1]);
-        ScopedValue<const Tensor*> peer_slots_binding(peer_linear_state_slots_, &linear_state_slots[1]);
-        ScopedValue<const Tensor*> peer_valid_binding(peer_valid_columns_, &valid_columns[1]);
+        std::array<const Tensor*, kMaximumDevices> peer_cache_values{};
+        std::array<const Tensor*, kMaximumDevices> peer_row_values{};
+        std::array<const Tensor*, kMaximumDevices> peer_slot_values{};
+        std::array<const Tensor*, kMaximumDevices> peer_valid_values{};
+        for (std::int32_t r = 1; r < tp_count_; ++r) {
+            const auto slot         = static_cast<std::size_t>(r);
+            peer_cache_values[slot] = &cache_positions[slot];
+            peer_row_values[slot]   = &kv_table_rows[slot];
+            peer_slot_values[slot]  = &linear_state_slots[slot];
+            peer_valid_values[slot] = &valid_columns[slot];
+        }
+        ScopedRankTensorBinding peer_cache_binding(tp_count_, ranks_,
+                                                   &TextRankBinding::cache_positions,
+                                                   peer_cache_values);
+        ScopedRankTensorBinding peer_rope_binding(tp_count_, ranks_, &TextRankBinding::rope_positions,
+                                                  peer_cache_values);
+        ScopedRankTensorBinding peer_rows_binding(tp_count_, ranks_, &TextRankBinding::kv_table_rows,
+                                                  peer_row_values);
+        ScopedRankTensorBinding peer_slots_binding(tp_count_, ranks_,
+                                                   &TextRankBinding::linear_state_slots,
+                                                   peer_slot_values);
+        ScopedRankTensorBinding peer_valid_binding(tp_count_, ranks_,
+                                                   &TextRankBinding::valid_columns,
+                                                   peer_valid_values);
         auto scope_0 = work_.scope();
-        auto scope_1 = tp_->work->scope();
-        std::array<Tensor, 2> x;
-        std::array<Tensor, 2> staging;
-        for (std::size_t r = 0; r < 2; ++r) {
+        auto scope_1 = rank_scopes();
+        TpArray<Tensor> x;
+        TpArray<Tensor> staging;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
             x[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, width * batch});
             staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, width * batch});
         }
         for_each_rank(execution, [&](int rank) {
             const auto r = static_cast<std::size_t>(rank);
-            ops::embedding(ids[r].view({width * batch}), rank == 0 ? *embed_ : *embed_peer_,
+            ops::embedding(ids[r].view({width * batch}), rank_embed(rank),
                            x[r], stream_for(rank));
         });
         run_layers_tp2(x, Phase::Verify, staging, &sink);
-        std::array<Tensor, 2> flat_hidden;
-        std::array<Tensor, 2> flat_logits;
-        for (std::size_t r = 0; r < 2; ++r) {
+        TpArray<Tensor> flat_hidden;
+        TpArray<Tensor> flat_logits;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
             flat_hidden[r] = hidden[r].view({kCfg.hidden, width * batch});
             flat_logits[r] = logits[r].view({kCfg.vocab, width * batch});
             for_each_rank(execution, [&](int rank) {
                 if (static_cast<std::size_t>(rank) == r) {
-                    ops::rmsnorm(x[r], rank == 0 ? *final_norm_ : *final_norm_peer_, kCfg.rms_eps,
+                    ops::rmsnorm(x[r], rank_final_norm(rank), kCfg.rms_eps,
                                  true, flat_hidden[r], stream_for(rank));
                 }
             });
         }
-        logits_tp2(flat_hidden, flat_logits[0], flat_logits[1]);
+        logits_tp2(flat_hidden, flat_logits);
         for_each_rank(execution, [&](int rank) {
             const auto r = static_cast<std::size_t>(rank);
             Tensor flat_tokens = target_tokens[r].view({width * batch});
@@ -2741,20 +3482,23 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
         });
     }
     work_.reset();
-    tp_->work->reset();
+    reset_peer_workspaces();
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids,
-                                           const std::array<Tensor, 2>& hidden,
-                                           const std::array<Tensor, 2>& cache_positions,
-                                           const std::array<Tensor, 2>& rope_positions,
-                                           const std::array<Tensor, 2>& valid_columns,
-                                           const std::array<Tensor, 2>& kv_table_rows,
+                                           const TpArray<Tensor>& hidden,
+                                           const TpArray<Tensor>& cache_positions,
+                                           const TpArray<Tensor>& rope_positions,
+                                           const TpArray<Tensor>& valid_columns,
+                                           const TpArray<Tensor>& kv_table_rows,
                                            ops::GqaExecutionEnvelope envelope,
-                                           const std::array<Tensor, 2>& mtp_hidden) {
+                                           const TpArray<Tensor>& mtp_hidden) {
     if (!tp2()) { throw std::logic_error("tensor-parallel MTP decode requires a peer"); }
-    if (batch_mtp_kv_ == nullptr || tp_->batch_mtp_kv == nullptr) {
-        throw std::runtime_error("MTP forward is not enabled");
+    if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    for (int rank = 1; rank < tp_count_; ++rank) {
+        if (rank_binding(rank).execution.batch_mtp_kv == nullptr) {
+            throw std::runtime_error("MTP forward is not enabled on every rank");
+        }
     }
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
@@ -2763,7 +3507,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids,
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
     }
     require_tensor_shape(ids, DType::I32, {width, batch}, "MTP decode batch ids");
-    for (std::size_t r = 0; r < 2; ++r) {
+    for (std::size_t r = 0; r < static_cast<std::size_t>(ec().tp); ++r) {
         require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, width, batch},
                              "MTP decode batch target hidden");
         require_tensor_shape(cache_positions[r], DType::I32, {width, batch},
@@ -2778,20 +3522,29 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids,
     }
 
     ScopedValue<const Tensor*> backend_binding(active_backend_kv_table_rows_, &kv_table_rows[0]);
-    ScopedValue<const Tensor*> peer_backend_binding(peer_backend_kv_table_rows_,
-                                                    &kv_table_rows[1]);
     ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns[0]);
-    ScopedValue<const Tensor*> peer_valid_binding(peer_valid_columns_, &valid_columns[1]);
+    std::array<const Tensor*, kMaximumDevices> peer_backend_values{};
+    std::array<const Tensor*, kMaximumDevices> peer_valid_values{};
+    for (std::int32_t r = 1; r < tp_count_; ++r) {
+        const auto slot              = static_cast<std::size_t>(r);
+        peer_backend_values[slot]    = &kv_table_rows[slot];
+        peer_valid_values[slot]      = &valid_columns[slot];
+    }
+    ScopedRankTensorBinding peer_backend_binding(tp_count_, ranks_,
+                                                 &TextRankBinding::backend_kv_table_rows,
+                                                 peer_backend_values);
+    ScopedRankTensorBinding peer_valid_binding(tp_count_, ranks_, &TextRankBinding::valid_columns,
+                                               peer_valid_values);
     ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
     ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
     mtp_forward_core_tp2(ids, hidden, cache_positions, rope_positions, envelope, mtp_hidden);
 }
 
-void TextContext::mtp_propose_batch(const std::array<Tensor, 2>& hidden,
-                                    const std::array<Tensor, 2>& logits, Tensor& draft_tokens) {
+void TextContext::mtp_propose_batch(const TpArray<Tensor>& hidden,
+                                    const TpArray<Tensor>& logits, Tensor& draft_tokens) {
     if (!tp2()) { throw std::logic_error("tensor-parallel MTP proposal requires a peer"); }
     const std::int32_t batch = hidden[0].ne[1];
-    for (std::size_t r = 0; r < 2; ++r) {
+    for (std::size_t r = 0; r < static_cast<std::size_t>(ec().tp); ++r) {
         require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, batch},
                              "MTP proposal batch hidden");
         require_tensor_shape(logits[r], DType::BF16, {kCfg.vocab, batch},
@@ -2799,26 +3552,29 @@ void TextContext::mtp_propose_batch(const std::array<Tensor, 2>& hidden,
     }
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP proposal batch tokens");
     auto scope_0 = work_.scope();
-    auto scope_1 = tp_->work->scope();
+    auto scope_1 = rank_scopes();
     proposal_argmax_tp2(hidden, logits, draft_tokens);
 }
 
-void TextContext::mtp_forward_batch(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                                    const std::array<Tensor, 2>& positions,
-                                    const std::array<Tensor, 2>& rope_positions,
+void TextContext::mtp_forward_batch(const Tensor& ids, const TpArray<Tensor>& hidden,
+                                    const TpArray<Tensor>& positions,
+                                    const TpArray<Tensor>& rope_positions,
                                     ops::GqaExecutionEnvelope envelope,
-                                    const std::array<Tensor, 2>& mtp_hidden, int logits_column,
-                                    const std::array<Tensor, 2>* logits, Tensor* draft_token) {
+                                    const TpArray<Tensor>& mtp_hidden, int logits_column,
+                                    const TpArray<Tensor>* logits, Tensor* draft_token) {
     if (!tp2()) { throw std::logic_error("tensor-parallel MTP batch requires a peer"); }
-    if (batch_mtp_kv_ == nullptr || tp_->batch_mtp_kv == nullptr) {
-        throw std::runtime_error("MTP forward is not enabled");
+    if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    for (int rank = 1; rank < tp_count_; ++rank) {
+        if (rank_binding(rank).execution.batch_mtp_kv == nullptr) {
+            throw std::runtime_error("MTP forward is not enabled on every rank");
+        }
     }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
         throw std::invalid_argument("MTP batch T must be in [1,prefill_chunk]");
     }
     require_tensor_shape(ids, DType::I32, {T}, "MTP ids");
-    for (std::size_t r = 0; r < 2; ++r) {
+    for (std::size_t r = 0; r < static_cast<std::size_t>(ec().tp); ++r) {
         require_tensor_shape(positions[r], DType::I32, {T}, "MTP positions");
         require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, T}, "MTP hidden");
         require_tensor_shape(mtp_hidden[r], DType::BF16, {kCfg.hidden, T}, "MTP output hidden");
@@ -2842,25 +3598,33 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const std::array<Tensor, 
 
     mtp_forward_core_tp2(ids, hidden, positions, rope_positions, envelope, mtp_hidden);
     if (logits_column >= 0) {
-        const std::array<Tensor, 2> columns{mtp_hidden[0].slice(1, logits_column, 1),
-                                            mtp_hidden[1].slice(1, logits_column, 1)};
+        // One column per rank, not two: the proposal gather reads every rank's shard, so a
+        // two-element list here would hand ranks 2..tp-1 default-constructed (null) tensors and the
+        // gather would read through them.
+        TpArray<Tensor> columns;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(ec().tp); ++r) {
+            columns[r] = mtp_hidden[r].slice(1, logits_column, 1);
+        }
         proposal_argmax_tp2(columns, *logits, *draft_token);
     }
 }
 
 void TextContext::mtp_forward_ar_step(const Tensor& token,
-                                      const std::array<Tensor, 2>& previous_hidden,
-                                      const std::array<Tensor, 2>& position,
+                                      const TpArray<Tensor>& previous_hidden,
+                                      const TpArray<Tensor>& position,
                                       ops::GqaExecutionEnvelope envelope,
-                                      const std::array<Tensor, 2>& mtp_hidden,
-                                      const std::array<Tensor, 2>& logits, Tensor& draft_token) {
+                                      const TpArray<Tensor>& mtp_hidden,
+                                      const TpArray<Tensor>& logits, Tensor& draft_token) {
     if (!tp2()) { throw std::logic_error("tensor-parallel MTP AR step requires a peer"); }
-    if (batch_mtp_kv_ == nullptr || tp_->batch_mtp_kv == nullptr) {
-        throw std::runtime_error("MTP forward is not enabled");
+    if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    for (int rank = 1; rank < tp_count_; ++rank) {
+        if (rank_binding(rank).execution.batch_mtp_kv == nullptr) {
+            throw std::runtime_error("MTP forward is not enabled on every rank");
+        }
     }
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP AR draft token");
-    for (std::size_t r = 0; r < 2; ++r) {
+    for (std::size_t r = 0; r < static_cast<std::size_t>(ec().tp); ++r) {
         require_tensor_shape(position[r], DType::I32, {1}, "MTP AR position");
         require_tensor_shape(previous_hidden[r], DType::BF16, {kCfg.hidden, 1},
                              "MTP AR previous hidden");
@@ -2868,11 +3632,11 @@ void TextContext::mtp_forward_ar_step(const Tensor& token,
         require_tensor_shape(logits[r], DType::BF16, {kCfg.vocab, 1}, "MTP AR logits");
     }
     const ExecutionContext& execution       = ec();
-    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    const TpArray<WorkspaceArena*> ws = workspaces();
     auto position_scope_0                   = work_.scope();
-    auto position_scope_1                   = tp_->work->scope();
-    std::array<Tensor, 2> rope_position;
-    for (std::size_t r = 0; r < 2; ++r) { rope_position[r] = ws[r]->alloc(DType::I32, {1}); }
+    auto position_scope_1 = rank_scopes();
+    TpArray<Tensor> rope_position;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) { rope_position[r] = ws[r]->alloc(DType::I32, {1}); }
     for_each_rank(execution, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
         ops::offset_i32_positions(position[r], io_for(rank).rope_delta, rope_position[r],
@@ -2880,19 +3644,22 @@ void TextContext::mtp_forward_ar_step(const Tensor& token,
     });
     mtp_forward_core_tp2(token, previous_hidden, position, rope_position, envelope, mtp_hidden);
     auto logits_scope_0 = work_.scope();
-    auto logits_scope_1 = tp_->work->scope();
+    auto logits_scope_1 = rank_scopes();
     proposal_argmax_tp2(mtp_hidden, logits, draft_token);
 }
 
-void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                                        const std::array<Tensor, 2>& positions,
-                                        const std::array<Tensor, 2>& rope_positions,
+void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const TpArray<Tensor>& hidden,
+                                        const TpArray<Tensor>& positions,
+                                        const TpArray<Tensor>& rope_positions,
                                         ops::GqaExecutionEnvelope envelope, bool final_chunk,
-                                        const std::array<Tensor, 2>* final_hidden,
-                                        const std::array<Tensor, 2>* logits,
+                                        const TpArray<Tensor>* final_hidden,
+                                        const TpArray<Tensor>* logits,
                                         Tensor* draft_token) {
-    if (!mtp_kv_.valid() || !tp_->mtp_kv.valid()) {
-        throw std::runtime_error("MTP prefill is not enabled");
+    if (!mtp_kv_.valid()) { throw std::runtime_error("MTP prefill is not enabled"); }
+    for (int rank = 1; rank < tp_count_; ++rank) {
+        if (!rank_mtp_kv(rank).valid()) {
+            throw std::runtime_error("MTP prefill is not enabled on every rank");
+        }
     }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
@@ -2901,7 +3668,8 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
     nvtx::ScopedRange mtp_prefill_range(nvtx::Name::PrefillMtpChunk, nvtx::Category::Mtp,
                                         static_cast<std::uint64_t>(T));
     require_tensor_shape(ids, DType::I32, {T}, "MTP prefill ids");
-    for (std::size_t r = 0; r < 2; ++r) {
+    // member function: the ExecutionContext comes from the accessor, not a local alias
+    for (std::size_t r = 0; r < static_cast<std::size_t>(ec().tp); ++r) {
         require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, T}, "MTP prefill hidden");
         require_tensor_shape(positions[r], DType::I32, {T}, "MTP prefill positions");
         require_tensor_shape(rope_positions[r], DType::I32, {T}, "MTP prefill rope positions");
@@ -2911,14 +3679,14 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
     }
 
     const ExecutionContext& execution       = ec();
-    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    const TpArray<WorkspaceArena*> ws = workspaces();
     auto scratch_scope_0                    = work_.scope();
-    auto scratch_scope_1                    = tp_->work->scope();
-    std::array<Tensor, 2> staging;
-    std::array<Tensor, 2> last_staging;
-    std::array<Tensor, 2> x_last;
-    std::array<Tensor, 2> ah_last;
-    for (std::size_t r = 0; r < 2; ++r) {
+    auto scratch_scope_1 = rank_scopes();
+    TpArray<Tensor> staging;
+    TpArray<Tensor> last_staging;
+    TpArray<Tensor> x_last;
+    TpArray<Tensor> ah_last;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, T});
         if (final_chunk) {
             // The final-chunk stage reduces ONE column, and `linear_row_parallel` requires the
@@ -2932,31 +3700,31 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
 
     {
         auto bulk_scope_0 = work_.scope();
-        auto bulk_scope_1 = tp_->work->scope();
-        std::array<Tensor, 2> x;
-        std::array<Tensor, 2> ah;
+        auto bulk_scope_1 = rank_scopes();
+        TpArray<Tensor> x;
+        TpArray<Tensor> ah;
         mtp_forward_stem_tp2(ids, hidden, x, ah, staging);
 
-        std::array<Tensor, 2> k_flat;
-        std::array<Tensor, 2> v_flat;
-        for (std::size_t r = 0; r < 2; ++r) {
-            k_flat[r] = ws[r]->alloc(DType::BF16, {kShardKvSize, T});
-            v_flat[r] = ws[r]->alloc(DType::BF16, {kShardKvSize, T});
+        TpArray<Tensor> k_flat;
+        TpArray<Tensor> v_flat;
+        for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+            k_flat[r] = ws[r]->alloc(DType::BF16, {shard_kv_size(), T});
+            v_flat[r] = ws[r]->alloc(DType::BF16, {shard_kv_size(), T});
         }
         Variant::mtp_kv_projection(
-            ah, {&mtp_weights_for(0).payload->attention, &mtp_weights_for(1).payload->attention},
+            ah, mtp_attention_weights(),
             k_flat, v_flat, ws, execution);
         for_each_rank(execution, [&](int rank) {
             const auto r    = static_cast<std::size_t>(rank);
             cudaStream_t s  = stream_for(rank);
             const MtpW& mtp = mtp_weights_for(rank);
-            Tensor k        = k_flat[r].view({kCfg.head_dim, kShardKvHeads, T});
-            Tensor v        = v_flat[r].view({kCfg.head_dim, kShardKvHeads, T});
-            Tensor kn       = ws[r]->alloc(DType::BF16, {kCfg.head_dim, kShardKvHeads, T});
+            Tensor k        = k_flat[r].view({kCfg.head_dim, shard_kv_heads(), T});
+            Tensor v        = v_flat[r].view({kCfg.head_dim, shard_kv_heads(), T});
+            Tensor kn       = ws[r]->alloc(DType::BF16, {kCfg.head_dim, shard_kv_heads(), T});
             ops::rmsnorm(k, *mtp.k_norm, kCfg.rms_eps, true, kn, s);
             ops::rope(rope_positions[r], kCfg.rotary_dim, kCfg.rope_theta, kn,
                       rope_frequency_[r], s);
-            qwen3_6::PagedKVCacheView pages = rank == 0 ? mtp_kv_ : tp_->mtp_kv;
+            qwen3_6::PagedKVCacheView pages = rank_mtp_kv(rank);
             ops::gqa_kv_append(kn, v, positions[r], pages.layer_view(0), s);
             if (final_chunk) {
                 const std::size_t column_bytes =
@@ -2972,23 +3740,24 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
             }
         });
     }
+    mtp_stage_barrier(execution, "mtp_prefill: stem + kv append");
 
     if (!final_chunk) { return; }
 
-    std::array<Tensor, 2> q_flat;
-    std::array<Tensor, 2> gate_flat;
-    for (std::size_t r = 0; r < 2; ++r) {
-        q_flat[r]    = ws[r]->alloc(DType::BF16, {kShardQSize, 1});
-        gate_flat[r] = ws[r]->alloc(DType::BF16, {kShardQSize, 1});
+    TpArray<Tensor> q_flat;
+    TpArray<Tensor> gate_flat;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+        q_flat[r]    = ws[r]->alloc(DType::BF16, {shard_q_size(), 1});
+        gate_flat[r] = ws[r]->alloc(DType::BF16, {shard_q_size(), 1});
     }
     Variant::mtp_q_gate_projection(
-        ah_last, {&mtp_weights_for(0).payload->attention, &mtp_weights_for(1).payload->attention},
+        ah_last, mtp_attention_weights(),
         q_flat, gate_flat, ws, execution);
-    std::array<Tensor, 2> a;
-    std::array<Tensor, 2> o;
-    std::array<Tensor, 2> mh;
-    for (std::size_t r = 0; r < 2; ++r) {
-        a[r]  = ws[r]->alloc(DType::BF16, {kCfg.head_dim, kShardQHeads, 1});
+    TpArray<Tensor> a;
+    TpArray<Tensor> o;
+    TpArray<Tensor> mh;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
+        a[r]  = ws[r]->alloc(DType::BF16, {kCfg.head_dim, shard_q_heads(), 1});
         o[r]  = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
         mh[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
     }
@@ -2996,21 +3765,20 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
         const auto r    = static_cast<std::size_t>(rank);
         cudaStream_t s  = stream_for(rank);
         const MtpW& mtp = mtp_weights_for(rank);
-        Tensor q        = q_flat[r].view({kCfg.head_dim, kShardQHeads, 1});
-        Tensor gate     = gate_flat[r].view({kCfg.head_dim, kShardQHeads, 1});
-        Tensor qn       = ws[r]->alloc(DType::BF16, {kCfg.head_dim, kShardQHeads, 1});
+        Tensor q        = q_flat[r].view({kCfg.head_dim, shard_q_heads(), 1});
+        Tensor gate     = gate_flat[r].view({kCfg.head_dim, shard_q_heads(), 1});
+        Tensor qn       = ws[r]->alloc(DType::BF16, {kCfg.head_dim, shard_q_heads(), 1});
         ops::rmsnorm(q, *mtp.q_norm, kCfg.rms_eps, true, qn, s);
         Tensor last_position = positions[r].slice(0, T - 1, 1);
         Tensor last_rope     = rope_positions[r].slice(0, T - 1, 1);
         ops::rope(last_rope, kCfg.rotary_dim, kCfg.rope_theta, qn, rope_frequency_[r], s);
-        qwen3_6::PagedKVCacheView pages = rank == 0 ? mtp_kv_ : tp_->mtp_kv;
+        qwen3_6::PagedKVCacheView pages = rank_mtp_kv(rank);
         ops::gqa_attention_cached(qn, last_position, kAttnScale, pages.layer_view(0), envelope,
                                   *ws[r], a[r], s);
         ops::sigmoid_mul(gate, a[r], s);
     });
-    ops::linear_row_parallel({a[0].view({kShardQSize, 1}), a[1].view({kShardQSize, 1})},
-                             {*mtp_weights_for(0).o_proj, *mtp_weights_for(1).o_proj}, o,
-                             last_staging, execution, *tp_->events);
+    ops::linear_row_parallel(attention_flat(a, 1), mtp_output_weights(), o, last_staging,
+                             execution, peer_events());
     for_each_rank(execution, [&](int rank) {
         const auto r   = static_cast<std::size_t>(rank);
         cudaStream_t s = stream_for(rank);
@@ -3018,12 +3786,13 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
         ops::rmsnorm(x_last[r], *mtp_weights_for(rank).post_attn_norm, kCfg.rms_eps, true, mh[r],
                      s);
     });
+    mtp_stage_barrier(execution, "mtp_prefill: attention + output projection");
     {
         auto post_scope_0 = work_.scope();
-        auto post_scope_1 = tp_->work->scope();
+        auto post_scope_1 = rank_scopes();
         Variant::mtp_post_mixer(
-            mh, {&mtp_weights_for(0).payload->post_mixer, &mtp_weights_for(1).payload->post_mixer},
-            x_last, last_staging, ws, execution, *tp_->events);
+            mh, mtp_post_mixer_weights(),
+            x_last, last_staging, ws, execution, peer_events());
     }
     for_each_rank(execution, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
@@ -3032,7 +3801,9 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
         ops::rmsnorm(x_last[r], *mtp_weights_for(rank).norm, kCfg.rms_eps, true,
                      const_cast<Tensor&>((*final_hidden)[r]), stream_for(rank));
     });
+    mtp_stage_barrier(execution, "mtp_prefill: post mixer + final norm");
     proposal_argmax_tp2(*final_hidden, *logits, *draft_token);
+    mtp_stage_barrier(execution, "mtp_prefill: proposal argmax");
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

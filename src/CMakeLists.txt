@@ -26,13 +26,18 @@ add_library(ninfer_core STATIC
   core/layout.cpp
   core/tensor.cpp
   core/decode_graph.cpp
+  core/tp_comm.cu
   runtime/engine/admission_policy.cpp
   runtime/engine/kv_capacity.cpp
   runtime/engine/public_types.cpp
   runtime/engine/request_memory.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+target_include_directories(ninfer_core PUBLIC ${NINFER_NCCL_INCLUDE_DIR})
+# PUBLIC: the tp > 2 collectives live in ninfer_core, so every consumer of core (ops, engine,
+# apps, tests) must see the header and link the library.
+target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads
+                                   ${NINFER_NCCL_LIBRARY})
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC

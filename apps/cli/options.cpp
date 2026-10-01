@@ -43,8 +43,11 @@ int parse_device(const char* text) {
 
 int parse_tp(const char* text) {
     const std::uint64_t value = parse_u64(text, "tp");
-    if (value != 1 && value != 2) {
-        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1 or 2)");
+    // The degrees with a shard plan. 3 is absent on purpose: it divides neither the hidden size nor
+    // the vocabulary, so no split of the resident model exists for it. 4 is the TP4 degree
+    // (kMaximumDevices in ninfer/types.h).
+    if (value != 1 && value != 2 && value != 4) {
+        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1, 2 or 4)");
     }
     return static_cast<int>(value);
 }
@@ -63,7 +66,8 @@ std::vector<int> parse_devices(const char* text) {
         start = comma + 1;
     }
     if (result.empty() || result.size() > 2) {
-        throw std::invalid_argument("--devices must list 1 or 2 device ids");
+        throw std::invalid_argument("--devices must list 1 to " +
+                                    std::to_string(kMaximumDevices) + " device ids");
     }
     return result;
 }
@@ -121,7 +125,7 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--rope native|yarn] [--yarn-factor F] [--yarn-origin O]\n"
-           "       [--device N] [--tp 1|2] [--devices N,N]\n"
+           "       [--device N] [--tp 1|2|4] [--devices N,...]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -141,11 +145,11 @@ std::string usage_text(const char* argv0) {
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n"
            "--tp selects the tensor-parallel degree (default 1); --tp 2 splits the model across "
-           "two GPUs and requires --devices; it supports --spec mtp and --spec dflash, but "
-           "not --vision.\n"
-           "--devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
-           "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
-           "primary device.\n"
+           "two GPUs and --tp 4 across four, either way requiring --devices and one id per rank. "
+           "--tp 2 supports --spec mtp and --spec dflash, but not --vision.\n"
+           "--devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, "
+           "--devices 0,1 for --tp 2, or --devices 0,1,2,3 for --tp 4. When given together with "
+           "--device they must agree on the primary device.\n"
            "--rope selects the rotary regime (default native, the checkpoint\'s own RoPE and its\n"
            "registered 262144-position ceiling). --rope yarn applies YaRN frequency correction and\n"
            "raises the --max-context ceiling to --yarn-origin x --yarn-factor (at most 1048576);\n"

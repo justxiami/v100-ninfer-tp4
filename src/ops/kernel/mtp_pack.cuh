@@ -22,6 +22,13 @@ inline constexpr int kMtpQRowsTp2    = 3072;
 inline constexpr int kMtpKvRowsTp2   = 512;
 static_assert(kMtpAttnRowsTp2 == 2 * kMtpQRowsTp2 + 2 * kMtpKvRowsTp2);
 
+// ... and the tp == 4 shard of the same object: the quartered sections, in the same
+// Q | K | Gate | V order, with 6 query/gate and 1 key/value head of 256 each.
+inline constexpr int kMtpAttnRowsTp4 = 3584;
+inline constexpr int kMtpQRowsTp4    = 1536;
+inline constexpr int kMtpKvRowsTp4   = 256;
+static_assert(kMtpAttnRowsTp4 == 2 * kMtpQRowsTp4 + 2 * kMtpKvRowsTp4);
+
 __global__ void mtp_pack_fc_input_kernel(const __nv_bfloat16* embedding_norm,
                                          const __nv_bfloat16* hidden_norm, __nv_bfloat16* out,
                                          std::int32_t rows) {

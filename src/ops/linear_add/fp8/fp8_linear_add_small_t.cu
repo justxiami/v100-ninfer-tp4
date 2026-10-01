@@ -72,6 +72,35 @@ template <int ActiveTokens>
 struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Tp2RowGeometry, ActiveTokens>
     : Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Geometry, ActiveTokens> {};
 
+// The tp4 6144 row shard (K = 1536) inherits its parent unchanged: 1536 is a whole number of the
+// 512-element phase (3 * 512).
+template <int ActiveTokens>
+struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual6144Tp4RowGeometry, ActiveTokens>
+    : Fp8LinearAddSmallTProductionSchedule<Fp8Residual6144Geometry, ActiveTokens> {};
+
+// K = 4352 -- the tp4 quarter of the 17408-wide MLP down projection -- is not a whole number of
+// the parent's 512-element phase (4352 = 8*512 + 256), so this geometry keeps 8 values per lane
+// (256-element phase, 4352 = 17*256) at every token count. Every other field is the parent's.
+template <int ActiveTokens>
+struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Tp4RowGeometry, ActiveTokens> {
+    static_assert(ActiveTokens >= kFp8FirstSmallT && ActiveTokens <= kFp8LastSmallT);
+    static constexpr int kWarpsPerCta   = ActiveTokens >= 21 && ActiveTokens <= 22 ? 4 : 8;
+    static constexpr int kRowsPerWarp   = ActiveTokens <= 5 ? 1 : 2;
+    static constexpr int kValuesPerLane = 8;
+    static constexpr int kTokenTile     = ActiveTokens == 24 ? 12 : ActiveTokens;
+    static constexpr auto kCodeCache    = (ActiveTokens >= 6 && ActiveTokens <= 8) ||
+                                               (ActiveTokens >= 17 && ActiveTokens <= 20) ||
+                                               ActiveTokens == 23
+                                              ? Fp8CodeCache::Streaming
+                                              : Fp8CodeCache::Default;
+    static constexpr auto kBlockOrder   = ActiveTokens == 24
+                                              ? Fp8SmallTBlockOrder::TokenTilesContiguous
+                                              : Fp8SmallTBlockOrder::RowsContiguous;
+    using Type =
+        Fp8SmallTSchedule<kWarpsPerCta, kRowsPerWarp, kValuesPerLane, kTokenTile, 1,
+                          Fp8SmallTActivationAccess::TokenPacked, kCodeCache, 1, kBlockOrder, 1>;
+};
+
 template <class Geometry, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
     using Schedule = typename Fp8LinearAddSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
@@ -122,6 +151,12 @@ void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor
     case Fp8Problem::Residual17408Tp2Row:
         launchers<Fp8Residual17408Tp2RowGeometry>()[index](x, weight, residual, stream);
         return;
+    case Fp8Problem::Residual6144Tp4Row:
+        launchers<Fp8Residual6144Tp4RowGeometry>()[index](x, weight, residual, stream);
+        return;
+    case Fp8Problem::Residual17408Tp4Row:
+        launchers<Fp8Residual17408Tp4RowGeometry>()[index](x, weight, residual, stream);
+        return;
     case Fp8Problem::AttnInput:
     case Fp8Problem::GdnInput:
     case Fp8Problem::MlpGateUp:
@@ -129,6 +164,10 @@ void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor
     case Fp8Problem::VocabularyTp2Column:
     case Fp8Problem::GdnInputTp2Column:
     case Fp8Problem::MlpGateUpTp2Column:
+    case Fp8Problem::VocabularyTp4Column:
+    case Fp8Problem::GdnInputTp4Column:
+    case Fp8Problem::MlpGateUpTp4Column:
+    case Fp8Problem::AttnInputTp4Column:
     case Fp8Problem::AttnInputTp2Column:
         break;
     }

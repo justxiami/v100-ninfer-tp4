@@ -60,6 +60,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "ninfer/types.h" // TpArray, kMaximumDevices
 
 using namespace ninfer;
 using namespace ninfer::test;
@@ -486,19 +487,19 @@ int run_case(const Case& test_case, const ExecutionContext& ec, const ops::PeerE
 
             // For a column split shard_x[r] is the whole replicated activation on device r
             // (sk == k); for a row split it is that rank's own block of the activation rows.
-            const std::array<Tensor, 2> x{Tensor(shard_x[0].p, DType::BF16, {sk, tokens}),
+            const TpArray<Tensor> x{Tensor(shard_x[0].p, DType::BF16, {sk, tokens}),
                                           Tensor(shard_x[1].p, DType::BF16, {sk, tokens})};
-            const std::array<Weight, 2> w{shard[0].weight, shard[1].weight};
-            const std::array<Tensor, 2> out{
+            const TpArray<Weight> w{shard[0].weight, shard[1].weight};
+            const TpArray<Tensor> out{
                 Tensor(split_out[0]->data(), DType::BF16, {sn, tokens}),
                 Tensor(split_out[1]->data(), DType::BF16, {sn, tokens})};
-            const std::array<ninfer::WorkspaceArena*, 2> workspace{&*arena[0], &*arena[1]};
+            const TpArray<ninfer::WorkspaceArena*> workspace{&*arena[0], &*arena[1]};
 
             retire_staging(ec);
             if (column) {
                 ops::linear_column_parallel(x, w, out, policy, workspace, ec);
             } else {
-                const std::array<Tensor, 2> staging_view{
+                const TpArray<Tensor> staging_view{
                     Tensor(staging[0]->p, DType::BF16, {sn, tokens}),
                     Tensor(staging[1]->p, DType::BF16, {sn, tokens})};
                 ops::linear_row_parallel(x, w, out, staging_view, policy, workspace, ec, events);
@@ -694,9 +695,9 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
 
     // Mismatched token counts on the two ranks.
     expect_throw("token count", [&] {
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kK, 2}),
+        const TpArray<Tensor> x{Tensor(x0.p, DType::BF16, {kK, 2}),
                                       Tensor(x1.p, DType::BF16, {kK, 1})};
-        const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kN, 2}),
+        const TpArray<Tensor> out{Tensor(out0.p, DType::BF16, {kN, 2}),
                                         Tensor(out1.p, DType::BF16, {kN, 1})};
         ops::linear_column_parallel(x, {fake, fake}, out, ec);
     });
@@ -705,9 +706,9 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
     expect_throw("column K", [&] {
         Weight other = fake;
         other.k      = kK / 2;
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kK, 1}),
+        const TpArray<Tensor> x{Tensor(x0.p, DType::BF16, {kK, 1}),
                                       Tensor(x1.p, DType::BF16, {kK / 2, 1})};
-        const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kN, 1}),
+        const TpArray<Tensor> out{Tensor(out0.p, DType::BF16, {kN, 1}),
                                         Tensor(out1.p, DType::BF16, {kN, 1})};
         ops::linear_column_parallel(x, {fake, other}, out, ec);
     });
@@ -716,13 +717,13 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
     expect_throw("row N", [&] {
         Weight other = fake;
         other.n      = kN / 2;
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kK, 1}),
+        const TpArray<Tensor> x{Tensor(x0.p, DType::BF16, {kK, 1}),
                                       Tensor(x1.p, DType::BF16, {kK, 1})};
-        const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kN, 1}),
+        const TpArray<Tensor> out{Tensor(out0.p, DType::BF16, {kN, 1}),
                                         Tensor(out1.p, DType::BF16, {kN / 2, 1})};
         // Real, disjoint staging: aliasing it onto `out` would be a second, unrelated contract
         // violation and would leave it ambiguous which one the Op actually rejected.
-        const std::array<Tensor, 2> staging{Tensor(stage0.p, DType::BF16, {kN, 1}),
+        const TpArray<Tensor> staging{Tensor(stage0.p, DType::BF16, {kN, 1}),
                                             Tensor(stage1.p, DType::BF16, {kN / 2, 1})};
         ops::linear_row_parallel(x, {fake, other}, out, staging, ec, events);
     });
@@ -730,9 +731,9 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
     // A single-device context is not a split context.
     expect_throw("tp1 context", [&] {
         const ExecutionContext single({0});
-        const std::array<Tensor, 2> x{Tensor(x0.p, DType::BF16, {kK, 1}),
+        const TpArray<Tensor> x{Tensor(x0.p, DType::BF16, {kK, 1}),
                                       Tensor(x1.p, DType::BF16, {kK, 1})};
-        const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kN, 1}),
+        const TpArray<Tensor> out{Tensor(out0.p, DType::BF16, {kN, 1}),
                                         Tensor(out1.p, DType::BF16, {kN, 1})};
         ops::linear_column_parallel(x, {fake, fake}, out, single);
     });
