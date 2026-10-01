@@ -30,7 +30,10 @@ tokenizer report: [`docs/tp4/tokenizer-oklogk.md`](docs/tp4/tokenizer-oklogk.md)
 
 ## Measurements (this host, completed tp4)
 
-Reference config: Qwen3.8-27B W4A4/W8A8 (ModelOpt NVFP4+FP8 mixed) `.ninfer` artifact,
+Reference config: the **Merkyor EfficientThink-K3 `W4A4+W8A8`** hybrid SFT variant of
+Qwen3.8-27B (NVFP4 for 140 weight matrices + FP8 for 260 + BF16 residual, plus the MTP
+draft block), converted to the ninfer `.ninfer` format inside tuxKOH's **v2 container**
+(full source/converter details under [Model artifact provenance](#model-artifact-provenance));
 `--tp 4 --devices 0,1,2,3`, 131,072 max context, **int8 KV**, 4,096-token prefill chunks,
 MTP with 3 drafts, CUDA graphs. Decode tok/s counts committed output tokens, not drafted
 ones.
@@ -48,6 +51,31 @@ The 4-way split halves per-GPU weights and KV: 6.6 GiB stays free per card at st
 (6.9 GiB slack), so the artifact's native 262,144-token capacity also fits — the 128k
 default is kept on purpose, for parity with the old service.
 
+### Prefill ladder — context scaling (tp4, this host)
+
+Full cold prefill sweep, 3 reps per context, session salt so no rep hits the prefix cache
+(authoritative numbers = engine `done` line, req-baseline matched so each sample is
+uniquely attributed; the sweep ran with no other active request source). The 8k and 16k
+points reproduce the earlier 5.8k / 17.4k single-shot numbers, confirming stability.
+
+| context | prefill tok/s | time-to-first-token | greedy 300-token decode (t=0) |
+|---:|---:|---:|---:|
+| 8k | 3,470 | 2.4 s | 143 tok/s |
+| 16k | 3,357 | 4.8 s | 134 tok/s |
+| 32k | 3,118 | 10.3 s | 141 tok/s |
+| 64k | 2,724 | 23.7 s | 117 tok/s |
+| 120k | 2,229 | 54.1 s | 96 tok/s |
+
+Prefill declines monotonically with context — the long-context **O(n²) attention wall**:
+8k→16k is near-flat (3,470→3,357), then it steepens (−7%/tier at 32k/64k, −19% into 120k).
+The 120k point still fits inside the 131k int8 KV pool. The greedy-decode column also
+drops with context because each decode step must read more KV; that is separate from the
+thinking-mode decode below.
+
+The 2,048-token thinking run (t=1.0) re-measured **94.4 tok/s** (MTP acceptance 34.2%)
+in this rerun. The online record for the same run is 113.1 tok/s / 47.5% acceptance; the
+spread is MTP-draft-acceptance variance under t=1.0 sampling, not a config change.
+
 Smoke (all passed): 4 greedy probes semantically correct; 17.4k needle retrieval hit;
 4-way concurrency (`--max-concurrency 4`) all answers correct.
 
@@ -55,6 +83,24 @@ Build guide, NCCL/CUTLASS dependencies and tests: [`docs/tp4/README.md`](docs/tp
 Reference build graph and exact CMake option values: [`docs/tp4/build-config/`](docs/tp4/build-config/).
 The baseline fork's README (detailed TP2 measurements, build/run/convert instructions):
 [`docs/upstream-README-v100x2.md`](docs/upstream-README-v100x2.md).
+
+## Model artifact provenance
+
+The measured artifact is `qwen3_8_27b_w4a4w8a8.ninfer` (21.0 GiB, 1,097 tensors), recipe
+`qwen3_8_27b_w4a4w8a8-v1`, target key `qwen3.8-27b`:
+
+- **Variant** — Merkyor EfficientThink-K3 `W4A4+W8A8` hybrid: an SFT distillation of
+  Qwen3.8-27B (the “Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-MTP” lineage), quantized with
+  NVFP4 for 140 weight matrices, FP8 (E4M3) for 260, BF16 for the residual, plus the
+  1-layer MTP draft block and the vision tower.
+- **Converted from** — the single-source ModelOpt field layout in
+  `Merkyor/Qwen3.8-27B-EfficientThink-K3-…-MTP-NVFP4` (local
+  `EfficientThink-K3-W4A4-W8A8`); not the GGUF Q4_K_M path.
+- **Converter** — the ninfer `.ninfer` format converter, run inside **tuxKOH's v2
+  container** (the `.ninfer` converter only runs in that container image), CPU, ~3.7 min
+  (219 s); `recipe_id qwen3_8_27b_w4a4w8a8-v1`, conversion bookkeeping in the sibling
+  `*.ninfer.conversion.json`.
+- **Base model** — [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B).
 
 ## Notable files added by this fork
 
@@ -71,4 +117,6 @@ docs/tp4/                                build guide, history, RCA, reference bu
 
 Apache-2.0 ([LICENSE](LICENSE), required attribution in [NOTICE](NOTICE)).
 Upstream chain: tuxKOH/ninfer-V100X2 ← geoffwatts/ninfer-v100 ← Neroued/ninfer.
-The measured model derives from [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B).
+The measured model is the Merkyor EfficientThink-K3 `W4A4+W8A8` SFT variant, based on
+[Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B); see
+[Model artifact provenance](#model-artifact-provenance).
