@@ -9,7 +9,10 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
+#include <queue>
+#include <tuple>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -579,19 +582,87 @@ void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_m
     const std::string normalized = uni::normalize_nfc(text);
     for (const std::string_view word : qwen_split_words(normalized)) {
         std::vector<std::string> symbols = byte_level_symbols(byte_level_encode(word));
-        while (symbols.size() > 1) {
-            int best_rank              = std::numeric_limits<int>::max();
-            std::size_t best_pair_left = symbols.size();
-            for (std::size_t i = 0; i + 1 < symbols.size(); ++i) {
-                const auto rank = merge_ranks.find(merge_pair_key(symbols[i], symbols[i + 1]));
-                if (rank != merge_ranks.end() && rank->second < best_rank) {
-                    best_rank      = rank->second;
-                    best_pair_left = i;
-                }
+
+        // [local patch 2026-10-01] O(k log k) BPE: 双向链表 + 优先队列。
+        //
+        // 原实现每轮重扫全部相邻 pair 取最小 rank（best_pair_left 从左往右，严格小于
+        // 才更新 => 平局取最左），O(k^2)。对超长 word（例：连续 6 万 CJK 字符，
+        // byte-level 后 k = 18 万字节）会退化成分钟级，表现为请求"卡死"：
+        // 实测 8k=10s / 16k=42s / 32k=170s / 120k 外推 ~40min（严格二次标度）。
+        //
+        // 语义与旧实现完全一致：每轮合并全局最小 rank 的相邻 pair；rank 相同取最左。
+        // 堆条目 (rank, left, right) 按字典序取最小，right 用来识别过期条目。
+        if (symbols.size() > 1) {
+            struct Node {
+                std::string symbol;
+                std::ptrdiff_t prev;
+                std::ptrdiff_t next;
+                std::uint32_t epoch;   // 每次 symbol 变化 ++（堆条目据此判过期）
+            };
+            const std::ptrdiff_t count = static_cast<std::ptrdiff_t>(symbols.size());
+            std::vector<Node> nodes(static_cast<std::size_t>(count));
+            for (std::ptrdiff_t i = 0; i < count; ++i) {
+                const std::size_t idx = static_cast<std::size_t>(i);
+                nodes[idx].symbol = std::move(symbols[idx]);
+                nodes[idx].prev   = i - 1;
+                nodes[idx].next   = (i + 1 < count) ? (i + 1) : -1;
+                nodes[idx].epoch  = 0;
             }
-            if (best_pair_left == symbols.size()) { break; }
-            symbols[best_pair_left] += symbols[best_pair_left + 1];
-            symbols.erase(symbols.begin() + static_cast<std::ptrdiff_t>(best_pair_left + 1));
+
+            // (rank, left, left_epoch, right, right_epoch)：字典序最小堆。
+            // 两端 epoch 都必须入堆：left 变长会主动 push 新条目，但 right 被合并变长时
+            // 拓扑不变、left epoch 也不变，只查一端会让过期 rank 混进来（曾导致 token
+            // 序列与旧实现不一致，已由 5500 例随机对拍捕获）。
+            using Entry =
+                std::tuple<int, std::ptrdiff_t, std::uint32_t, std::ptrdiff_t, std::uint32_t>;
+            std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> heap;
+
+            const auto push_pair = [&](std::ptrdiff_t left) {
+                const std::ptrdiff_t right = nodes[static_cast<std::size_t>(left)].next;
+                if (right < 0) { return; }
+                const auto it = merge_ranks.find(merge_pair_key(
+                    nodes[static_cast<std::size_t>(left)].symbol,
+                    nodes[static_cast<std::size_t>(right)].symbol));
+                if (it != merge_ranks.end()) {
+                    heap.emplace(it->second, left, nodes[static_cast<std::size_t>(left)].epoch, right,
+                                 nodes[static_cast<std::size_t>(right)].epoch);
+                }
+            };
+
+            for (std::ptrdiff_t i = 0; i + 1 < count; ++i) { push_pair(i); }
+
+            while (!heap.empty()) {
+                const Entry top = heap.top();
+                heap.pop();
+                const std::ptrdiff_t left     = std::get<1>(top);
+                const std::uint32_t  left_ep  = std::get<2>(top);
+                const std::ptrdiff_t right    = std::get<3>(top);
+                const std::uint32_t  right_ep = std::get<4>(top);
+                // 过期条目：拓扑变了，或任一端 symbol 内容已变（对方参与过合并）。
+                if (nodes[static_cast<std::size_t>(left)].next != right ||
+                    nodes[static_cast<std::size_t>(left)].epoch != left_ep ||
+                    nodes[static_cast<std::size_t>(right)].epoch != right_ep) {
+                    continue;
+                }
+
+                const std::ptrdiff_t after  = nodes[static_cast<std::size_t>(right)].next;
+                const std::ptrdiff_t before = nodes[static_cast<std::size_t>(left)].prev;
+                nodes[static_cast<std::size_t>(left)].symbol +=
+                    nodes[static_cast<std::size_t>(right)].symbol;
+                nodes[static_cast<std::size_t>(left)].next = after;
+                nodes[static_cast<std::size_t>(left)].epoch++;
+                if (after >= 0) { nodes[static_cast<std::size_t>(after)].prev = left; }
+                nodes[static_cast<std::size_t>(right)].prev = -1;
+                nodes[static_cast<std::size_t>(right)].next = -1;
+
+                if (before >= 0) { push_pair(before); }
+                push_pair(left);
+            }
+
+            symbols.clear();
+            for (std::ptrdiff_t i = 0; i >= 0; i = nodes[static_cast<std::size_t>(i)].next) {
+                symbols.push_back(std::move(nodes[static_cast<std::size_t>(i)].symbol));
+            }
         }
         for (const std::string& symbol : symbols) { append_symbol_id(ids, token_to_id, symbol); }
     }
