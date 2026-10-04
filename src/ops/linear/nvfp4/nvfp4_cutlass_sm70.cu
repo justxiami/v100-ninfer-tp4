@@ -96,7 +96,6 @@ using LayoutInputB           = cutlass::layout::ColumnMajor;
 using LayoutOutput           = cutlass::layout::RowMajor;
 using MMAOp                  = cutlass::arch::OpClassTensorOp;
 using SmArch                 = cutlass::arch::Sm70;
-using ShapeMMAThreadBlock    = cutlass::gemm::GemmShape<128, 128, 32>;
 using ShapeMMAWarp           = cutlass::gemm::GemmShape<64, 64, 32>;
 using ShapeMMAOp             = cutlass::gemm::GemmShape<8, 8, 4>;
 using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
@@ -105,10 +104,11 @@ template <class ElementOutput>
 using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
     ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value, ElementAccumulator,
     ElementComputeEpilogue>;
-template <class ElementOutput>
+template <class ElementOutput, int TileN = 128>
 using GemmFor = cutlass::gemm::device::Gemm<ElementInputA, LayoutInputA, ElementInputB, LayoutInputB,
                                          ElementOutput, LayoutOutput, ElementAccumulator, MMAOp,
-                                         SmArch, ShapeMMAThreadBlock, ShapeMMAWarp, ShapeMMAOp,
+                                         SmArch, cutlass::gemm::GemmShape<128, TileN, 32>,
+                                         ShapeMMAWarp, ShapeMMAOp,
                                          EpilogueOp<ElementOutput>, SwizzleThreadBlock, kNumStages>;
 using Gemm = GemmFor<cutlass::bfloat16_t>;
 
@@ -141,10 +141,10 @@ std::size_t workspace_bytes_impl(std::int32_t n, std::int32_t k, std::int32_t co
     return layout.peak_bytes(1);
 }
 
-template <class ElementOutput>
+template <class ElementOutput, int TileN>
 void launch_impl(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
                  cudaStream_t stream) {
-    using Gemm = GemmFor<ElementOutput>;
+    using Gemm = GemmFor<ElementOutput, TileN>;
     const std::int32_t k    = x.ne[0];
     const std::int32_t cols = x.ne[1];
     const std::int32_t n    = w.n;
@@ -203,6 +203,19 @@ void launch_impl(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& 
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <class ElementOutput>
+void launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+            cudaStream_t stream) {
+    // The same 64x64 warp contraction gains output-column reuse on the wide TP2 MLPs.
+    // Narrow calls and other registered geometries retain their measured 128-column tile.
+    if (x.ne[1] >= 2048 && ((w.n == 17408 && w.k == 5120) ||
+                             (w.n == 5120 && w.k == 8704))) {
+        launch_impl<ElementOutput, 256>(x, w, out, ws, stream);
+    } else {
+        launch_impl<ElementOutput, 128>(x, w, out, ws, stream);
+    }
+}
+
 } // namespace
 
 std::size_t nvfp4_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k,
@@ -212,12 +225,12 @@ std::size_t nvfp4_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k,
 
 void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
                                cudaStream_t stream) {
-    launch_impl<cutlass::bfloat16_t>(x, w, out, ws, stream);
+    launch<cutlass::bfloat16_t>(x, w, out, ws, stream);
 }
 
 void nvfp4_cutlass_sm70_fp32_launch(const Tensor& x, const Weight& w, Tensor& out,
                                     WorkspaceArena& ws, cudaStream_t stream) {
-    launch_impl<float>(x, w, out, ws, stream);
+    launch<float>(x, w, out, ws, stream);
 }
 
 } // namespace ninfer::ops::detail

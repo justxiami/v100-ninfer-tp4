@@ -92,6 +92,61 @@ __launch_bounds__(kArgmaxBlock) __global__
     if (threadIdx.x == 0) { out[t] = indices[0]; }
 }
 
+// Greedy tensor-parallel verification only needs the winning value and local row.  This direct
+// one-CTA route deliberately keeps the exact BF16->FP32 comparison and lowest-index tie policy;
+// its output is merged after the two small [1,T] shards are exchanged.
+__launch_bounds__(kArgmaxBlock) __global__ void argmax_with_value_kernel(
+    const __nv_bfloat16* logits, float* values_out, std::int32_t* indices_out,
+    std::int32_t valid_rows, std::int32_t physical_rows) {
+    const std::int32_t t    = static_cast<std::int32_t>(blockIdx.x);
+    const std::int64_t base = static_cast<std::int64_t>(t) * physical_rows;
+
+    float best_value        = -CUDART_INF_F;
+    std::int32_t best_index = INT32_MAX;
+    for (std::int32_t v = static_cast<std::int32_t>(threadIdx.x); v < valid_rows;
+         v += blockDim.x) {
+        const float value = __bfloat162float(logits[base + v]);
+        if (argmax_better(value, v, best_value, best_index)) {
+            best_value = value;
+            best_index = v;
+        }
+    }
+
+    __shared__ float values[kArgmaxBlock];
+    __shared__ std::int32_t indices[kArgmaxBlock];
+    values[threadIdx.x]  = best_value;
+    indices[threadIdx.x] = best_index;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            const float other_value        = values[threadIdx.x + stride];
+            const std::int32_t other_index = indices[threadIdx.x + stride];
+            if (argmax_better(other_value, other_index, values[threadIdx.x],
+                              indices[threadIdx.x])) {
+                values[threadIdx.x]  = other_value;
+                indices[threadIdx.x] = other_index;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        values_out[t]  = values[0];
+        indices_out[t] = indices[0];
+    }
+}
+
+__global__ void merge_argmax_shards_kernel(const float* values, const std::int32_t* indices,
+                                           std::int32_t* out, std::int32_t first_shard_rows,
+                                           std::int32_t columns) {
+    const std::int32_t t = static_cast<std::int32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= columns) { return; }
+    const float v0 = values[t * 2];
+    const float v1 = values[t * 2 + 1];
+    const std::int32_t i0 = indices[t * 2];
+    const std::int32_t i1 = indices[t * 2 + 1] + first_shard_rows;
+    out[t] = argmax_better(v1, i1, v0, i0) ? i1 : i0;
+}
+
 __launch_bounds__(kArgmaxBlock) __global__
     void argmax_tiled_atomic_kernel(const __nv_bfloat16* logits, std::int32_t* out,
                                     std::int32_t valid_rows, std::int32_t physical_rows) {

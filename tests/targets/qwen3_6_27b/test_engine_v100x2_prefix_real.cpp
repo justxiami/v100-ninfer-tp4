@@ -1,4 +1,5 @@
-// Opt-in TP2 + optimized MTP3 prefix-state gate on the real Qwen3.8 GGUF artifact.
+// Opt-in TP2 prefix-state gate on real Qwen3.8 Q4_K_M/NVFP4 artifacts.
+// Defaults to optimized MTP3; NINFER_V100X2_SPEC=dflash selects full-head DFlash7.
 // Exact token/state replay is the behavioral oracle; the independent numerical
 // Op oracles live in the GGML_K, GDN, and attention tests. Prefix vs cold prefill
 // uses exact greedy output except resident exact-frontier and normalized-response cold comparisons:
@@ -11,6 +12,7 @@
 // NINFER_V100X2_ARTIFACT=/path/to/model.ninfer ctest -R v100x2_prefix_real
 
 #include "ninfer/engine.h"
+#include "v100x2_test_profile.h"
 
 #include <cuda_runtime.h>
 
@@ -49,9 +51,7 @@ ninfer::EngineOptions engine_options(const char* artifact, bool graphs) {
     options.prefill_chunk = 256;
     options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
     options.use_cuda_graph = graphs;
-    options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens = 3;
-    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.speculative = v100x2_test::profile(ninfer::ProposalHead::Optimized);
     return options;
 }
 
@@ -116,11 +116,13 @@ Observation run(ninfer::Engine& engine, std::string name, ninfer::PreparedPrompt
                 computed == prompt_tokens - result.reused_prompt_tokens,
             name + ": computed prefill does not equal the actual suffix");
     if (count > 4) {
+        const auto profile = v100x2_test::profile(ninfer::ProposalHead::Optimized);
         require(result.speculative.enabled &&
-                    result.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
-                    result.speculative.draft_window == 3 && result.speculative.rounds > 0 &&
+                    result.speculative.backend == profile.backend &&
+                    result.speculative.draft_window == profile.draft_tokens &&
+                    result.speculative.rounds > 0 &&
                     result.speculative.drafted_tokens > 0,
-                name + ": MTP3 did not execute");
+                name + ": selected speculative backend did not execute");
     }
     std::cout << name << " prompt=" << prompt_tokens << " reused="
               << result.reused_prompt_tokens << " computed=" << computed << " accepted="
@@ -213,9 +215,7 @@ Tokens continuation(const Tokens& prompt, const ninfer::GenerationResult& respon
 
 std::vector<Observation> exercise(const char* artifact, bool graphs) {
     ninfer::Engine engine(engine_options(artifact, graphs));
-    require(engine.load_summary().tp == 2 && engine.load_summary().model_id == "qwen3.8-27b" &&
-                engine.load_summary().weights_id == "gguf-q4-k-m",
-            "this test requires the TP2 Qwen3.8 GGUF Q4_K_M artifact");
+    v100x2_test::check_identity(engine);
     engine.debug_enable_logit_capture(true);
     engine.debug_enable_peer_egress_check(true);
     const auto input = coding_prompt();
@@ -275,7 +275,7 @@ std::vector<Observation> exercise(const char* artifact, bool graphs) {
     same_replay(miss, miss_cold);
 
     // A retained engine with reuse explicitly disabled is the cold-state comparator. Reset must
-    // discard both ranks' old KV, GDN, and MTP state, even after a rejected speculative draft.
+    // discard both ranks' old KV, GDN, and draft state, even after a rejected proposal.
     const auto& append_cold = remember(run(engine, "append_cold", engine.prepare_tokens(appended),
                                            false, Path::FullReset));
     same_output(append, append_cold);
@@ -322,7 +322,7 @@ std::vector<Observation> exercise(const char* artifact, bool graphs) {
 
     // Stop immediately after the original prompt, leaving its complete state resident without
     // restoring a checkpoint. Appending the normalized response now has the same token partition
-    // as the checkpoint route above, so logits, MTP acceptance, and output must agree exactly.
+    // as the checkpoint route above, so logits, acceptance, and output must agree exactly.
     remember(run(engine, "normalized_direct_source", engine.prepare(input), false,
                  Path::FullReset, 1));
     const auto& normalized_direct = remember(run(engine, "normalized_direct_append",
@@ -345,8 +345,8 @@ std::vector<Observation> exercise(const char* artifact, bool graphs) {
     }
     require(accepted > 0 && accepted < drafted,
             "fixture must exercise both accepted and rejected drafts before prefix reuse");
-    const auto [rounds, mismatches] = engine.debug_peer_egress_check_counts();
-    require(rounds > 0 && mismatches == 0, "TP2 ranks disagree on speculative egress");
+    v100x2_test::check_peer_egress(
+        engine, v100x2_test::profile(ninfer::ProposalHead::Optimized).backend);
     require((engine.memory_summary().cuda_graph_node_count > 0) == graphs,
             "the requested graph/eager route was not used");
 

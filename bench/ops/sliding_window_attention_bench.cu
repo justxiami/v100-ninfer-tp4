@@ -30,17 +30,15 @@ namespace {
 constexpr std::int32_t kHeadDim     = 128;
 constexpr std::int32_t kQueryHeads  = 32;
 constexpr std::int32_t kKvHeads     = 8;
-constexpr std::int32_t kWindow      = 4096;
 constexpr float kScale              = 0.08838834764831844055F;
 constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
-constexpr double kDenseBf16TcTflops = 209.5;
-constexpr double kRtx5090DramGBs    = 1792.0;
 
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
 struct Options {
+    std::int32_t window = 4096;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16};
     std::vector<std::int32_t> contexts{0, 128, 2048, 4095, 4096, 8192, 262144};
     Execution execution = Execution::Graph;
@@ -54,6 +52,7 @@ struct Options {
 struct Result {
     std::int32_t tokens;
     std::int32_t context;
+    std::int32_t window;
     Execution execution;
     CacheState cache;
     std::size_t workspace_bytes;
@@ -66,7 +65,7 @@ struct Result {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_sliding_window_attention_bench "
-                 "[--tokens 1,...,16] [--context 0,...,262144] "
+                 "[--tokens 1,...,16] [--context 0,...,262144] [--window 2048|4096] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                  message);
@@ -110,7 +109,12 @@ Options parse_options(int argc, char** argv) {
             if (++index == argc) { usage(flag); }
             return argv[index];
         };
-        if (argument == "--tokens") {
+        if (argument == "--window") {
+            options.window = parse_i32(next("--window requires a value"), 2048, 4096, "--window");
+            if (options.window != 2048 && options.window != 4096) {
+                usage("--window expects 2048 or 4096");
+            }
+        } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), 1, 16, "--tokens");
         } else if (argument == "--context") {
             options.contexts =
@@ -157,12 +161,12 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v) {
+CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, std::int32_t window) {
     return {
-        .k               = Tensor(k.p, DType::BF16, {kHeadDim, kWindow, kKvHeads, 1}),
-        .v               = Tensor(v.p, DType::BF16, {kHeadDim, kWindow, kKvHeads, 1}),
-        .capacity        = kWindow,
-        .padded_capacity = kWindow,
+        .k               = Tensor(k.p, DType::BF16, {kHeadDim, window, kKvHeads, 1}),
+        .v               = Tensor(v.p, DType::BF16, {kHeadDim, window, kKvHeads, 1}),
+        .capacity        = static_cast<std::uint32_t>(window),
+        .padded_capacity = static_cast<std::uint32_t>(window),
         .num_kv_heads    = kKvHeads,
         .head_dim        = kHeadDim,
         .lane_capacity   = 1,
@@ -177,7 +181,7 @@ std::size_t workspace_capacity(std::int32_t tokens, std::int32_t context) {
 
 class Case {
 public:
-    Case(std::int32_t tokens, std::int32_t context)
+    Case(std::int32_t tokens, std::int32_t context, std::int32_t window)
         : tokens_(tokens), context_(context),
           q_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens)),
           query_k_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens)),
@@ -185,9 +189,9 @@ public:
           positions_(static_cast<std::size_t>(tokens) * sizeof(std::int32_t)),
           valid_(sizeof(std::int32_t)), lane_(sizeof(std::int32_t)),
           context_k_(
-              bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kWindow * kKvHeads * 2)),
+              bench::make_zeros(static_cast<std::size_t>(kHeadDim) * window * kKvHeads * 2)),
           context_v_(
-              bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kWindow * kKvHeads * 2)),
+              bench::make_zeros(static_cast<std::size_t>(kHeadDim) * window * kKvHeads * 2)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens * 2)),
           workspace_bytes_(workspace_capacity(tokens, context)),
           workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
@@ -197,7 +201,7 @@ public:
           positions_tensor_(positions_.p, DType::I32, {tokens, 1}),
           valid_tensor_(valid_.p, DType::I32, {1}), lane_tensor_(lane_.p, DType::I32, {1}),
           output_tensor_(output_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens, 1}),
-          context_view_(make_context_view(context_k_, context_v_)),
+          context_view_(make_context_view(context_k_, context_v_, window)),
           envelope_{static_cast<std::uint32_t>(context), static_cast<std::uint32_t>(context)} {
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens));
         for (std::int32_t token = 0; token < tokens; ++token) {
@@ -249,15 +253,15 @@ const char* execution_name(Execution execution) {
 
 const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
 
-double useful_bytes(std::int32_t tokens, std::int32_t context) {
-    const std::int32_t context_union = std::min(context, kWindow - 1);
+double useful_bytes(std::int32_t tokens, std::int32_t context, std::int32_t window) {
+    const std::int32_t context_union = std::min(context, window - 1);
     return static_cast<double>(context_union) * 4096.0 + static_cast<double>(tokens) * 20480.0;
 }
 
-double useful_flops(std::int32_t tokens, std::int32_t context) {
+double useful_flops(std::int32_t tokens, std::int32_t context, std::int32_t window) {
     std::int64_t visible_keys = 0;
     for (std::int32_t token = 0; token < tokens; ++token) {
-        visible_keys += std::min(context, std::max(0, kWindow - 1 - token)) + tokens;
+        visible_keys += std::min(context, std::max(0, window - 1 - token)) + tokens;
     }
     return 4.0 * kQueryHeads * kHeadDim * static_cast<double>(visible_keys);
 }
@@ -282,11 +286,10 @@ void report(const Result& result) {
     const double tflops  = result.useful_flops / seconds / 1.0e12;
     std::printf("entry=sliding_window execution=%-5s cache=%-4s T=%2d L=%6d W=%d "
                 "workspace=%8zu median=%9.3f us min=%9.3f us p95=%9.3f us "
-                "useful=%8.1f GB/s (%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n",
+                "useful=%8.1f GB/s math=%7.2f TFLOP/s\n",
                 execution_name(result.execution), cache_name(result.cache), result.tokens,
-                result.context, kWindow, result.workspace_bytes, result.timing.median_us,
-                result.timing.min_us, result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0,
-                kRtx5090DramGBs, tflops, tflops / kDenseBf16TcTflops * 100.0, kDenseBf16TcTflops);
+                result.context, result.window, result.workspace_bytes, result.timing.median_us,
+                result.timing.min_us, result.timing.p95_us, gbps, tflops);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -300,7 +303,7 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     for (const Result& result : results) {
         output << "sliding_window," << execution_name(result.execution) << ','
                << cache_name(result.cache) << ',' << result.tokens << ',' << result.context << ','
-               << kWindow << ',' << result.workspace_bytes << ',' << result.useful_bytes << ','
+               << result.window << ',' << result.workspace_bytes << ',' << result.useful_bytes << ','
                << result.useful_flops << ',' << result.timing.median_us << ','
                << result.timing.min_us << ',' << result.timing.p95_us << '\n';
     }
@@ -351,7 +354,7 @@ int main(int argc, char** argv) {
         DeviceBuffer flush(kFlushBytes);
 
         if (options.profile) {
-            Case data(options.tokens.front(), options.contexts.front());
+            Case data(options.tokens.front(), options.contexts.front(), options.window);
             profile(data, options, flush, stream);
             CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
@@ -360,7 +363,7 @@ int main(int argc, char** argv) {
         std::vector<Result> results;
         for (const std::int32_t context : options.contexts) {
             for (const std::int32_t tokens : options.tokens) {
-                Case data(tokens, context);
+                Case data(tokens, context, options.window);
                 bench::TimedGraph graph;
                 if (options.execution != Execution::Eager) {
                     data.launch(stream);
@@ -380,11 +383,12 @@ int main(int argc, char** argv) {
                         }
                         Result result{tokens,
                                       context,
+                                      options.window,
                                       execution,
                                       cache,
                                       data.workspace_bytes(),
-                                      useful_bytes(tokens, context),
-                                      useful_flops(tokens, context),
+                                      useful_bytes(tokens, context, options.window),
+                                      useful_flops(tokens, context, options.window),
                                       measure(data, execution, cache, &graph, flush, stream,
                                               options.warmup, options.repeat)};
                         report(result);

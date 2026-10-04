@@ -155,6 +155,15 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens) {
 
 int run_bf16_linear() {
     int failures = 0;
+#ifdef NINFER_VOLTA_BUILD
+    DeviceWeight conv_projection(make_patterned(1280, 5120, 397U));
+    DeviceWeight selector_projection(make_patterned(256, 5120, 399U));
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                    17, 32, 128}) {
+        failures += run_bf16_linear_case(conv_projection, tokens);
+        failures += run_bf16_linear_case(selector_projection, tokens);
+    }
+#endif
     DeviceWeight attention_weight(make_patterned(14336, 5120, 401U));
     for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 27, 28, 32, 33, 128, 129, 1024}) {
         failures += run_bf16_linear_case(attention_weight, tokens);

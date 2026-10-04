@@ -25,21 +25,21 @@ struct SwaContextExecutionEnvelope {
 /**
  * Op: symmetric non-causal sliding-window grouped-query attention
  *
- * The fixed optimized geometry is D=128, Hq=32, Hkv=8, group=4, and window W=4096.
- * q/out are contiguous BF16 [128,32,W,B], query_k/query_v are contiguous BF16 [128,8,W,B],
- * positions is contiguous device I32 [W,B], valid_columns and lanes are contiguous device I32
+ * The fixed geometry is D=128, Hq=32, Hkv=8, group=4, and window W=2048 or 4096.
+ * q/out are contiguous BF16 [128,32,T,B], query_k/query_v are contiguous BF16 [128,8,T,B],
+ * positions is contiguous device I32 [T,B], valid_columns and lanes are contiguous device I32
  * [B]. Row b has V=valid_columns[b] live query columns with positions[i,b]=L[b]+i for i<V;
  * lanes[b] selects its cyclic-cache lane. Columns i>=V are an inert physical tail and produce
  * zero output.
  *
- * The read-only cyclic context contains committed absolute positions [max(0,L-4096),L), with
- * absolute position p stored at physical slot p mod 4096. Query K/V is a separate temporary
+ * The read-only cyclic context contains committed absolute positions [max(0,L-W),L), with
+ * absolute position p stored at physical slot p mod W. Query K/V is a separate temporary
  * segment at positions [L,L+V). For every live query position p_i, admitted populated keys satisfy
- * abs(p_j-p_i)<4096. Thus distance 4095 is included, distance 4096 is excluded, and every query
+ * abs(p_j-p_i)<W. Thus distance W-1 is included, distance W is excluded, and every query
  * row sees every live temporary query row from the same batch row. scale is 1/sqrt(128).
  *
  * Context and query K/V are unchanged. out is the only observable mutation and is completely
- * overwritten. The current optimized implementation domain is T=1..16 on sm_120a.
+ * overwritten. The supported domain is T=1..16, B=1..8 on the built CUDA target.
  *
  * The caller guarantees min_context <= L <= max_context, sequential nonnegative positions, and
  * that the cyclic context contains the declared live interval. The execution envelope may affect

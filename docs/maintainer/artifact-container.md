@@ -79,6 +79,16 @@ with no loading semantics. A writer naturally emits them as zero; a reader need 
 All object offsets in JSON are relative to `payload_offset`. The prefix contains no file size,
 flags, checksum, object count, identity fields, directory offset, or extension area.
 
+### 2.3 Narrow Qwen3.8 upstream-v3 compatibility
+
+The generic container contract remains version 2. The reader has one target-private compatibility
+adapter for the official single-file Qwen3.8-27B NVFP4 artifact with magic
+`4e 49 4e 46 45 52 00 03`. It validates that v3 directory, projects its physical objects and
+logical `bindings`/`uses` records into the version-2 logical directory, and preserves the original
+payload offsets and packed bytes. The adapter is not a generic version-3 reader and does not add a
+second artifact identity; the projected result resolves to `qwen3.8-27b/nvfp4`. Its v3 DFlash2
+objects are intentionally outside the selected target plan.
+
 ## 3. JSON directory
 
 ### 3.1 Root

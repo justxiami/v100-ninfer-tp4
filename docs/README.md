@@ -1,8 +1,9 @@
 # NInfer documentation
 
-Start with the [project README](../README.md) for the CUDA 12.8 V100X2 build, conversion of the
-local LM Studio Q4_K_M model, and the 180,000-token INT8-KV/MTP3 launcher. It also retains the
-published-artifact CLI and HTTP examples for other profiles.
+Start with the [project README](../README.md) or [中文文档](../README.zh-CN.md) for the CUDA 12.8
+V100X2 build, Q4_K_M conversion, 180,000-token INT8-KV/MTP3 usage, and separately labeled
+P2P-enabled and P2P-disabled measurements. The Chinese guide also includes the NVFP4 API
+launch command; general protocol examples live in the serving guide below.
 
 ## User guides
 

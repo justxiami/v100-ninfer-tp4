@@ -148,6 +148,31 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
         licensed_counts, accepted, token_domain, configs, scratch, stream);
 }
 
+void speculative_accept_greedy_tokens(const Tensor& target_tokens, const Tensor& drafts,
+                                      const Tensor& current_extents, Tensor& lengths,
+                                      Tensor& anchors, Tensor& licensed_tokens,
+                                      Tensor& licensed_counts, Tensor& accepted,
+                                      std::int32_t token_domain,
+                                      const SamplingConfig* configs, cudaStream_t stream) {
+    constexpr const char* op = "speculative_accept_greedy_tokens";
+    const std::int32_t k     = drafts.ne[0];
+    const std::int32_t batch = drafts.ne[1];
+    if (k < 1 || batch < 1 || target_tokens.dtype != DType::I32 || drafts.dtype != DType::I32 ||
+        current_extents.dtype != DType::I32 || lengths.dtype != DType::I32 ||
+        anchors.dtype != DType::I32 || licensed_tokens.dtype != DType::I32 ||
+        licensed_counts.dtype != DType::I32 || accepted.dtype != DType::I32 ||
+        target_tokens.ne[0] != k + 1 || target_tokens.ne[1] != batch ||
+        current_extents.ne[0] != batch || lengths.ne[0] != batch || anchors.ne[0] != batch ||
+        licensed_tokens.ne[0] != k + 1 || licensed_tokens.ne[1] != batch ||
+        licensed_counts.ne[0] != batch || accepted.ne[0] != batch || token_domain <= 0 ||
+        configs == nullptr) {
+        throw std::invalid_argument(std::string(op) + ": invalid tensor shape or configuration");
+    }
+    detail::speculative_accept_greedy_tokens_launch(
+        target_tokens, drafts, current_extents, lengths, anchors, licensed_tokens,
+        licensed_counts, accepted, token_domain, configs, stream);
+}
+
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,
                                         cudaStream_t stream) {
     constexpr const char* op = "speculative_select_accepted_hidden";

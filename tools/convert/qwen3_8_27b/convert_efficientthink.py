@@ -3,7 +3,7 @@
 Canonical invocation::
 
     python3 -m tools.convert.qwen3_8_27b.convert_efficientthink \
-      --model $HOME/models/Qwen3.8-27B-EfficientThink-W4A4W8A8 \
+      --model /home/lu/models/Qwen3.8-27B-EfficientThink-W4A4W8A8 \
       --out ~/models/ninfer-V100X2/qwen3_8_27b_w4a4w8a8.ninfer
 
 The one ModelOpt-style checkpoint plays both source roles: the quantized

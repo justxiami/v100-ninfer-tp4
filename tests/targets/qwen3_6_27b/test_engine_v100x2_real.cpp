@@ -1,4 +1,4 @@
-// Opt-in Qwen3.8 GGUF Q4_K_M integration gate for two 16 GiB V100s. All engines
+// Opt-in Qwen3.8 Q4_K_M/NVFP4 integration gate for two 16 GiB V100s. All engines
 // use TP2 and are destroyed before the next one is constructed: this artifact
 // cannot fit on one card. NINFER_V100X2_PROPOSAL_HEAD selects full (default) or
 // optimized; both run the same graph/eager and non-speculative target checks.
@@ -7,15 +7,17 @@
 // The GGML_K and attention Op tests supply the independent FP64/FP32 oracles.
 // Here exact graph/eager output and acceptance checks protect graph replay and
 // cross-device commits. Fresh, non-speculative teacher-forced logits check every
-// MTP output position, recording the chosen token's actual logit deficit (not
+// speculative output position, recording the chosen token's actual logit deficit (not
 // merely the reference's top-two gap). No near-tie tolerance silently licenses
 // a different greedy choice. Prefill/decode rounding can cause this strict check
 // to fail; such a result requires investigation rather than claiming losslessness.
 //
 // NINFER_V100X2_ARTIFACT=/path/to/qwen3_8_27b_q4_k_m.ninfer ctest -R v100x2_real
 // Add NINFER_V100X2_PROPOSAL_HEAD=optimized to exercise the shortlist proposal head.
+// NINFER_V100X2_SPEC=dflash selects DFlash7 with the full vocabulary head.
 
 #include "ninfer/engine.h"
+#include "v100x2_test_profile.h"
 
 #include <cuda_runtime.h>
 
@@ -48,19 +50,8 @@ void require(bool condition, const std::string& message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
-ninfer::ProposalHead proposal_head() {
-    const char* selected = std::getenv("NINFER_V100X2_PROPOSAL_HEAD");
-    if (selected == nullptr || std::strcmp(selected, "full") == 0) {
-        return ninfer::ProposalHead::Full;
-    }
-    if (std::strcmp(selected, "optimized") == 0) {
-        return ninfer::ProposalHead::Optimized;
-    }
-    throw std::runtime_error("NINFER_V100X2_PROPOSAL_HEAD must be full or optimized");
-}
-
-ninfer::EngineOptions engine_options(const char* artifact, bool mtp, bool graphs,
-                                     ninfer::ProposalHead head) {
+ninfer::EngineOptions engine_options(const char* artifact, bool speculation, bool graphs,
+                                     ninfer::SpeculativeOptions profile) {
     ninfer::EngineOptions options;
     options.artifact_path = artifact;
     options.tp = 2;
@@ -70,11 +61,7 @@ ninfer::EngineOptions engine_options(const char* artifact, bool mtp, bool graphs
     options.prefill_chunk = kChunk;
     options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
     options.use_cuda_graph = graphs;
-    if (mtp) {
-        options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
-        options.speculative.draft_tokens = 3;
-        options.speculative.proposal_head = head;
-    }
+    if (speculation) { options.speculative = profile; }
     return options;
 }
 
@@ -155,57 +142,54 @@ Logits probe(ninfer::Engine& engine, const Tokens& context) {
     return logits;
 }
 
-void require_mtp(const ninfer::GenerationResult& result) {
+void require_speculation(const ninfer::GenerationResult& result,
+                         ninfer::SpeculativeOptions profile) {
     const auto& stats = result.speculative;
-    require(stats.enabled && stats.backend == ninfer::SpeculativeBackend::Mtp &&
-                stats.draft_window == 3 && stats.rounds > 0 && stats.drafted_tokens > 0,
-            "the MTP3 probe did not execute speculative rounds");
+    require(stats.enabled && stats.backend == profile.backend &&
+                stats.draft_window == profile.draft_tokens && stats.rounds > 0 &&
+                stats.drafted_tokens > 0,
+            "the selected probe did not execute speculative rounds");
     require(stats.accepted_tokens <= stats.drafted_tokens, "invalid accepted draft count");
 }
 
 void compare_rounds(const ninfer::GenerationResult& captured,
                     const ninfer::GenerationResult& eager) {
     require(captured.generated_token_ids == eager.generated_token_ids,
-            "graph/eager MTP committed token sequences differ");
+            "graph/eager speculative committed token sequences differ");
     const auto& a = captured.speculative;
     const auto& b = eager.speculative;
     require(a.rounds == b.rounds && a.drafted_tokens == b.drafted_tokens &&
                 a.accepted_tokens == b.accepted_tokens && a.fallback_steps == b.fallback_steps &&
                 a.accepted_per_position == b.accepted_per_position,
-            "graph/eager MTP acceptance or fallback patterns differ");
+            "graph/eager speculative acceptance or fallback patterns differ");
 }
 
-void check_identity(ninfer::Engine& engine) {
-    const auto summary = engine.load_summary();
-    require(summary.tp == 2 && summary.model_id == "qwen3.8-27b" &&
-                summary.weights_id == "gguf-q4-k-m",
-            "this gate requires the TP2 Qwen3.8-27B GGUF Q4_K_M artifact");
-}
-
-int exercise(const char* artifact, ninfer::ProposalHead head) {
-    std::cout << "proposal_head="
-              << (head == ninfer::ProposalHead::Full ? "full" : "optimized") << std::endl;
+int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
+    std::cout << "spec="
+              << (profile.backend == ninfer::SpeculativeBackend::Mtp ? "mtp" : "dflash")
+              << " drafts=" << profile.draft_tokens << " proposal_head="
+              << (profile.proposal_head == ninfer::ProposalHead::Full ? "full" : "optimized")
+              << std::endl;
     std::array<Tokens, kProbes> inputs;
     std::array<ninfer::GenerationResult, kProbes> captured;
-    std::array<std::array<Logits, kLogitPositions.size()>, kProbes> mtp_logits;
+    std::array<std::array<Logits, kLogitPositions.size()>, kProbes> speculative_logits;
     std::uint64_t accepted_total = 0;
     {
-        ninfer::Engine engine(engine_options(artifact, true, true, head));
-        check_identity(engine);
+        ninfer::Engine engine(engine_options(artifact, true, true, profile));
+        v100x2_test::check_identity(engine);
         inputs = prompts(engine);
         engine.debug_enable_peer_egress_check(true);
         for (std::size_t p = 0; p < kProbes; ++p) {
             captured[p] = generate(engine, inputs[p]);
-            require_mtp(captured[p]);
+            require_speculation(captured[p], profile);
             accepted_total += captured[p].speculative.accepted_tokens;
             std::cout << "captured probe=" << p << " prompt_tokens=" << inputs[p].size()
                       << " output_tokens=" << captured[p].generated_token_ids.size()
                       << " accepted=" << captured[p].speculative.accepted_tokens
                       << "/" << captured[p].speculative.drafted_tokens << std::endl;
         }
-        require(accepted_total > 0, "no proposal was accepted; the MTP commit path was not exercised");
-        const auto [rounds, mismatches] = engine.debug_peer_egress_check_counts();
-        require(rounds > 0 && mismatches == 0, "TP2 ranks disagree on speculative egress");
+        require(accepted_total > 0, "no proposal was accepted; the commit path was not exercised");
+        v100x2_test::check_peer_egress(engine, profile.backend);
         require(engine.memory_summary().cuda_graph_node_count > 0,
                 "graphs were requested but no decode graph was captured");
         engine.debug_enable_logit_capture(true);
@@ -214,20 +198,19 @@ int exercise(const char* artifact, ninfer::ProposalHead head) {
                 Tokens context = inputs[p];
                 const auto& emitted = captured[p].generated_token_ids;
                 context.insert(context.end(), emitted.begin(), emitted.begin() + kLogitPositions[i]);
-                mtp_logits[p][i] = probe(engine, context);
+                speculative_logits[p][i] = probe(engine, context);
             }
         }
     }
     {
-        ninfer::Engine engine(engine_options(artifact, true, false, head));
+        ninfer::Engine engine(engine_options(artifact, true, false, profile));
         engine.debug_enable_peer_egress_check(true);
         for (std::size_t p = 0; p < kProbes; ++p) {
             const auto eager = generate(engine, inputs[p]);
-            require_mtp(eager);
+            require_speculation(eager, profile);
             compare_rounds(captured[p], eager);
         }
-        const auto [rounds, mismatches] = engine.debug_peer_egress_check_counts();
-        require(rounds > 0 && mismatches == 0, "eager TP2 ranks disagree on speculative egress");
+        v100x2_test::check_peer_egress(engine, profile.backend);
         require(engine.memory_summary().cuda_graph_node_count == 0,
                 "the eager control unexpectedly captured a graph");
     }
@@ -235,12 +218,12 @@ int exercise(const char* artifact, ninfer::ProposalHead head) {
     std::size_t disagreements = 0;
     float worst_deficit = 0.0F;
     {
-        ninfer::Engine engine(engine_options(artifact, false, false, head));
+        ninfer::Engine engine(engine_options(artifact, false, false, profile));
         engine.debug_enable_logit_capture(true);
         for (std::size_t p = 0; p < kProbes; ++p) {
             const auto plain = generate(engine, inputs[p]);
             require(!plain.speculative.enabled, "the target control unexpectedly enabled speculation");
-            std::cout << "probe=" << p << " MTP_vs_plain_sequence_equal="
+            std::cout << "probe=" << p << " speculative_vs_plain_sequence_equal="
                       << (plain.generated_token_ids == captured[p].generated_token_ids) << std::endl;
             Tokens context = inputs[p];
             for (std::size_t i = 0; i < kOutputs; ++i) {
@@ -248,19 +231,19 @@ int exercise(const char* artifact, ninfer::ProposalHead head) {
                 const auto best = argmax(logits);
                 const auto emitted = captured[p].generated_token_ids[i];
                 require(emitted >= 0 && std::size_t(emitted) < kTokenDomain,
-                        "MTP emitted a token outside the registered tokenizer domain");
+                        "speculation emitted a token outside the registered tokenizer domain");
                 if (best != emitted) {
                     const float deficit = value(logits[best]) - value(logits[emitted]);
                     worst_deficit = std::max(worst_deficit, deficit);
                     ++disagreements;
                     std::cerr << "teacher_force probe=" << p << " position=" << i
-                              << " target=" << best << " MTP=" << emitted
+                              << " target=" << best << " speculative=" << emitted
                               << " emitted_logit_deficit=" << deficit << '\n';
                 }
                 for (std::size_t j = 0; j < kLogitPositions.size(); ++j) {
                     if (i == kLogitPositions[j]) {
-                        require(logits == mtp_logits[p][j],
-                                "enabling MTP changed teacher-forced target prefill logit bits");
+                        require(logits == speculative_logits[p][j],
+                                "enabling speculation changed target prefill logit bits");
                     }
                 }
                 context.push_back(emitted);
@@ -270,7 +253,7 @@ int exercise(const char* artifact, ninfer::ProposalHead head) {
     std::cout << "teacher_force_positions=" << kProbes * kOutputs
               << " disagreements=" << disagreements << " worst_emitted_logit_deficit="
               << worst_deficit << std::endl;
-    require(disagreements == 0, "MTP outputs failed strict non-speculative teacher-forced argmax");
+    require(disagreements == 0, "outputs failed strict non-speculative teacher-forced argmax");
     return 0;
 }
 
@@ -288,7 +271,7 @@ int main() {
         return 77;
     }
     try {
-        return exercise(artifact, proposal_head());
+        return exercise(artifact, v100x2_test::profile(ninfer::ProposalHead::Full));
     } catch (const std::exception& error) {
         std::cerr << "V100X2 integration: " << error.what() << '\n';
         return 1;

@@ -24,6 +24,7 @@ namespace frontend = ninfer::targets::qwen3_6::frontend_internal;
 struct Options {
     std::size_t chat_tokens = 0;
     std::size_t output_tokens = 1024;
+    std::filesystem::path task_file;
     std::vector<std::filesystem::path> files;
 };
 
@@ -41,7 +42,10 @@ Options parse_options(int argc, char** argv) {
     bool output_override = false;
     for (int i = 3; i < argc; ++i) {
         const std::string_view argument(argv[i]);
-        if (argument == "--code-chat" || argument == "--output-tokens") {
+        if (argument == "--code-task") {
+            if (++i == argc) { throw std::invalid_argument("--code-task needs a file"); }
+            options.task_file = argv[i];
+        } else if (argument == "--code-chat" || argument == "--output-tokens") {
             if (++i == argc) { throw std::invalid_argument(std::string(argument) + " needs a value"); }
             const auto count = positive_count(argv[i], argument.data());
             if (argument == "--code-chat") {
@@ -59,6 +63,9 @@ Options parse_options(int argc, char** argv) {
     if (options.files.empty()) { throw std::invalid_argument("list at least one source file"); }
     if (output_override && options.chat_tokens == 0) {
         throw std::invalid_argument("--output-tokens requires --code-chat");
+    }
+    if (!options.task_file.empty() && options.chat_tokens == 0) {
+        throw std::invalid_argument("--code-task requires --code-chat");
     }
     return options;
 }
@@ -88,14 +95,11 @@ std::vector<int> code_chat(const frontend::Tokenizer& tokenizer,
     system.role = ninfer::ChatRole::System;
     system.parts.push_back(frontend::ChatPart::text_part(
         "You are a C++ engineer. Treat the supplied repository excerpts as reference code, "
-        "then solve the implementation task at the end. Provide code and concise reasoning."));
+        "then solve the implementation task at the end. " + std::string(options.task_file.empty()
+            ? "Provide code and concise reasoning." : "Follow the requested output format.")));
     frontend::ChatMessage user;
     user.role = ninfer::ChatRole::User;
-    user.parts.push_back(frontend::ChatPart::text_part(
-        "Repository reference excerpts follow in their listed order. The final excerpt may "
-        "stop mid-file. Use them as engineering context; do not reproduce the excerpts.\n\n```cpp\n" +
-        std::string(marker) +
-        "\n```\n\nImplementation task:\n"
+    const std::string task = options.task_file.empty() ?
         "Implement a self-contained C++20 bounded blocking queue for move-only tasks, using "
         "std::mutex and std::condition_variable. Provide push, pop and close. A producer blocks "
         "when full and a consumer blocks when empty. close(Drain) rejects further pushes but lets "
@@ -106,7 +110,12 @@ std::vector<int> code_chat(const frontend::Tokenizer& tokenizer,
         "and how conflicting close calls are resolved. Reject zero capacity.\n"
         "Show the complete class, a short two-worker usage example, and explain the synchronization "
         "invariants and thread-joining requirement. Do not execute tasks while holding the queue "
-        "lock. Include the necessary standard headers. This is a fixed-budget coding response: "
+        "lock. Include the necessary standard headers." : read_file(options.task_file);
+    user.parts.push_back(frontend::ChatPart::text_part(
+        "Repository reference excerpts follow in their listed order. The final excerpt may "
+        "stop mid-file. Use them as engineering context; do not reproduce the excerpts.\n\n```cpp\n" +
+        std::string(marker) + "\n```\n\nImplementation task:\n" + task +
+        " This is a fixed-budget coding response: "
         "use at most " + std::to_string(options.output_tokens) +
         " output tokens, spending most of them on the implementation and example."));
     const auto rendered = chat_template.render({system, user}, {.enable_thinking = false});
@@ -165,7 +174,8 @@ std::vector<int> code_chat(const frontend::Tokenizer& tokenizer,
               << " prefix_tokens=" << prefix_tokens << " code_tokens=" << body_tokens
               << " suffix_tokens=" << suffix.size()
               << " requested_output_tokens=" << options.output_tokens
-              << " thinking=false task=bounded-blocking-task-queue\n";
+              << " thinking=false task=" << (options.task_file.empty()
+                    ? "bounded-blocking-task-queue" : options.task_file.generic_string()) << '\n';
     return result;
 }
 
@@ -185,6 +195,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage: ninfer_v100_corpus ARTIFACT OUTPUT.ids TEXT_FILE...\n"
                      "       ninfer_v100_corpus ARTIFACT OUTPUT.ids --code-chat 85000 "
                      "[--output-tokens 1024] CPP_OR_CUDA_FILE...\n"
+                     "       Add --code-task TASK.txt for a custom implementation task.\n"
                      "Code-chat preserves the complete task and template at an exact prompt length.\n"
                      "--output-tokens states the fixed response budget in the task; configure both\n"
                      "inference engines with that same generation budget and pass these raw IDs.\n";

@@ -35,8 +35,8 @@ template's default. An artifact whose template does not expose effort rejects th
 GPU residency is frozen when the Engine starts:
 
 - no `--spec` omits MTP/DFlash weights and state and the optimized proposal head;
-- `--spec mtp` loads only MTP, while `--spec dflash` loads only the 35B-A3B text-only DFlash
-  backend;
+- `--spec mtp` loads only MTP, while `--spec dflash` loads the artifact's optional text-only
+  DFlash package and omits MTP;
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
   request-transient allocation;
@@ -104,9 +104,10 @@ long-decode, and long-context inputs.
 
 ## Speculative decoding
 
-Speculative decoding is disabled by default. Select MTP with one to five draft positions, or the
-35B-A3B text-only DFlash backend with one to fifteen. `--lm-head-draft` selects the optimized
-proposal head and requires a selected backend:
+Speculative decoding is disabled by default. Select MTP with one to five draft positions.
+Text-only DFlash supports one to fifteen on 35B-A3B, or one to seven on Qwen3.8-27B artifacts
+containing the optional DFlash2 package. The official NVFP4 v3 container includes that package.
+`--lm-head-draft` selects the optimized proposal head and requires a selected backend:
 
 ```bash
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
@@ -126,10 +127,21 @@ For DFlash:
   --spec dflash --draft-tokens 7 --lm-head-draft
 ```
 
-MTP and DFlash cannot be enabled together. The published [performance results](performance.md)
-use MTP with three draft tokens and DFlash with seven draft tokens (block length eight), both with
-the optimized proposal head. DFlash accepts up to fifteen draft tokens; seven is the current
-measured recommendation rather than a semantic limit.
+For the two-V100 NVFP4 v3 DFlash2 profile:
+
+```bash
+./build-v100/apps/ninfer /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 --max-context 98304 --prefill-chunk 1024 --kv-dtype int8 \
+  --prompt "Write a complete C++20 program." --max-new 2048 --greedy --no-thinking \
+  --spec dflash --draft-tokens 7
+```
+
+MTP and DFlash cannot be enabled together, and DFlash cannot enable Vision. Qwen3.8 DFlash2's
+lattice selector always consumes the full target vocabulary; the optimized MTP shortlist is not
+its proposal path. The NVFP4 v3 drafter adds about 2.074 GiB of resident weights per TP rank.
+The demonstrated V100X2 configuration fits at 98304 capacity/chunk1024; 180000 capacity does not.
+See [performance results](performance.md) for measured workloads and limitations. Seven drafts
+are a measured choice, not the 35B-A3B semantic limit.
 
 ## Common options
 
@@ -147,7 +159,7 @@ measured recommendation rather than a semantic limit.
 | `--devices A,B` | one CUDA device index per `--tp` rank; required for `--tp 2` | `--device` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
+| `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
@@ -207,8 +219,8 @@ device used at the default `--tp 1`; when both are given they must agree on the 
 
 Tensor-parallel execution is implemented for the 27B execution package (`qwen3.6-27b` and
 `qwen3.8-27b`, either weight profile). `qwen3.6-35b-a3b` has no tensor-parallel path and rejects
-`--tp 2` at startup, as do `--spec dflash` and `--vision`. `--spec mtp` is supported at `--tp 2`,
-including compatible-prefix reuse in a resident Engine. Both suffix prefill and exact-frontier
+`--tp 2` at startup, as does `--vision`. `--spec mtp` and optional Qwen3.8 DFlash2 are supported
+at `--tp 2`, including compatible-prefix reuse in a resident Engine. Both suffix prefill and exact-frontier
 sampling restore the complete state on both devices. The HTTP server enables reuse by default;
 separate CLI processes do not share a cache.
 

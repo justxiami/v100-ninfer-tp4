@@ -642,9 +642,9 @@ __launch_bounds__(128, 2) __global__
                                                        split_capacity, out);
 }
 
-template <int Tokens, int KeyBlock, int WarpsPerBlock>
+template <int Tokens, int KeyBlock, int WarpsPerBlock, class Accumulator = __nv_bfloat16>
 __launch_bounds__(WarpsPerBlock * 32, 2) __global__
-    void swa_reduce_kernel(const __nv_bfloat16* __restrict__ partial_acc,
+    void swa_reduce_kernel(const Accumulator* __restrict__ partial_acc,
                            const float* __restrict__ partial_m, const float* __restrict__ partial_l,
                            const std::int32_t* __restrict__ positions,
                            const std::int32_t* __restrict__ valid_columns, int max_context,
@@ -709,7 +709,7 @@ __launch_bounds__(WarpsPerBlock * 32, 2) __global__
         float numerator = 0.0f;
         for (int split = 0; split < active_splits; ++split) {
             numerator +=
-                __bfloat162float(
+                static_cast<float>(
                     partial_acc[bidirectional_gqa_partial_index<Tokens>(q_head, d, token, split)]) *
                 weights[warp][split];
         }

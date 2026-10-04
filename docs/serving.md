@@ -35,13 +35,17 @@ buffer are not allocated, and media
 requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
 server must accept image or video input. Speculative residency is likewise frozen by
 `--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
-`--lm-head-draft` additionally loads the optimized proposal head. DFlash is 35B-A3B text-only and
-cannot be combined with `--vision`. A later request cannot enable a capability omitted at startup.
+`--lm-head-draft` additionally loads the optimized proposal head. DFlash is text-only: 35B-A3B
+supports up to fifteen drafts and Qwen3.8-27B artifacts with the optional DFlash2 package support
+up to seven. DFlash cannot be combined with `--vision`. A later request cannot enable a capability
+omitted at startup.
 
 `--tp 2` splits one model across two GPUs and requires an explicit `--devices A,B` naming one
-distinct device per rank. It supports `--spec mtp` (with `--draft-tokens` and `--lm-head-draft`);
-it does not support `--spec dflash` or `--vision`, and both are rejected at startup with a message
-naming the unsupported feature.
+distinct device per rank. The 27B package supports `--spec mtp` and optional Qwen3.8 DFlash2 at
+TP2, but rejects `--vision`. On the two 16 GB V100s, the qualified NVFP4 v3 DFlash2 profile uses
+`--max-context 98304 --prefill-chunk 1024 --kv-dtype int8 --spec dflash --draft-tokens 7`, without
+`--lm-head-draft`: its selector uses the full vocabulary. It does not fit the 180000-capacity MTP
+profile. The 35B-A3B package has no TP2 path.
 
 Compatible-prefix reuse is enabled by default at both TP widths, including `--tp 2 --spec mtp`.
 It applies transparently to the HTTP APIs: submit the normal conversation history. A matching
@@ -530,7 +534,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
+| `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `65536` |
 | `--vision` | enable media input and load Vision GPU allocations | off |

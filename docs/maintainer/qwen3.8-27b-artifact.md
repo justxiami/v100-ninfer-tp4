@@ -32,6 +32,40 @@ the artifact inventory or identity.
 The identity is read from the version-2 artifact directory. The filename, object count, and any
 representative tensor descriptor do not select the model or weights profile.
 
+### 1.1 Upstream v3 container compatibility
+
+The reader also accepts the official single-file `NINFER\x00\x03` container published as
+`neroued/Qwen3.8-27B-nvfp4-NInfer`. This is a narrow reader compatibility path for this registered
+identity, not a second product artifact lane: the adapter validates the v3 metadata, projects its
+`bindings`/`uses` records to the logical names documented below, and exposes the result as
+`qwen3.8-27b/nvfp4`. Physical payload offsets and packed codes are retained; no runtime weight
+repacking occurs. The v3 tokenizer configuration supplies the chat-template resource used by the
+frontend. Text and MTP are verified through the public Engine route; Vision objects are projected
+for the existing Vision route. The optional v3 DFlash2 objects are also projected and validated;
+they become GPU-resident only when DFlash is selected at Engine startup.
+
+### 1.2 Optional v3 DFlash2 package
+
+The official v3 container supplies 66 DFlash2 objects totaling 2,226,792,960 bytes. Main feature,
+attention, and MLP projections retain `W8G32_F16S` / `row-split-k128-v1`; norms, dynamic-convolution
+projections, base kernels, and selector tensors retain BF16. No stored code or scale is changed.
+The five draft layers use hidden width 5120, intermediate width 17408, 32 query heads, eight KV
+heads, head width 128, and a 2048-position sliding window. Feature taps are `[5,19,33,47,61]`;
+the mask token is 248070. The selector uses rank 256 and the full target vocabulary's top 16.
+
+The adapter maps `dflash2/` bindings to `dflash/`. Attention Q/K/V resolve to the packed
+`[6144,5120]` parent in `[query 4096,key 1024,value 1024]` order; gate/up resolve to one
+`[34816,5120]` parent. Target binding supplies format-correct execution row views, rather than
+treating packed W8 storage as a BF16 tensor. The source convolution descriptor `[2,2,5120]`
+becomes the execution ne0-fast `[5120,2,2]` channel/tap/side view without transposing bytes.
+Source alias identities and the fixed DFlash2 configuration are validated before binding.
+
+At TP2 the drafter is replicated on both ranks, proposals execute on rank 0, and the target
+verification uses the same TP2 Engine route as MTP. DFlash and MTP are mutually exclusive, as
+are DFlash and Vision. Ordinary/MTP startup does not materialize the DFlash weights. The exact
+payload/startup test independently compares every projected object against its complete source
+file range; W8 and BF16 Ops retain their independent mathematical oracle qualification.
+
 ## 2. Fixed target facts
 
 All matrix shapes use logical `[N,K] = [output rows,input columns]` notation. NVFP4 groups and all

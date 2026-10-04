@@ -348,10 +348,11 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             DFlashLayerWeights& weights   = target.layers[layer];
             weights.input_norm      = artifact::materialized_tensor(backing, source.input_norm,
                                                                     NumericFormat::BF16, {2048});
-            weights.query_key_value = artifact::materialized_weight(
+            const Weight packed = artifact::materialized_weight(
                 backing, source.query_key_value, NumericFormat::W8G32_F16S, 6144, 2048);
-            weights.context_key   = row_view(weights.query_key_value, 4096, 1024);
-            weights.context_value = row_view(weights.query_key_value, 5120, 1024);
+            weights.query = row_view(packed, 0, 4096);
+            weights.key   = row_view(packed, 4096, 1024);
+            weights.value = row_view(packed, 5120, 1024);
             weights.query_norm    = artifact::materialized_tensor(backing, source.query_norm,
                                                                   NumericFormat::BF16, {128});
             weights.key_norm =

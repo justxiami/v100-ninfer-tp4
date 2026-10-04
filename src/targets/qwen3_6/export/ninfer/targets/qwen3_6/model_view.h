@@ -59,9 +59,9 @@ struct OptimizedProposalWeights {
 
 struct DFlashLayerWeights {
     Tensor input_norm;
-    Weight query_key_value;
-    Weight context_key;
-    Weight context_value;
+    Weight query;
+    Weight key;
+    Weight value;
     Tensor query_norm;
     Tensor key_norm;
     Weight attention_output;

@@ -68,4 +68,34 @@ void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStre
     detail::argmax_launch(logits, out, valid_rows, stream);
 }
 
+void argmax_with_value(const Tensor& logits, Tensor& values, Tensor& indices,
+                       std::int32_t valid_rows, cudaStream_t stream) {
+    constexpr const char* op = "argmax_with_value";
+    if (logits.dtype != DType::BF16 || !logits.is_contiguous() || logits.ne[0] <= 0 ||
+        logits.ne[1] <= 0 || logits.ne[2] != 1 || logits.ne[3] != 1 || values.dtype != DType::FP32 ||
+        indices.dtype != DType::I32 || values.ne[0] != logits.ne[1] || values.ne[1] != 1 ||
+        values.ne[2] != 1 || values.ne[3] != 1 || indices.ne[0] != logits.ne[1] ||
+        indices.ne[1] != 1 || indices.ne[2] != 1 || indices.ne[3] != 1 ||
+        !values.is_contiguous() || !indices.is_contiguous() || values.data == nullptr ||
+        indices.data == nullptr || valid_rows <= 0 || valid_rows > logits.ne[0]) {
+        throw std::invalid_argument(std::string(op) + ": invalid tensor shape or dtype");
+    }
+    detail::argmax_with_value_launch(logits, values, indices, valid_rows, stream);
+}
+
+void merge_argmax_shards(const Tensor& values, const Tensor& indices, Tensor& out,
+                         std::int32_t first_shard_rows, cudaStream_t stream) {
+    constexpr const char* op = "merge_argmax_shards";
+    if (values.dtype != DType::FP32 || indices.dtype != DType::I32 || out.dtype != DType::I32 ||
+        values.ne[0] != 2 || values.ne[1] <= 0 || values.ne[2] != 1 || values.ne[3] != 1 ||
+        indices.ne[0] != 2 || indices.ne[1] != values.ne[1] || indices.ne[2] != 1 ||
+        indices.ne[3] != 1 || out.ne[0] != values.ne[1] || out.ne[1] != 1 || out.ne[2] != 1 ||
+        out.ne[3] != 1 || !values.is_contiguous() || !indices.is_contiguous() ||
+        !out.is_contiguous() || values.data == nullptr || indices.data == nullptr ||
+        out.data == nullptr || first_shard_rows <= 0) {
+        throw std::invalid_argument(std::string(op) + ": invalid tensor shape or dtype");
+    }
+    detail::merge_argmax_shards_launch(values, indices, out, first_shard_rows, stream);
+}
+
 } // namespace ninfer::ops

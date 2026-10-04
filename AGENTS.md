@@ -123,6 +123,10 @@ The five published identities retain Text, image/video Vision, MTP, prefix reuse
 OpenAI/Anthropic serving, and measurement through the same public `.ninfer` Engine route.
 The GGUF-derived identity uses this same route for Text/MTP and rejects Vision; its retained
 Vision objects are validation-only. The 35B-A3B target additionally supports text-only DFlash.
+Qwen3.8-27B artifacts containing the optional DFlash2 package also support text-only DFlash,
+including TP2; the official NVFP4 v3 package preserves W8 projections and BF16 auxiliary tensors.
+The 27B draft window is at most seven. On this V100X2, the verified DFlash profile is 98304-token
+capacity with a 1024-token prefill chunk, not the 180000-capacity MTP acceptance profile.
 
 One Engine owns one resident model, with one device or TP2 on the 27B package and a startup-fixed
 one to eight active requests. The V100X2 acceptance workload is one active request on two cards.

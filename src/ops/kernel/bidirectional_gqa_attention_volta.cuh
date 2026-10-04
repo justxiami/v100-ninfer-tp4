@@ -13,7 +13,8 @@ namespace ninfer::ops {
 // owns one (query head, proposal token, KV split). The 128 lanes reduce Q.K and
 // independently accumulate one output channel with an online softmax, retaining
 // the public split/reduce workspace contract used by the tensor-core launcher.
-template <bool CyclicSwa, int Tokens, int KeyBlock, bool DirectOutput>
+template <bool CyclicSwa, int Tokens, int KeyBlock, bool DirectOutput,
+          class Accumulator = __nv_bfloat16>
 __launch_bounds__(128, 2) __global__ void noncausal_gqa_volta_partial_kernel(
         const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
         const __nv_bfloat16* __restrict__ query_v,
@@ -24,7 +25,7 @@ __launch_bounds__(128, 2) __global__ void noncausal_gqa_volta_partial_kernel(
         const __nv_bfloat16* __restrict__ context_v,
         const std::int32_t* __restrict__ block_tables, int context_stride, int logical_pages,
         int max_context, int split_capacity, float scale,
-        __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
+        Accumulator* __restrict__ partial_acc, float* __restrict__ partial_m,
         float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
     static_assert(Tokens >= 1 && Tokens <= 16);
     static_assert(KeyBlock == 32 || KeyBlock == 64);
@@ -156,7 +157,7 @@ __launch_bounds__(128, 2) __global__ void noncausal_gqa_volta_partial_kernel(
         out[bidirectional_gqa_q_index(q_head, d, token)] = __float2bfloat16(value);
     } else {
         partial_acc[bidirectional_gqa_partial_index<Tokens>(q_head, d, token, split)] =
-            __float2bfloat16(numerator);
+            static_cast<Accumulator>(numerator);
         if (d == 0) {
             const auto stat = bidirectional_gqa_stat_index<Tokens>(q_head, token, split);
             partial_m[stat] = final_m;

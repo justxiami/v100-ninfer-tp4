@@ -57,6 +57,28 @@ void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                                tiled_block_for(physical_rows, valid_rows, t_count), stream);
 }
 
+void argmax_with_value_launch(const Tensor& logits, Tensor& values, Tensor& indices,
+                              std::int32_t valid_rows, cudaStream_t stream) {
+    const std::int32_t physical_rows = logits.ne[0];
+    const std::int32_t t_count       = logits.ne[1];
+    if (t_count == 0) { return; }
+    argmax_with_value_kernel<<<static_cast<unsigned int>(t_count), kArgmaxBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(logits.data), static_cast<float*>(values.data),
+        static_cast<std::int32_t*>(indices.data), valid_rows, physical_rows);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void merge_argmax_shards_launch(const Tensor& values, const Tensor& indices, Tensor& out,
+                                std::int32_t first_shard_rows, cudaStream_t stream) {
+    constexpr int kBlock = 128;
+    const int columns    = values.ne[1];
+    const int grid       = div_up(columns, kBlock);
+    merge_argmax_shards_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const float*>(values.data), static_cast<const std::int32_t*>(indices.data),
+        static_cast<std::int32_t*>(out.data), first_shard_rows, columns);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 namespace {
 
 void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,

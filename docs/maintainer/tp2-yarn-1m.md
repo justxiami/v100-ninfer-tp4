@@ -43,14 +43,20 @@ positions remain the resident frontier and complete typed checkpoints, as specif
 
 ## 2. Transport: qualified UVA D2D
 
-On the V100X2 host the two cards are behind a translated `DMA-FQ` IOMMU domain, so direct peer DMA
-is not usable even when the driver advertises peer capability. This is a measured property of the
-hardware, not a configuration choice. Startup detects the domain, leaves direct peer access off,
-and qualifies the same UVA device-to-device copy used by the collectives in both directions.
+Startup disables direct peer access for translated Linux IOMMU `DMA`/`DMA-FQ` domains, even if
+the driver advertises peer capability, and qualifies the actual UVA device-to-device copy used
+by the collectives in both directions. CUDA selects driver-managed staging in that configuration.
 
-CUDA then selects its driver-managed staging path over PCIe. The collectives do not allocate an
-explicit pinned host buffer or maintain a separate D2H/H2D branch. A previous explicit pinned
-experiment was slower in whole-prefill profiling and is retained only as historical diagnostic data.
+The V100X2 host now boots with `iommu=pt`; both GPU domains are `identity` and driver peer
+read/write checks pass. The same startup path automatically enables and verifies direct PCIe
+P2P. This remains PCIe 3.0 ×16 through PHB, not NVLink. See the
+[P2P evaluation](../performance.md#p2p-enabled) for the same-input throughput and exact-transfer
+checks. An identity domain permits qualification; it does not imply that every motherboard or
+GPU pair supports peer access.
+
+Both configurations use the same graph-capturable UVA D2D API. The collectives do not allocate
+an explicit pinned host buffer or maintain a separate D2H/H2D branch. A previous explicit
+pinned experiment was slower in whole-prefill profiling and is retained only as historical data.
 
 `allreduce_sum` / `allgather` live in `include/ninfer/ops/allreduce.h` and
 `src/ops/common/allreduce.cu`. The design is **pull-based with four events per call**. A two-event
@@ -62,7 +68,7 @@ Measured costs:
 | Quantity | Value |
 |---|---|
 | 10 KiB `allreduce_sum` | ~16 µs |
-| Collectives per decode token | 128 reduces plus one logit all-gather |
+| Collectives per single-token target forward | 128 reduces plus one logit all-gather |
 | Whole collective set per token, under CUDA Graphs | ~0.2 ms |
 
 (These historical 5090 values are not V100X2 measurements.)

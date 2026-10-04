@@ -78,11 +78,14 @@ MTP Engine:
 
 DFlash Engine:
     Main Text KV Pool
-    DFlash Full-Context KV Pool
+    DFlash Full-Context KV Pool (only when the drafter has a full-attention layer)
 ```
 
 MTP 与 DFlash 是 engine-wide mutually exclusive backends，因此一个 Engine 当前最多包含两个 growing
 KV pools。DFlash local cyclic KV 属于 fixed state，不在这个 pool set 中。
+Qwen3.8-27B DFlash2 的五层全部使用 local sliding attention，因此没有 DFlash Full pool，
+backend entitlement 为零；35B-A3B 的第六层使用 full attention，保留独立 Full pool。
+这个区别来自 compile-time Variant 的层拓扑，不是可选的历史裁剪策略，Main Text KV 不变。
 
 这些名称属于 target/runtime 对 pool 的使用方式。Common KV Store 只看到一组 immutable pool layouts
 和 opaque pool handles，不根据 feature name、attention type 或 runtime string 分派。
@@ -193,13 +196,16 @@ speculative_backend = MTP:
 
 speculative_backend = DFlash:
     Main physical=M, logical-per-allocation=L
-    DFlash Full physical=M, logical-per-allocation=L
+    with a full-attention draft layer: DFlash Full physical=M, logical-per-allocation=L
+    all-local draft layers: no backend growing pool
 ```
 
 MTP 的额外 physical groups 覆盖最多 `C` 条 concurrent rows 各自相对 Main entitlement 多出的
 `K_draft-1` provisional positions；它不增加 block-table width，也不允许任一 allocation 超过 `L` logical
 pages。
-DFlash Full 不存在这类 provisional lead，因此不需要额外 headroom。
+DFlash Full 不存在这类 provisional lead，因此不需要额外 headroom。All-local DFlash2 的
+context frontier 仍跟踪已提交 target features，prefix/rewrite checkpoint 仍保存完整 cyclic KV；
+没有 Full pool 时不预留、materialize 或 graph-capture 一个不会被读写的 backend pool。
 
 两个 pools 不共享 physical pages；它们只是为相同数量的 logical 64-token groups 分别规划 typed
 payload。由于 materialize 时机不同，一个 pool 有空闲 page 而另一个 pool 已全部 materialize 是正常

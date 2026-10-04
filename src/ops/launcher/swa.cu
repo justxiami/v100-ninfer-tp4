@@ -4,6 +4,7 @@
 #include "ops/kernel/bidirectional_gqa_attention.cuh"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/kernel/bidirectional_gqa_attention_volta.cuh"
+#include "ops/kernel/swa_volta.cuh"
 #endif
 
 #include <algorithm>
@@ -98,7 +99,7 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
 #ifdef NINFER_VOLTA_BUILD
         const dim3 partial_grid(kBidirectionalGqaQHeads * Tokens, plan.split_capacity, q.ne[3]);
         if (direct) {
-            noncausal_gqa_volta_partial_kernel<true, Tokens, KeyBlock, true>
+            noncausal_gqa_volta_partial_kernel<true, Tokens, KeyBlock, true, float>
                 <<<partial_grid, kBidirectionalGqaHeadDim, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const __nv_bfloat16*>(query_k.data),
@@ -109,14 +110,38 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                     static_cast<const __nv_bfloat16*>(context.k.data),
                     static_cast<const __nv_bfloat16*>(context.v.data), nullptr,
                     static_cast<int>(context.padded_capacity), 0, plan.max_context, 1, scale,
-                    static_cast<__nv_bfloat16*>(partial_acc.data),
+                    static_cast<float*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
             return;
         }
-        noncausal_gqa_volta_partial_kernel<true, Tokens, KeyBlock, false>
-            <<<partial_grid, kBidirectionalGqaHeadDim, 0, stream>>>(
+        // The complete 4/8-warp-by-T matrix puts the crossover at fewer
+        // context tiles as more rows fill the GPU. Keep CTA-wide reduction
+        // for tiny work; one warp per row wins once independent work is ample.
+        const bool warp_rows = plan.max_context >= 1024 ||
+                               (plan.max_context >= 512 && Tokens >= 2) ||
+                               (plan.max_context >= 256 && Tokens >= 4) ||
+                               (plan.max_context >= 128 && Tokens >= 8) || Tokens >= 10;
+        if (warp_rows) {
+            constexpr int RowWarps = 4;
+            const dim3 warp_grid((kBidirectionalGqaQHeads * Tokens + RowWarps - 1) / RowWarps,
+                                 plan.split_capacity, q.ne[3]);
+            swa_volta_partial_kernel<Tokens><<<warp_grid, RowWarps * 32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data),
+                static_cast<const __nv_bfloat16*>(query_k.data),
+                static_cast<const __nv_bfloat16*>(query_v.data),
+                static_cast<const std::int32_t*>(positions.data),
+                static_cast<const std::int32_t*>(valid_columns.data),
+                static_cast<const std::int32_t*>(lanes.data),
+                static_cast<const __nv_bfloat16*>(context.k.data),
+                static_cast<const __nv_bfloat16*>(context.v.data),
+                static_cast<int>(context.padded_capacity), plan.max_context, plan.split_capacity,
+                scale, static_cast<float*>(partial_acc.data),
+                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+        } else {
+            noncausal_gqa_volta_partial_kernel<true, Tokens, KeyBlock, false, float>
+                <<<partial_grid, kBidirectionalGqaHeadDim, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const __nv_bfloat16*>(query_k.data),
                 static_cast<const __nv_bfloat16*>(query_v.data),
@@ -126,17 +151,18 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 static_cast<const __nv_bfloat16*>(context.k.data),
                 static_cast<const __nv_bfloat16*>(context.v.data), nullptr,
                 static_cast<int>(context.padded_capacity), 0, plan.max_context,
-                plan.split_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+                plan.split_capacity, scale, static_cast<float*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                 static_cast<__nv_bfloat16*>(out.data));
+        }
         CUDA_CHECK(cudaGetLastError());
 
         constexpr int ReduceWarps = 1;
         constexpr int ReduceRows  = kBidirectionalGqaQHeads * Tokens;
         const dim3 reduce_grid((ReduceRows + ReduceWarps - 1) / ReduceWarps, 1, q.ne[3]);
-        swa_reduce_kernel<Tokens, KeyBlock, ReduceWarps>
+        swa_reduce_kernel<Tokens, KeyBlock, ReduceWarps, float>
             <<<reduce_grid, ReduceWarps * 32, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(partial_acc.data),
+                static_cast<const float*>(partial_acc.data),
                 static_cast<const float*>(partial_m.data),
                 static_cast<const float*>(partial_l.data),
                 static_cast<const std::int32_t*>(positions.data),

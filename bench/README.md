@@ -369,7 +369,8 @@ cmake --build build --parallel --target ninfer_context_softmax_attention_bench
 ```
 
 `ninfer_sliding_window_attention_bench` measures the public Q32/KV8/D128 symmetric sliding-window
-contract over the 4096-slot cyclic BF16 cache and a complete non-causal query block.
+contract over a 2048- or 4096-slot cyclic BF16 cache and a complete non-causal query block.
+`--window 2048` measures the Qwen3.8 DFlash2 v3 geometry; the default is 4096.
 
 ```bash
 cmake --build build --parallel --target ninfer_sliding_window_attention_bench

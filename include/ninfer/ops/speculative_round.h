@@ -94,6 +94,19 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
+ * Greedy-only acceptance variant for a target path that already computed argmax token IDs.
+ * It has the same commit semantics as speculative_accept_greedy_drafts at temperature <= 0 but
+ * does not require or read the full verification-logit tensor. `configs` is still supplied so the
+ * device-side request layout remains identical; every row must be greedy (temperature <= 0).
+ */
+void speculative_accept_greedy_tokens(const Tensor& target_tokens, const Tensor& drafts,
+                                      const Tensor& current_extents, Tensor& lengths,
+                                      Tensor& anchors, Tensor& licensed_tokens,
+                                      Tensor& licensed_counts, Tensor& accepted,
+                                      std::int32_t token_domain, const SamplingConfig* configs,
+                                      cudaStream_t stream);
+
+/**
  * Op: speculative_select_accepted_hidden
  *
  * Math / indexing:
