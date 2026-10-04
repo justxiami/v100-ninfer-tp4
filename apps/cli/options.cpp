@@ -65,7 +65,7 @@ std::vector<int> parse_devices(const char* text) {
         if (comma == std::string_view::npos) { break; }
         start = comma + 1;
     }
-    if (result.empty() || result.size() > 2) {
+    if (result.empty() || result.size() > kMaximumDevices) {
         throw std::invalid_argument("--devices must list 1 to " +
                                     std::to_string(kMaximumDevices) + " device ids");
     }

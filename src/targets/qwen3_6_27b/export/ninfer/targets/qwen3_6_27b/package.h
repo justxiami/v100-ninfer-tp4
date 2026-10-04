@@ -36,6 +36,7 @@ enum class WeightsProfile : std::uint8_t {
     Qwen36Nvfp4,
     Qwen38Nvfp4,
     Qwen38GgmlK,
+    Qwen38QuasarNvfp4,
 };
 
 using Frontend       = qwen3_6::Frontend;

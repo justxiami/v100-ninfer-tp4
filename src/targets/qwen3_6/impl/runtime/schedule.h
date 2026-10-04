@@ -100,13 +100,17 @@ struct ExecutionCore {
     // bit-for-bit, which is why the default value is the pre-YaRN behavior.
     TpArray<ops::RopeFrequencyOverride> rope_frequency{};
     // One core per non-zero rank, indexed by RANK; slot 0 is unused and slots at or above the
-    // width stay null. `peer_at(1)` is the single peer the tp2-only paths (MTP, DFlash, the graph
-    // bridge) read; there is deliberately no second, separately-maintained `peer` field, because
-    // two copies of the same fact is exactly how a tp2 path silently keeps running at tp4.
+    // width stay null. `peer_at(1)` is the single peer the tp2-only paths (MTP, the graph bridge)
+    // read; DFlash loops 1..tp-1. There is deliberately no second, separately-maintained `peer`
+    // field, because two copies of the same fact is exactly how a tp2 path silently keeps
+    // running at tp4.
     TpArray<const TpPeerCore*> peers{};
     [[nodiscard]] const TpPeerCore* peer_at(std::size_t rank) const noexcept {
         return rank < peers.size() ? peers[rank] : nullptr;
     }
+    // Tensor-parallel width (1 = single rank). tp2-only paths (MTP, the graph bridge) still
+    // read peer_at(1) directly; the widened DFlash path loops 1..tp-1.
+    std::int32_t tp = 1;
 };
 
 // Builds the per-rank core array an ExecutionCore is initialised with: rank 1's core at slot 1.
@@ -248,6 +252,10 @@ struct DFlashBatchContext {
     const qwen3_6::DFlashDecodeIngress& host_ingress;
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Op-layer execution context (dev[]/tp/comm) for the collective Ops; the ExecutionCore above
+    // is the target-layer core and does not name the devices the collectives switch between.
+    const ExecutionContext& ec;
+    bool greedy_target = false;
 };
 
 struct DFlashAppendContext {
@@ -296,7 +304,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          std::uint32_t mtp_proposal_extent);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          ops::GqaExecutionEnvelope envelope);
+                          ops::GqaExecutionEnvelope envelope, bool greedy_target = false);
 // Tensor-parallel form: one frame per rank, INDEXED BY RANK. Each rank's frame is its OWN
 // identically-shaped view; the acceptance arithmetic is replicated rather than transferred,
 // because every one of its inputs is either the ingress record (uploaded to every frame) or the
@@ -304,7 +312,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
 // the continuation-hidden scatter and the egress transfer stay on rank 0 alone.
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, const TpArray<TargetVerifyFrameView>& frames,
-                          ops::GqaExecutionEnvelope envelope);
+                          ops::GqaExecutionEnvelope envelope, bool greedy_target = false);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,

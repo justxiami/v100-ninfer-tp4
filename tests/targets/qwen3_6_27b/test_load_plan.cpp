@@ -185,9 +185,13 @@ int verify_profile_mismatch_rejection() {
     const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;
     auto sequence             = std::move(planner).finalize(pages);
     RuntimeModelView empty_model;
+    // tp1: the span has exactly one slot (rank 0), which is unused -- mirror the production
+    // tp1 construction in Package::create_program (value-initialized array, null slot 0).
+    const RuntimeModelView* unused_rank0_slot = nullptr;
     try {
         (void)ninfer::targets::qwen3_6::create_program<Variant>(
-            empty_model, nullptr, WeightsProfile::Qwen36Nvfp4, std::move(sequence), execution);
+            empty_model, std::span<const RuntimeModelView* const>(&unused_rank0_slot, 1),
+            WeightsProfile::Qwen36Nvfp4, std::move(sequence), execution);
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }
     }

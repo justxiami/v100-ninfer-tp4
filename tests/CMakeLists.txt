@@ -160,7 +160,7 @@ ninfer_add_test(ninfer_qwen3_8_27b_mtp_tp2_real_test
   LIBRARIES ninfer_engine ninfer_product_prompt_input)
 target_link_libraries(ninfer_qwen3_8_27b_mtp_tp2_real_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_8_27b_mtp_tp2_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
-# Full-head GGUF Q4_K_M MTP3 and graph/eager state gate. Every engine uses TP2,
+# Q4_K_M/NVFP4 MTP3/DFlash7 graph/eager and teacher-forcing state gate. Every engine uses TP2,
 # so it can run on two 16 GiB V100s without loading the whole artifact on one card.
 ninfer_add_test(ninfer_qwen3_8_27b_v100x2_real_test
   SOURCES targets/qwen3_6_27b/test_engine_v100x2_real.cpp
@@ -168,7 +168,7 @@ ninfer_add_test(ninfer_qwen3_8_27b_v100x2_real_test
 target_link_libraries(ninfer_qwen3_8_27b_v100x2_real_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_8_27b_v100x2_real_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
-# TP2 INT8 KV + optimized MTP3 cache continuation and response-checkpoint replay.
+# TP2 INT8 KV + MTP3/DFlash7 cache continuation and response-checkpoint replay.
 ninfer_add_test(ninfer_qwen3_8_27b_v100x2_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_v100x2_prefix_real.cpp
   LIBRARIES ninfer_engine)
@@ -205,6 +205,24 @@ target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_dflash2_v3_load_plan_test
+  SOURCES targets/qwen3_6_27b/test_dflash2_v3_load_plan.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_qwen3_8_27b_dflash2_v3_load_plan_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+set_tests_properties(ninfer_qwen3_8_27b_dflash2_v3_load_plan_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_quasar_load_plan_test
+  SOURCES targets/qwen3_6_27b/test_quasar_load_plan.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_qwen3_8_27b_quasar_load_plan_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+set_tests_properties(ninfer_qwen3_8_27b_quasar_load_plan_test
+  PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_sharded_materialization_test
   SOURCES targets/qwen3_6_27b/test_sharded_materialization.cpp
   LIBRARIES ninfer_engine)
@@ -430,6 +448,9 @@ ninfer_add_op_test(ninfer_attn_input_proj_test
 ninfer_add_op_test(ninfer_gdn_input_proj_test
   SOURCES ops/test_gdn_input_proj.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_attn_cutlass_bench
+  SOURCES ops/bench_gdn_attn_cutlass_shard.cpp
+  LIBRARIES ninfer_ops ninfer_core)
 ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
   SOURCES ops/test_gdn_input_proj_conv_snapshot.cpp
   LIBRARIES ninfer_ops)

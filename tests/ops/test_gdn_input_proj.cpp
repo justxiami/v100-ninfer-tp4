@@ -1,5 +1,6 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/input_projection_test_common.h"
 
 #include <cuda_runtime.h>
@@ -207,6 +208,8 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     return failures;
 }
 
+int run_nvfp4_tp4_shard();
+
 int run_nvfp4() {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
@@ -218,10 +221,114 @@ int run_nvfp4() {
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::A16Only);
-    failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    cudaDeviceProp properties;
+    cudaGetDeviceProperties(&properties, 0);
+    if (properties.major >= 12) { // A4 route is an sm_120a-only kernel (stub on Volta builds)
+        failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
+        failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
+        failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
+        failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    }
+    failures += run_nvfp4_tp4_shard();
+    return failures;
+}
+
+int run_nvfp4_tp4_shard_case(DevicePackedWeight& shard, std::int32_t tokens) {
+    // tp4 column shard of the fused 16384-row GDN input parent (quasar's first end-to-end tp4
+    // exposure, 10/04): 4096 rows = qkv 2560 (q 512 | k 512 | v 1536) + z 1536. The op tests above
+    // only instantiate the parent and tp2 shard geometries, so the tp4 decode/small_t shard
+    // kernels have never run against the FP64 oracle before this case.
+    constexpr std::int32_t kHidden  = 5120;
+    constexpr std::int32_t kQkvRows = 2560;
+    constexpr std::int32_t kZRows   = 1536;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 631U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+    GuardedBf16Tensor qkv(kQkvRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
+    Tensor x               = Tensor(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor qkv_output      = qkv.tensor();
+    Tensor z_output        = z.tensor();
+    ops::detail::nvfp4_gdn_input_dispatch_shard(x, shard.view(), qkv_output, z_output,
+                                           ops::LinearPolicy::A16Only, nullptr, nullptr);
+    cuda_synchronize();
+    const ReductionCriterion& criterion = kGdnInputProjA16Tolerance;
+    const std::string suffix            = " NVFP4 TP4SHARD T=" + std::to_string(tokens);
+    int failures = qkv.verify_guards("gdn tp4 qkv" + suffix);
+    failures += z.verify_guards("gdn tp4 z" + suffix);
+    failures += qkv.verify_fully_written("gdn tp4 qkv" + suffix);
+    failures += z.verify_fully_written("gdn tp4 z" + suffix);
+    failures += verify_output_range_sampled("gdn tp4 qkv" + suffix, qkv, kQkvRows, 0, kQkvRows,
+                                            shard.host, 0, activation, kHidden, tokens,
+                                            criterion);
+    failures += verify_output_range_sampled("gdn tp4 z" + suffix, z, kZRows, 0, kZRows, shard.host,
+                                            kQkvRows, activation, kHidden, tokens, criterion);
+    failures += verify_preserved("gdn tp4 x" + suffix, device_activation, activation_bits);
+    failures += shard.verify_preserved("gdn tp4 shard weight" + suffix);
+    return failures;
+}
+
+int run_nvfp4_tp4_shard_cutlass_case(DevicePackedWeight& shard, std::int32_t tokens) {
+    // T >= 33: dispatch_shard routes to the NVFP4 cutlass fast path (one contiguous projected
+    // plane + the generic NVFP4 -> FP16 CUTLASS GEMM + the split kernel) instead of the
+    // 32-token small_t chunks that re-read the whole shard weight per chunk. The arena is sized
+    // by the parent wrapper capacity (the production chain's own query: variant -> wrapper tp1
+    // -> plan), and the tp4 shard execution uses less than that by design (the tp2-derived
+    // over-provision, the FP8 rule) -- so only an upper-bound high-water check applies here.
+    constexpr std::int32_t kHidden  = 5120;
+    constexpr std::int32_t kQkvRows = 2560;
+    constexpr std::int32_t kZRows   = 1536;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 911U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+    GuardedBf16Tensor qkv(kQkvRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
+    Tensor x               = Tensor(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor qkv_output      = qkv.tensor();
+    Tensor z_output        = z.tensor();
+    const std::size_t capacity = ops::gdn_input_proj_workspace_capacity_bytes(
+        QType::NVFP4, 16384, kHidden, ops::LinearPolicy::A16Only, tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+    ops::detail::nvfp4_gdn_input_dispatch_shard(x, shard.view(), qkv_output, z_output,
+                                           ops::LinearPolicy::A16Only, &workspace, nullptr);
+    cuda_synchronize();
+    const ReductionCriterion& criterion = kGdnInputProjA16Tolerance;
+    const std::string suffix            = " NVFP4 TP4SHARD CUTLASS T=" + std::to_string(tokens);
+    int failures = qkv.verify_guards("gdn tp4 cutlass qkv" + suffix);
+    if (workspace.peak_used() > capacity) {
+        std::cerr << "gdn tp4 cutlass workspace T=" << tokens
+                  << ": execution exceeded the parent capacity query\n";
+        ++failures;
+    }
+    failures += z.verify_guards("gdn tp4 cutlass z" + suffix);
+    failures += qkv.verify_fully_written("gdn tp4 cutlass qkv" + suffix);
+    failures += z.verify_fully_written("gdn tp4 cutlass z" + suffix);
+    failures += verify_output_range_sampled("gdn tp4 cutlass qkv" + suffix, qkv, kQkvRows, 0, kQkvRows,
+                                            shard.host, 0, activation, kHidden, tokens, criterion);
+    failures += verify_output_range_sampled("gdn tp4 cutlass z" + suffix, z, kZRows, 0, kZRows, shard.host,
+                                            kQkvRows, activation, kHidden, tokens, criterion);
+    failures += verify_preserved("gdn tp4 cutlass x" + suffix, device_activation, activation_bits);
+    failures += shard.verify_preserved("gdn tp4 cutlass shard weight" + suffix);
+    return failures;
+}
+
+int run_nvfp4_tp4_shard() {
+    constexpr std::int32_t kHidden = 5120;
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 3.5F;
+    DevicePackedWeight shard(
+        quantized_weight::make_patterned_weight(QType::NVFP4, 4096, kHidden, 627U, options));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 4, 16, 21, 32, 33}) {
+        failures += run_nvfp4_tp4_shard_case(shard, tokens);
+    }
+    // The cutlass fast path (T >= 33 with a caller workspace): the stride-bug case at T=33 above
+    // runs the chunk loop with a null workspace; these run the generic-GEMM + split-kernel route
+    // across the chunk boundary and at a realistic prefill width.
+    for (const std::int32_t tokens : {33, 48, 128, 1024}) {
+        failures += run_nvfp4_tp4_shard_cutlass_case(shard, tokens);
+    }
     return failures;
 }
 

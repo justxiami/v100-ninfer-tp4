@@ -142,6 +142,7 @@ struct DecodeGraphProfile {
     std::uint32_t min_execution_frontier = 0;
     std::uint32_t max_execution_frontier = 0;
     std::uint32_t topology_class         = 0;
+    bool greedy_target                   = false;
     DecodeGraphDefinition definition;
 };
 
@@ -421,8 +422,11 @@ public:
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
-    std::optional<PinnedHostBuffer> dflash_peer_host;
-    qwen3_6::DFlashDecodeIngress* dflash_peer_host_ingress = nullptr;
+    // One pinned DFlash ingress mirror per NON-ZERO rank, indexed by rank (slot 0 unused): the
+    // DFlash round is replicated on every rank, so each peer mirrors rank 0's record whole
+    // (unlike MTP, whose per-rank record names that rank's penalty counter lane).
+    TpArray<std::optional<PinnedHostBuffer>> dflash_peer_host{};
+    TpArray<qwen3_6::DFlashDecodeIngress*> dflash_peer_host_ingress{};
 
     std::size_t workspace_logical_peak_bytes = 0;
 

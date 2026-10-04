@@ -202,19 +202,21 @@ void allgather_rows(const TpArray<Tensor>& destination, const TpArray<Tensor>& p
                     const ExecutionContext& ec, const PeerEvents& events);
 
 /**
- * Exact one-way vocabulary gather used by DFlash's rank-0 selector.  `destination` is the full
- * `[C,T]` image on rank 0; `part[0]` and `part[1]` are the leading/trailing `[C_r,T]` shards on their owning
- * ranks.  Rank 1 is deliberately not written because it never consumes DFlash proposal logits.
+ * Exact one-way vocabulary gather used by DFlash's rank-0 selector. `destination` is the full
+ * `[C,T]` image on rank 0; `part[0]` and `part[1]` are the leading/trailing `[C_r,T]` shards on
+ * their owning ranks. The first/contiguous dimension is concatenated for every column. Rank 1 is
+ * deliberately not written because it never consumes DFlash proposal logits.
  * The source lifetime edge still orders rank 1 after rank 0 has finished importing its shard,
  * so the same work buffers may be reused by the next graph round.
  */
 void gather_columns_rank0(const Tensor& destination, const TpArray<Tensor>& part,
                           const ExecutionContext& ec, const PeerEvents& events);
 
-// Exact one-way relocation from rank 0 to rank 1. Both tensors have the same contiguous
-// dtype and shape. Uses the qualified UVA D2D transport and orders rank 0's next overwrite after
-// rank 1 has consumed the source, including under CUDA Graph capture.
-void broadcast_rank0(const Tensor& source, const Tensor& destination,
+// Exact one-way relocation from rank 0 to every non-zero rank. Slot r of `destination` is rank r's
+// tensor (slot 0 is ignored and may be the source itself); every destination shares the source's
+// contiguous dtype and shape. Uses the qualified UVA D2D transport per peer and orders rank 0's next
+// overwrite after every peer has consumed the source, including under CUDA Graph capture.
+void broadcast_rank0(const Tensor& source, const TpArray<Tensor>& destination,
                      const ExecutionContext& ec, const PeerEvents& events);
 
 } // namespace ninfer::ops

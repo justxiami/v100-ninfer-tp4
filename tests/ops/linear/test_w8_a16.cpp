@@ -15,6 +15,21 @@ constexpr Invocation convenience(std::int32_t t) { return {t, CallForm::A16Conve
 int w8_a16_conformance() {
     int failures = 0;
 
+    // W8 DFlash2 projections, including its packed-QKV query rows and context feature input.
+    constexpr std::array kDFlashWidths{
+        a16(1), a16(2), a16(3), a16(4), a16(7), a16(8), a16(9),
+        a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {4096, 5120, 191U, Comparison::Sampled, true, kDFlashWidths});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {5120, 4096, 193U, Comparison::Sampled, true, kDFlashWidths});
+    constexpr std::array kDFlashFeatureWidths{
+        a16(1), a16(4), a16(8), a16(9), a16(16), a16(17), a16(128), a16(3072),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {5120, 25600, 195U, Comparison::Sampled, true, kDFlashFeatureWidths});
+
     constexpr std::array kN248320K5120{
         a16(1),  a16(6),  a16(16), a16(17), a16(32), a16(33),
         a16(34), a16(48), a16(49), a16(64), a16(65),

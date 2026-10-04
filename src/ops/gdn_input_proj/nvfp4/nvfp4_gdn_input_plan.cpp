@@ -1,5 +1,6 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_cutlass_sm70.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 
 #include <algorithm>
@@ -22,7 +23,16 @@ Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                cudaStream_t stream) {
+                WorkspaceArena* workspace, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    // SM70 fast path (ported from upstream e27de9bf, 10/04): QPN pre-packed-weight kernel for
+    // T < 128, cutlass + split for T >= 128. The small_t chunk loop below re-reads the whole
+    // weight every 32 tokens and was 3.4-4.0x slower per launch at decode than the QPN kernel
+    // (see nvfp4_attn_input_sm70.cu), so it is unreachable in VOLTA builds.
+    nvfp4_gdn_input_sm70_launch(x, weight, qkv, z, workspace, stream);
+    return;
+#endif
+    (void)workspace;
     constexpr std::int32_t kChunk   = kNvfp4LastSmallT;
     constexpr std::int32_t kQkvRows = 10240;
     constexpr std::int32_t kZRows   = 6144;
@@ -46,13 +56,26 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
     }
 }
 
-// The tp2 column shard -- same chunking discipline, halved row counts
-// (Nvfp4GdnInputTp2ColumnGeometry's own qkv=5120=1024+1024+3072, z=3072).
+// The tp2/tp4 column shard -- same chunking discipline, per-rank row counts taken from the
+// caller's own output shapes rather than hardcoded. The tp2 constants (5120/3072) baked in here
+// originally are wrong for the tp4 shard (2560/1536): at any token_begin > 0 the output pointers
+// stride by the tp2 width and write out of bounds while the real token region stays unwritten
+// (found 10/04 by the tp4 op-level test: non-finite at the last-chunk tokens, T>=33).
 void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                      cudaStream_t stream) {
+                      WorkspaceArena* workspace, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    // SM70 fast path (ported from upstream e27de9bf, 10/04): QPN pre-packed-weight kernel for
+    // T < 128, cutlass + split for T >= 128 -- replaces the previous T >= 33 cutlass / T <= 32
+    // small_t split, which re-read the whole shard weight every 32 tokens and accounted for
+    // ~85% of the fork-vs-upstream decode gap (nsys decode window 10/04). The dedicated
+    // cutlass-shard launcher (nvfp4_gdn_input_cutlass_sm70_launch_shard) is now unused in
+    // VOLTA builds.
+    nvfp4_gdn_input_sm70_launch(x, weight, qkv, z, workspace, stream);
+    return;
+#endif
     constexpr std::int32_t kChunk   = kNvfp4LastSmallT;
-    constexpr std::int32_t kQkvRows = 5120;
-    constexpr std::int32_t kZRows   = 3072;
+    const std::int32_t kQkvRows     = qkv.ne[0];
+    const std::int32_t kZRows       = z.ne[0];
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
         auto* input               = static_cast<std::uint8_t*>(x.data) +
@@ -81,15 +104,28 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
         throw std::invalid_argument("nvfp4 gdn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
-    return resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::W4A4
-               ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4GdnInputGeometry::kInputRows)
-               : 0;
+    if (resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::W4A4) {
+        return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4GdnInputGeometry::kInputRows);
+    }
+#ifdef NINFER_VOLTA_BUILD
+    // The sm70 fast path (T >= 128 cutlass + split) and the retained dedicated cutlass-shard
+    // launcher both stage the projection and the GEMM operands in the caller workspace. Size to
+    // the larger of the two, at the parent geometry (the shard needs less; the over-provision
+    // is the FP8 rule; the variant's capacity query passes the parent row count).
+    constexpr std::int32_t kVoltaCutlassMinT = 33;
+    if (max_tokens >= kVoltaCutlassMinT) {
+        return std::max(nvfp4_gdn_input_cutlass_workspace_bytes(max_tokens),
+                        nvfp4_gdn_input_sm70_workspace_bytes(
+                            Nvfp4GdnInputGeometry::kOutputRows, max_tokens));
+    }
+#endif
+    return 0;
 }
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
-        launch_a16(x, weight, qkv, z, stream);
+        launch_a16(x, weight, qkv, z, workspace, stream);
         return;
     }
     if (workspace == nullptr) {
@@ -108,7 +144,7 @@ void nvfp4_gdn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tenso
                                     LinearPolicy policy, WorkspaceArena* workspace,
                                     cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
-        launch_a16_shard(x, weight, qkv, z, stream);
+        launch_a16_shard(x, weight, qkv, z, workspace, stream);
         return;
     }
     if (workspace == nullptr) {

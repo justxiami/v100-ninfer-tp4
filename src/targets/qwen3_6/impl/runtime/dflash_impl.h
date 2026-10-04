@@ -29,21 +29,11 @@
 
 #include <cstddef>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
-
-Weight bf16_rows(const Weight& block, std::int32_t begin, std::int32_t rows) {
-    Weight out = block;
-    const std::size_t offset = static_cast<std::size_t>(begin) *
-                               static_cast<std::size_t>(block.k) * sizeof(std::uint16_t);
-    out.qdata = static_cast<const std::byte*>(block.qdata) + offset;
-    out.payload = out.qdata;
-    out.payload_bytes = static_cast<std::uint64_t>(rows) * block.k * sizeof(std::uint16_t);
-    out.n = out.shape[0] = out.padded_shape[0] = rows;
-    return out;
-}
 
 void require_dflash_state(const PrefillContext& state) {
     if (state.dflash == nullptr || !state.execution.model.dflash.has_value()) {
@@ -170,9 +160,9 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 layer_roots.value.view({Config::head_dim, Config::kv_heads, layer_columns});
             Tensor key_flat   = key_raw.view({Config::kv_size, layer_columns});
             Tensor value_flat = value.view({Config::kv_size, layer_columns});
-            ops::linear(layer_context, weight.context_key, key_flat,
+            ops::linear(layer_context, weight.key, key_flat,
                         state.execution.device.stream);
-            ops::linear(layer_context, weight.context_value, value_flat,
+            ops::linear(layer_context, weight.value, value_flat,
                         state.execution.device.stream);
             Tensor key = layer_roots.key.view({Config::head_dim, Config::kv_heads, layer_columns});
             ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
@@ -242,15 +232,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 Tensor query_flat = query_raw.view({Config::query_size, columns});
                 Tensor key_flat   = key_raw.view({Config::kv_size, columns});
                 Tensor value_flat = value.view({Config::kv_size, columns});
-                const Weight q_weight = bf16_rows(weight.query_key_value, 0, Config::query_size);
-                const Weight k_weight = bf16_rows(weight.query_key_value, Config::query_size,
-                                                  Config::kv_size);
-                const Weight v_weight = bf16_rows(weight.query_key_value,
-                                                  Config::query_size + Config::kv_size,
-                                                  Config::kv_size);
-                ops::linear(roots.conv_input, q_weight, query_flat, state.execution.device.stream);
-                ops::linear(roots.conv_input, k_weight, key_flat, state.execution.device.stream);
-                ops::linear(roots.conv_input, v_weight, value_flat, state.execution.device.stream);
+                ops::linear(roots.conv_input, weight.query, query_flat, state.execution.device.stream);
+                ops::linear(roots.conv_input, weight.key, key_flat, state.execution.device.stream);
+                ops::linear(roots.conv_input, weight.value, value_flat, state.execution.device.stream);
                 Tensor query = roots.query.view({Config::head_dim, Config::query_heads, columns});
                 Tensor key   = roots.key.view({Config::head_dim, Config::kv_heads, columns});
                 ops::rmsnorm(query_raw, weight.query_norm, Config::rms_epsilon, false, query,
@@ -328,45 +312,93 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         ops::rmsnorm(packed, state.execution.model.dflash->final_norm, Config::rms_epsilon, false,
                      proposal_hidden, state.execution.device.stream);
         // DFlash2's selector codebooks are indexed by tokenizer IDs, so its lattice must see the
-        // full target vocabulary even when the ordinary/MTP route uses the optimized shortlist.
-        Tensor logits = state.execution.work.alloc(
-            DType::BF16, {TextConfig::output_rows, static_cast<std::int32_t>(k) * batch_size});
+        // full target candidate set even when the ordinary/MTP route uses the optimized shortlist.
+        // Single rank computes the full-vocabulary logits locally; tensor parallel keeps the exact
+        // same candidate set without a full-vocabulary transfer: every rank reduces its
+        // output-head shard to its local top-16 ordered keys and rank 0 merges the lists.
+        const std::int32_t selector_columns = static_cast<std::int32_t>(k) * batch_size;
         if (state.execution.peer_at(1) == nullptr) {
+            Tensor logits = state.execution.work.alloc(
+                DType::BF16, {TextConfig::output_rows, selector_columns});
             ops::linear(proposal_hidden, state.execution.model.output_head, logits,
                         state.execution.device.stream);
+            Tensor partial = state.execution.work.alloc(
+                DType::I64, {16, (TextConfig::output_rows + ops::kDFlashSelectorTile - 1) /
+                                     ops::kDFlashSelectorTile,
+                             selector_columns});
+            Tensor topk = state.execution.work.alloc(DType::I32, {16, selector_columns});
+            Tensor selector_gate = state.execution.work.alloc(DType::BF16, {256, selector_columns});
+            ops::linear(proposal_hidden, state.execution.model.dflash->selector_hidden_projection,
+                        selector_gate, state.execution.device.stream);
+            ops::dflash2_select(
+                logits, selector_gate, state.execution.model.dflash->selector_predecessor_codebook,
+                state.execution.model.dflash->selector_successor_codebook, anchors, partial,
+                topk, drafts, state.execution.device.stream);
         } else {
-            const std::int32_t columns = static_cast<std::int32_t>(k) * batch_size;
-            const std::int32_t shard   = TextConfig::output_rows / 2;
-            Tensor peer_hidden = state.execution.peer_at(1)->work->alloc(DType::BF16,
-                                                                     {Config::hidden, columns});
-            ops::broadcast_rank0(proposal_hidden, peer_hidden,
-                                 *state.execution.peer_at(1)->execution,
+            const std::int32_t shard = TextConfig::output_rows / state.execution.tp;
+            // Broadcast the draft-model output hidden to every peer so each rank can run its
+            // output-head shard. The hidden is rank 0's, so every peer holds an identical copy.
+            TpArray<Tensor> hidden_parts{};
+            hidden_parts[0] = proposal_hidden;
+            TpArray<Weight> head_parts{};
+            head_parts[0] = state.execution.model.output_head;
+            TpArray<Tensor> part_parts{};
+            part_parts[0] = state.execution.work.alloc(DType::BF16, {shard, selector_columns});
+            for (std::size_t rank = 1; rank < state.execution.tp; ++rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                const TpPeerCore* peer = state.execution.peer_at(slot);
+                hidden_parts[slot] =
+                    peer->work->alloc(DType::BF16, {Config::hidden, selector_columns});
+                head_parts[slot]   = peer->model->output_head;
+                part_parts[slot]   = peer->work->alloc(DType::BF16, {shard, selector_columns});
+            }
+            ops::broadcast_rank0(proposal_hidden, hidden_parts, state.ec,
                                  *state.execution.peer_at(1)->events);
-            Tensor part0 = state.execution.work.alloc(DType::BF16, {shard, columns});
-            Tensor part1 = state.execution.peer_at(1)->work->alloc(DType::BF16, {shard, columns});
-            ops::linear_column_parallel(
-                {proposal_hidden, peer_hidden},
-                {state.execution.model.output_head, state.execution.peer_at(1)->model->output_head},
-                {part0, part1}, *state.execution.peer_at(1)->execution);
-            // The lattice selector runs only on rank 0.  Gathering the full vocabulary to rank 1
-            // doubles the PCIe/DMA-FQ traffic and event choreography without feeding any
-            // consumer, so import only rank 1's shard into rank 0's logits image.
-            ops::gather_columns_rank0(logits, {part0, part1}, *state.execution.peer_at(1)->execution,
+            ops::linear_column_parallel(hidden_parts, head_parts, part_parts, state.ec);
+            const std::int32_t local_parts =
+                (shard + ops::kDFlashSelectorTile - 1) / ops::kDFlashSelectorTile;
+            TpArray<Tensor> partial_parts{};
+            TpArray<Tensor> local_keys_parts{};
+            for (std::size_t rank = 0; rank < state.execution.tp; ++rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                WorkspaceArena& ws = rank == 0 ? state.execution.work
+                                               : *state.execution.peer_at(slot)->work;
+                partial_parts[slot]   = ws.alloc(DType::I64, {16, local_parts, selector_columns});
+                local_keys_parts[slot] = ws.alloc(DType::I64, {16, selector_columns});
+            }
+            ops::dflash2_local_topk(part_parts[0], partial_parts[0], local_keys_parts[0], 0,
+                                    state.execution.device.stream);
+            for (std::size_t rank = 1; rank < state.execution.tp; ++rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                const TpPeerCore* peer = state.execution.peer_at(slot);
+                const CurrentDevice restore;
+                CUDA_CHECK(cudaSetDevice(peer->device->device));
+                ops::dflash2_local_topk(part_parts[slot], partial_parts[slot],
+                                        local_keys_parts[slot],
+                                        static_cast<std::int32_t>(shard * slot),
+                                        peer->device->stream);
+            }
+            {
+                const CurrentDevice restore;
+                CUDA_CHECK(cudaSetDevice(state.execution.device.device));
+            }
+            // gather_columns_rank0 concatenates the first tensor dimension (the local top-k
+            // entries), so the per-rank [16,C] lists become one [16*tp,C] list. Keeping columns
+            // in the second dimension preserves the selector's column-major tensor convention.
+            Tensor gathered_keys = state.execution.work.alloc(
+                DType::I64, {16 * state.execution.tp, selector_columns});
+            ops::gather_columns_rank0(gathered_keys, local_keys_parts, state.ec,
                                       *state.execution.peer_at(1)->events);
+            Tensor global_keys = state.execution.work.alloc(DType::I64, {16, selector_columns});
+            Tensor selector_gate = state.execution.work.alloc(DType::BF16, {256, selector_columns});
+            ops::linear(proposal_hidden, state.execution.model.dflash->selector_hidden_projection,
+                        selector_gate, state.execution.device.stream);
+            ops::dflash2_select_sharded(
+                gathered_keys, selector_gate,
+                state.execution.model.dflash->selector_predecessor_codebook,
+                state.execution.model.dflash->selector_successor_codebook, anchors, global_keys,
+                drafts, state.execution.device.stream);
         }
-        Tensor selector_gate = state.execution.work.alloc(
-            DType::BF16, {256, static_cast<std::int32_t>(k) * batch_size});
-        ops::linear(proposal_hidden, state.execution.model.dflash->selector_hidden_projection,
-                    selector_gate, state.execution.device.stream);
-        Tensor partial = state.execution.work.alloc(DType::I64,
-            {16, (TextConfig::output_rows + 1023) / 1024,
-             static_cast<std::int32_t>(k) * batch_size});
-        Tensor topk = state.execution.work.alloc(DType::I32,
-            {16, static_cast<std::int32_t>(k), batch_size});
-        ops::dflash2_select(logits, selector_gate,
-                            state.execution.model.dflash->selector_predecessor_codebook,
-                            state.execution.model.dflash->selector_successor_codebook,
-                            anchors, partial, topk, drafts, state.execution.device.stream);
         state.execution.work.reset();
     }
 }
@@ -385,20 +417,26 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                    sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
         TpPeers peers = tp_executions(state.execution);
-        TpExecution* tp = peers[1].has_value() ? &*peers[1] : nullptr;
-        qwen3_6::DFlashDecodeState* peer_frame = nullptr;
-        if (tp != nullptr) {
-            if (!tp->io->dflash_decode ||
-                state.execution.peer_at(1)->dflash_host_ingress == nullptr) {
-                throw std::logic_error("tensor-parallel DFlash decode requires a peer frame and ingress");
-            }
-            peer_frame = &*tp->io->dflash_decode;
+        // One peer frame per non-zero rank, indexed by rank (slot 0 unused).
+        TpArray<qwen3_6::DFlashDecodeState*> peer_frames{};
+        const bool multi_rank = peers[1].has_value();
+        if (multi_rank) {
             const CurrentDevice restore;
-            CUDA_CHECK(cudaSetDevice(tp->device->device));
-            CUDA_CHECK(cudaMemcpyAsync(peer_frame->ingress.data,
-                                       state.execution.peer_at(1)->dflash_host_ingress,
-                                       sizeof(qwen3_6::DFlashDecodeIngress),
-                                       cudaMemcpyHostToDevice, tp->device->stream));
+            for (std::size_t rank = 1; rank < state.execution.tp; ++rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                const TpPeerCore* peer = state.execution.peer_at(slot);
+                if (peer == nullptr || !peer->io->dflash_decode ||
+                    peer->dflash_host_ingress == nullptr) {
+                    throw std::logic_error(
+                        "tensor-parallel DFlash decode requires a peer frame and ingress on every rank");
+                }
+                peer_frames[slot] = &*peer->io->dflash_decode;
+                CUDA_CHECK(cudaSetDevice(peer->device->device));
+                CUDA_CHECK(cudaMemcpyAsync(peer_frames[slot]->ingress.data,
+                                           peer->dflash_host_ingress,
+                                           sizeof(qwen3_6::DFlashDecodeIngress),
+                                           cudaMemcpyHostToDevice, peer->device->stream));
+            }
         }
 
         Tensor anchors          = frame.anchors.slice(0, 0, batch_size);
@@ -434,24 +472,42 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
         ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids,
                                             state.execution.device.stream);
-        if (peer_frame != nullptr) {
-            Tensor peer_anchors = peer_frame->anchors.slice(0, 0, batch_size);
-            Tensor peer_frontiers = peer_frame->execution_frontiers.slice(0, 0, batch_size);
-            Tensor peer_valid = peer_frame->target_valid_columns.slice(0, 0, batch_size);
-            Tensor peer_ids = peer_frame->proposal_ids.slice(1, 0, batch_size);
-            Tensor peer_positions = peer_frame->proposal_positions.slice(1, 0, batch_size);
-            Tensor peer_drafts = peer_frame->draft_tokens.slice(1, 0, batch_size);
-            const CurrentDevice restore;
-            CUDA_CHECK(cudaSetDevice(tp->device->device));
-            ops::prepare_masked_block(peer_anchors, peer_frontiers, peer_valid,
-                                      Variant::DFlashConfig::mask_token, peer_ids,
-                                      peer_positions, tp->device->stream);
-            ops::broadcast_rank0(drafts, peer_drafts, *tp->execution, *tp->events);
-            CUDA_CHECK(cudaSetDevice(tp->device->device));
-            Tensor peer_verify_ids = peer_frame->verify_ids.slice(1, 0, batch_size);
-            ops::speculative_prepare_verify_ids(
-                peer_anchors, peer_drafts, peer_frame->proposal_extents.slice(0, 0, batch_size),
-                peer_verify_ids, tp->device->stream);
+        if (multi_rank) {
+            TpArray<Tensor> peer_drafts{};
+            for (std::size_t rank = 1; rank < state.execution.tp; ++rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                const TpPeerCore* peer = state.execution.peer_at(slot);
+                qwen3_6::DFlashDecodeState& pf = *peer_frames[slot];
+                Tensor peer_anchors = pf.anchors.slice(0, 0, batch_size);
+                Tensor peer_frontiers = pf.execution_frontiers.slice(0, 0, batch_size);
+                Tensor peer_valid = pf.target_valid_columns.slice(0, 0, batch_size);
+                Tensor peer_ids = pf.proposal_ids.slice(1, 0, batch_size);
+                Tensor peer_positions = pf.proposal_positions.slice(1, 0, batch_size);
+                peer_drafts[slot] = pf.draft_tokens.slice(1, 0, batch_size);
+                const CurrentDevice restore;
+                CUDA_CHECK(cudaSetDevice(peer->device->device));
+                ops::prepare_masked_block(peer_anchors, peer_frontiers, peer_valid,
+                                          Variant::DFlashConfig::mask_token, peer_ids,
+                                          peer_positions, peer->device->stream);
+            }
+            // Rank 0 owns the selector walk, so its draft sequence must reach every peer BEFORE the
+            // peers derive their verify ids from it. Upstream tp2 order is prepare_masked_block ->
+            // broadcast_rank0(drafts, peer_drafts) -> speculative_prepare_verify_ids(peer_drafts);
+            // deriving the ids first silently verifies a stale/empty block.
+            ops::broadcast_rank0(drafts, peer_drafts, state.ec,
+                                 *state.execution.peer_at(1)->events);
+            for (std::size_t rank = 1; rank < state.execution.tp; ++rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                const TpPeerCore* peer = state.execution.peer_at(slot);
+                qwen3_6::DFlashDecodeState& pf = *peer_frames[slot];
+                Tensor peer_anchors = pf.anchors.slice(0, 0, batch_size);
+                const CurrentDevice restore;
+                CUDA_CHECK(cudaSetDevice(peer->device->device));
+                Tensor peer_verify_ids = pf.verify_ids.slice(1, 0, batch_size);
+                ops::speculative_prepare_verify_ids(
+                    peer_anchors, peer_drafts[slot], pf.proposal_extents.slice(0, 0, batch_size),
+                    peer_verify_ids, peer->device->stream);
+            }
         }
         TextContext card(state.execution.device, state.execution.model, state.execution.work,
                          state.execution.rope_frequency, {}, state.execution.linear_attention,
@@ -485,17 +541,21 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 .feature_sink    = feature_sink,
             };
         };
-        if (peer_frame != nullptr) {
-            // DFlash is a two-rank path (rejected at tp > 2), so its frame set is exactly two.
+        if (state.execution.tp > 1) {
+            // DFlash is a multi-rank path now: one frame per rank (slot r is rank r's).
             TpArray<TargetVerifyFrameView> frames{};
             frames[0] = verify_view(frame, state.execution.replay_records, &sink);
-            frames[1] = verify_view(*peer_frame, tp->replay_records, nullptr);
+            for (std::size_t rank = 1; rank < state.execution.tp; ++rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                const TpPeerCore* peer = state.execution.peer_at(slot);
+                frames[slot] = verify_view(*peer_frames[slot], peer->replay_records, nullptr);
+            }
             target_verify_accept(state.execution, state.continuation_hidden_store, card, frames,
-                                 target_envelope);
+                                 target_envelope, state.greedy_target);
         } else {
             target_verify_accept(state.execution, state.continuation_hidden_store, card,
                                  verify_view(frame, state.execution.replay_records, &sink),
-                                 target_envelope);
+                                 target_envelope, state.greedy_target);
         }
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_6::DFlashDecodeEgress), cudaMemcpyDeviceToHost,

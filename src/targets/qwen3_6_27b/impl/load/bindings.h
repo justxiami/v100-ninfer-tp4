@@ -273,6 +273,7 @@ struct DFlashLayerPlan {
 };
 
 struct DFlashPlan {
+    artifact::NumericFormat projection_format = artifact::NumericFormat::BF16;
     artifact::ObjectHandle feature_projection;
     artifact::ObjectHandle context_norm;
     std::array<DFlashLayerPlan, 5> layers;

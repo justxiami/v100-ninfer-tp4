@@ -564,13 +564,9 @@ void allgather_rows(const TpArray<Tensor>& destination, const TpArray<Tensor>& p
 void gather_columns_rank0(const Tensor& destination, const TpArray<Tensor>& part,
                           const ExecutionContext& ec, const PeerEvents& events) {
     // Rank0-centric by construction: the DFlash selector reads its proposal logits on rank 0 only.
-    // There is no rank0-generalization at tp > 2, so refuse loudly rather than act on a subset.
-    if (ec.tp > 2) {
-        throw std::invalid_argument(
-            "gather_columns_rank0 is a two-rank operation; DFlash under tp > 2 is not supported");
-    }
-    require_two_devices(
-        ec, "gather_columns_rank0: requires an ExecutionContext with two distinct devices");
+    // Generalized from the two-rank pull: rank 0 records inputs_ready(0), every non-zero rank
+    // records its own, then rank 0 waits on each and memcpy2D-asyncs its part into the
+    // concatenated destination. Every copy stays a single captured node (capture-safe).
     const DType dtype             = destination.dtype;
     const std::int32_t full_width = destination.ne[0];
     const std::int32_t columns    = destination.ne[1];
@@ -588,17 +584,15 @@ void gather_columns_rank0(const Tensor& destination, const TpArray<Tensor>& part
                     part[rank].ne[2] == 1 && part[rank].ne[3] == 1,
                 "gather_columns_rank0: parts must be two-dimensional [C_r,T]");
     }
-    require(part[0].ne[0] + part[1].ne[0] == full_width,
+    std::int32_t width_sum = 0;
+    for (int rank = 0; rank < ec.tp; ++rank) { width_sum += part[rank].ne[0]; }
+    require(width_sum == full_width,
             "gather_columns_rank0: owned widths must sum to destination width");
     require(events.live(), "gather_columns_rank0: events must be live");
 
     const std::size_t element_bytes = dtype_size(dtype);
     const std::size_t destination_pitch =
         static_cast<std::size_t>(full_width) * element_bytes;
-    const std::size_t block[2] = {
-        static_cast<std::size_t>(part[0].ne[0]) * element_bytes,
-        static_cast<std::size_t>(part[1].ne[0]) * element_bytes};
-    const std::size_t offset[2] = {0, block[0]};
 
 #ifndef NDEBUG
     require_resident_on(destination.data, ec.dev[0]->device,
@@ -613,63 +607,98 @@ void gather_columns_rank0(const Tensor& destination, const TpArray<Tensor>& part
 
     const CurrentDeviceGuard guard;
     const DeviceContext& rank0 = *ec.dev[0];
-    const DeviceContext& rank1 = *ec.dev[1];
-    CurrentDeviceGuard::set(rank0.device);
-    CUDA_CHECK(cudaEventRecord(events.inputs_ready(0), rank0.stream));
-    CurrentDeviceGuard::set(rank1.device);
-    CUDA_CHECK(cudaEventRecord(events.inputs_ready(1), rank1.stream));
+    // Publish every rank's operand before any wait observes it.
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        CurrentDeviceGuard::set(ec.dev[static_cast<std::size_t>(rank)]->device);
+        CUDA_CHECK(cudaEventRecord(events.inputs_ready(rank),
+                                   ec.dev[static_cast<std::size_t>(rank)]->stream));
+    }
 
     CurrentDeviceGuard::set(rank0.device);
-    CUDA_CHECK(cudaStreamWaitEvent(rank0.stream, events.inputs_ready(0), 0));
-    CUDA_CHECK(cudaMemcpy2DAsync(destination.data, destination_pitch, part[0].data, block[0],
-                                 block[0], static_cast<std::size_t>(columns),
-                                 cudaMemcpyDeviceToDevice, rank0.stream));
-    CUDA_CHECK(cudaStreamWaitEvent(rank0.stream, events.inputs_ready(1), 0));
-    CUDA_CHECK(cudaMemcpy2DAsync(byte_offset(destination.data, offset[1]), destination_pitch,
-                                 part[1].data, block[1], block[1],
-                                 static_cast<std::size_t>(columns), cudaMemcpyDeviceToDevice,
-                                 rank0.stream));
+    std::size_t offset = 0;
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        const std::size_t slot = static_cast<std::size_t>(rank);
+        const std::size_t block =
+            static_cast<std::size_t>(part[slot].ne[0]) * element_bytes;
+        CUDA_CHECK(cudaStreamWaitEvent(rank0.stream, events.inputs_ready(rank), 0));
+        CUDA_CHECK(cudaMemcpy2DAsync(byte_offset(destination.data, offset), destination_pitch,
+                                     part[slot].data, block, block,
+                                     static_cast<std::size_t>(columns),
+                                     cudaMemcpyDeviceToDevice, rank0.stream));
+        offset += block;
+    }
     CUDA_CHECK(cudaEventRecord(events.pull_done(0), rank0.stream));
 
-    // Rank 1 may overwrite its proposal shard only after rank 0 has consumed it.  No reciprocal
+    // Every peer may overwrite its part only after rank 0 has consumed it. No reciprocal
     // destination write is needed because the selector and all subsequent DFlash logic run on
     // rank 0.
-    CurrentDeviceGuard::set(rank1.device);
-    CUDA_CHECK(cudaStreamWaitEvent(rank1.stream, events.pull_done(0), 0));
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        const std::size_t slot = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec.dev[slot]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(ec.dev[slot]->stream, events.pull_done(0), 0));
+    }
 }
 
-void broadcast_rank0(const Tensor& source, const Tensor& destination,
+void broadcast_rank0(const Tensor& source, const TpArray<Tensor>& destination,
                      const ExecutionContext& ec, const PeerEvents& events) {
-    if (ec.tp > 2) {
-        throw std::invalid_argument(
-            "broadcast_rank0 is a two-rank operation; DFlash under tp > 2 is not supported");
-    }
-    require_two_devices(ec, "broadcast_rank0: requires two devices");
+    // Rank 0-centric by construction: the DFlash draft tokens and draft-model output hidden
+    // are produced on rank 0 alone. Generalized from the two-rank pull to every non-zero rank:
+    // one single-copy UVA D2D per peer, all ordered after the same inputs_ready(0) record.
+    // Each single copy stays a one-shot node so the whole exchange is capture-safe (a memcpy
+    // node is captured into the graph; a host-side loop around it is not, see
+    // decode_graph.cpp's capture contract).
     require(events.live(), "broadcast_rank0: events must be live");
-    require(source.data != nullptr && destination.data != nullptr &&
-                source.dtype == destination.dtype && source.is_contiguous() &&
-                destination.is_contiguous(), "broadcast_rank0: invalid tensors");
-    for (int d = 0; d < 4; ++d) {
-        require(source.ne[d] == destination.ne[d], "broadcast_rank0: shapes must match");
-    }
+    require(source.data != nullptr && source.is_contiguous(),
+            "broadcast_rank0: source must be contiguous and non-null");
     const std::size_t bytes = source.bytes();
     if (bytes == 0) { return; }
 #ifndef NDEBUG
-    require_resident_on(source.data, ec.dev[0]->device, "broadcast_rank0: source is not on rank 0");
-    require_resident_on(destination.data, ec.dev[1]->device,
-                        "broadcast_rank0: destination is not on rank 1");
+    require_resident_on(source.data, ec.dev[0]->device,
+                        "broadcast_rank0: source is not on rank 0");
 #endif
     const CurrentDeviceGuard guard;
     const DeviceContext& origin = *ec.dev[0];
-    const DeviceContext& peer = *ec.dev[1];
     CurrentDeviceGuard::set(origin.device);
     CUDA_CHECK(cudaEventRecord(events.inputs_ready(0), origin.stream));
-    CurrentDeviceGuard::set(peer.device);
-    CUDA_CHECK(cudaStreamWaitEvent(peer.stream, events.inputs_ready(0), 0));
-    CUDA_CHECK(pull_peer(destination.data, source.data, bytes, peer.stream));
-    CUDA_CHECK(cudaEventRecord(events.pull_done(1), peer.stream));
-    CurrentDeviceGuard::set(origin.device);
-    CUDA_CHECK(cudaStreamWaitEvent(origin.stream, events.pull_done(1), 0));
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        const std::size_t slot = static_cast<std::size_t>(rank);
+        // [10/02 diagnostic] granular report: the merged condition cannot tell a null arena
+        // allocation from a dtype/layout mismatch at tp4, where each rank's operand comes from a
+        // different source (a fresh arena alloc on the propose path vs. a frame view on the
+        // decode path). Remove once the tp4 path is qualified.
+        if (destination[slot].data == nullptr || destination[slot].dtype != source.dtype ||
+            !destination[slot].is_contiguous()) {
+            const auto describe = [](const Tensor& t) {
+                return std::string("data=") + (t.data == nullptr ? "null" : "ok") +
+                       " dtype=" + std::to_string(static_cast<int>(t.dtype)) + " ne=[" +
+                       std::to_string(t.ne[0]) + "," + std::to_string(t.ne[1]) + "," +
+                       std::to_string(t.ne[2]) + "," + std::to_string(t.ne[3]) + "] nb=[" +
+                       std::to_string(t.nb[0]) + "," + std::to_string(t.nb[1]) + "," +
+                       std::to_string(t.nb[2]) + "," + std::to_string(t.nb[3]) +
+                       "] contig=" + (t.is_contiguous() ? "1" : "0");
+            };
+            throw std::invalid_argument("broadcast_rank0: rank " + std::to_string(rank) +
+                                        " destination invalid (" + describe(destination[slot]) +
+                                        "); source (" + describe(source) + ")");
+        }
+        for (int d = 0; d < 4; ++d) {
+            require(source.ne[d] == destination[slot].ne[d],
+                    "broadcast_rank0: shapes must match on every rank");
+        }
+#ifndef NDEBUG
+        require_resident_on(destination[slot].data, ec.dev[slot]->device,
+                            "broadcast_rank0: destination is not on its rank");
+        require_disjoint(destination[slot].data, bytes, source.data, bytes,
+                         "broadcast_rank0: destination must not overlap the source");
+#endif
+        const DeviceContext& peer = *ec.dev[slot];
+        CurrentDeviceGuard::set(peer.device);
+        CUDA_CHECK(cudaStreamWaitEvent(peer.stream, events.inputs_ready(0), 0));
+        CUDA_CHECK(pull_peer(destination[slot].data, source.data, bytes, peer.stream));
+        CUDA_CHECK(cudaEventRecord(events.pull_done(slot), peer.stream));
+        CurrentDeviceGuard::set(origin.device);
+        CUDA_CHECK(cudaStreamWaitEvent(origin.stream, events.pull_done(slot), 0));
+    }
 }
 
 } // namespace ninfer::ops

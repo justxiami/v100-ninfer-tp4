@@ -1,5 +1,6 @@
 #include "ninfer/ops/attn_input_proj.h"
 
+#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
 
@@ -295,6 +296,8 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     return failures;
 }
 
+int run_nvfp4_tp4_shard();
+
 int run_nvfp4_target() {
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kParentRows = 14336;
@@ -308,9 +311,137 @@ int run_nvfp4_target() {
     for (const std::int32_t tokens : {1, 2, 4, 8, 16, 20, 32, 33}) {
         failures += run_nvfp4_target_case(parent, tokens);
     }
-    failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    cudaDeviceProp properties;
+    cudaGetDeviceProperties(&properties, 0);
+    if (properties.major >= 12) { // A4 route is an sm_120a-only kernel (stub on Volta builds)
+        failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
+        failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
+        failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    }
+    failures += run_nvfp4_tp4_shard();
+    return failures;
+}
+
+int run_nvfp4_tp4_shard_case(DevicePackedWeight& shard, std::int32_t tokens) {
+    // tp4 column shard of the fused 14336-row attention input parent (quasar's first end-to-end
+    // tp4 exposure, 10/04): 3584 rows = q 1536 | k 256 | gate 1536 | v 256. The cases above only
+    // instantiate the parent and tp2 shard geometries, so the tp4 shard kernels never ran against
+    // the FP64 oracle before this case.
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kQRows      = 1536;
+    constexpr std::int32_t kKvRows     = 256;
+    constexpr std::int32_t kKeyBegin   = kQRows;
+    constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
+    constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
+    const std::vector<float> activation =
+        make_bf16_activation(kHidden, tokens, 377U + static_cast<std::uint32_t>(tokens));
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+
+    GuardedBf16Tensor query(kQRows, tokens);
+    GuardedBf16Tensor gate(kQRows, tokens);
+    GuardedBf16Tensor key(kKvRows, tokens);
+    GuardedBf16Tensor value(kKvRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor q = query.tensor();
+    Tensor g = gate.tensor();
+    Tensor k = key.tensor();
+    Tensor v = value.tensor();
+    ops::detail::nvfp4_attn_input_dispatch_shard(x, shard.view(), q, g, k, v, ops::LinearPolicy::A16Only,
+                                            nullptr, nullptr);
+    cuda_synchronize();
+    const ReductionCriterion& criterion = kAttnInputProjA16Tolerance;
+    const std::string suffix            = " NVFP4 TP4SHARD T=" + std::to_string(tokens);
+    int failures = query.verify_guards("attn tp4 q" + suffix);
+    failures += key.verify_guards("attn tp4 k" + suffix);
+    failures += gate.verify_guards("attn tp4 gate" + suffix);
+    failures += value.verify_guards("attn tp4 v" + suffix);
+    failures += verify_output("attn tp4 q" + suffix, query, shard.host, 0, kQRows, activation,
+                              kHidden, tokens, criterion, 7);
+    failures += verify_output("attn tp4 k" + suffix, key, shard.host, kKeyBegin, kKvRows,
+                              activation, kHidden, tokens, criterion, 7);
+    failures += verify_output("attn tp4 gate" + suffix, gate, shard.host, kGateBegin, kQRows,
+                              activation, kHidden, tokens, criterion, 7);
+    failures += verify_output("attn tp4 v" + suffix, value, shard.host, kValueBegin, kKvRows,
+                              activation, kHidden, tokens, criterion, 7);
+    failures += verify_preserved("attn tp4 x" + suffix, device_activation, activation_bits);
+    failures += shard.verify_preserved("attn tp4 shard weight" + suffix);
+    return failures;
+}
+
+int run_nvfp4_tp4_shard_cutlass_case(DevicePackedWeight& shard, std::int32_t tokens) {
+    // T >= 33: dispatch_shard routes to the NVFP4 cutlass fast path (one contiguous projected
+    // plane + the generic NVFP4 -> FP16 CUTLASS GEMM + the Q|K|Gate|V split kernel) instead of
+    // the 32-token small_t chunks. The arena is sized by the parent wrapper capacity (the
+    // production chain's own query), and the tp4 shard execution uses less than that by design
+    // (the tp2-derived over-provision, the FP8 rule).
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kQRows      = 1536;
+    constexpr std::int32_t kKvRows     = 256;
+    constexpr std::int32_t kKeyBegin   = kQRows;
+    constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
+    constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
+    const std::vector<float> activation =
+        make_bf16_activation(kHidden, tokens, 487U + static_cast<std::uint32_t>(tokens));
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+
+    GuardedBf16Tensor query(kQRows, tokens);
+    GuardedBf16Tensor gate(kQRows, tokens);
+    GuardedBf16Tensor key(kKvRows, tokens);
+    GuardedBf16Tensor value(kKvRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor q = query.tensor();
+    Tensor g = gate.tensor();
+    Tensor k = key.tensor();
+    Tensor v = value.tensor();
+    const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::NVFP4, 14336, kHidden, ops::LinearPolicy::A16Only, tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+    ops::detail::nvfp4_attn_input_dispatch_shard(x, shard.view(), q, g, k, v, ops::LinearPolicy::A16Only,
+                                            &workspace, nullptr);
+    cuda_synchronize();
+    const ReductionCriterion& criterion = kAttnInputProjA16Tolerance;
+    const std::string suffix            = " NVFP4 TP4SHARD CUTLASS T=" + std::to_string(tokens);
+    int failures = query.verify_guards("attn tp4 cutlass q" + suffix);
+    if (workspace.peak_used() > capacity) {
+        std::cerr << "attn tp4 cutlass workspace T=" << tokens
+                  << ": execution exceeded the parent capacity query\n";
+        ++failures;
+    }
+    failures += key.verify_guards("attn tp4 cutlass k" + suffix);
+    failures += gate.verify_guards("attn tp4 cutlass gate" + suffix);
+    failures += value.verify_guards("attn tp4 cutlass v" + suffix);
+    failures += verify_output("attn tp4 cutlass q" + suffix, query, shard.host, 0, kQRows, activation,
+                              kHidden, tokens, criterion, 11);
+    failures += verify_output("attn tp4 cutlass k" + suffix, key, shard.host, kKeyBegin, kKvRows,
+                              activation, kHidden, tokens, criterion, 11);
+    failures += verify_output("attn tp4 cutlass gate" + suffix, gate, shard.host, kGateBegin, kQRows,
+                              activation, kHidden, tokens, criterion, 11);
+    failures += verify_output("attn tp4 cutlass v" + suffix, value, shard.host, kValueBegin, kKvRows,
+                              activation, kHidden, tokens, criterion, 11);
+    failures += verify_preserved("attn tp4 cutlass x" + suffix, device_activation, activation_bits);
+    failures += shard.verify_preserved("attn tp4 cutlass shard weight" + suffix);
+    return failures;
+}
+
+int run_nvfp4_tp4_shard() {
+    constexpr std::int32_t kHidden = 5120;
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 3.5F;
+    DevicePackedWeight shard(
+        quantized_weight::make_patterned_weight(QType::NVFP4, 3584, kHidden, 367U, options));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 20, 32, 33}) {
+        failures += run_nvfp4_tp4_shard_case(shard, tokens);
+    }
+    // The cutlass fast path (T >= 33 with a caller workspace): the T=33 case above runs the chunk
+    // loop with a null workspace; these run the generic-GEMM + split-kernel route across the
+    // chunk boundary and at a realistic prefill width.
+    for (const std::int32_t tokens : {33, 48, 128, 1024}) {
+        failures += run_nvfp4_tp4_shard_cutlass_case(shard, tokens);
+    }
     return failures;
 }
 

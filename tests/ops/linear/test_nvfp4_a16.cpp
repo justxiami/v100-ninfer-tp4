@@ -28,6 +28,17 @@ int run_nvfp4_a16() {
     int failures = 0;
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {14336, 5120, 701U, Comparison::Sampled, true, attn_invocations});
+    // tp4 shard decode shapes (10/04, quasar NVFP4): attention input (t<=3 decode) and the
+    // row-parallel output/down projections (t<8 decode) resolve through A16 to QPN2/SIMT at these
+    // geometries; the parent suites above never instantiated them.
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {3584, 5120, 741U, Comparison::Sampled, true, attn_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {4096, 5120, 743U, Comparison::Sampled, true, attn_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {5120, 1536, 745U, Comparison::Sampled, true, attn_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {5120, 4352, 747U, Comparison::Sampled, true, attn_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {16384, 5120, 703U, Comparison::Sampled, true, new_problem_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
@@ -38,7 +49,8 @@ int run_nvfp4_a16() {
                           {5120, 17408, 707U, Comparison::Sampled, true, new_problem_invocations});
 #ifdef NINFER_VOLTA_BUILD
     constexpr std::array prefill_invocations{
-        Invocation{128}, Invocation{1024}, Invocation{4096},
+        Invocation{128}, Invocation{1024}, Invocation{2047}, Invocation{2048}, Invocation{2049},
+        Invocation{3072}, Invocation{4096},
     };
     for (const bool prepacked : {false, true}) {
         // The oracle decodes the original artifact bytes, independently of both the load-time

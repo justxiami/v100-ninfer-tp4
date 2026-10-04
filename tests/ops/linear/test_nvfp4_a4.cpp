@@ -41,6 +41,29 @@ int run_nvfp4_a4() {
                           {5120, 6144, 723U, Comparison::Sampled, true, residual_invocations});
     failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
                           {5120, 17408, 725U, Comparison::Sampled, true, residual_invocations});
+    // tp4 shard shapes (10/04, quasar NVFP4 attention/GDN): first end-to-end exposure of these
+    // geometries -- the parent and tp2-shard suites above never instantiated them. GdnInput
+    // resolves to W4A4 for every token count, so 4096x5120 runs on every step of every GDN layer.
+    constexpr std::array gdn_tp4_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{2, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
+    };
+    constexpr std::array residual_tp4_invocations{
+        Invocation{8, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
+    };
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {3584, 5120, 731U, Comparison::Sampled, true, attn_invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {4096, 5120, 733U, Comparison::Sampled, true, gdn_tp4_invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {8704, 5120, 735U, Comparison::Sampled, true, attn_invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {5120, 1536, 737U, Comparison::Sampled, true, residual_tp4_invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {5120, 4352, 739U, Comparison::Sampled, true, residual_tp4_invocations});
     return failures;
 }
 
