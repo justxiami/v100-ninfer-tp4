@@ -1,7 +1,10 @@
 # NInfer V100 tp4 — 4-way tensor parallel for 4 × V100 (SM70)
 
+[中文文档](README.zh-CN.md) · [Build guide](docs/tp4/README.md) · [Technical history](docs/tp4/changelog.md)
+
 Single-instance Qwen3.8-27B inference across **4 × Tesla V100-SXM2 16 GB**
-(`sm_70` / Volta, CUDA 12.8) via 4-way tensor parallel.
+(`sm_70` / Volta, CUDA 12.8) via 4-way tensor parallel. **Multimodal (image) since
+2026-10-05**; the text-only path is the byte-identical regression gate.
 
 This is a fork of [tuxKOH/ninfer-V100X2](https://github.com/tuxKOH/ninfer-V100X2)
 at baseline commit `c6100422` (2026-09-29). That baseline is the tuned **2-GPU (TP2)**
@@ -23,10 +26,29 @@ and adds `--tp 4`, which runs one instance across all four GPUs.
 - **Tokenizer BPE merge O(k²) → O(k·log k)** — a 60k-character unbroken CJK run is one
   pre-token (k=180k bytes), which the naive rescan made quadratic: 120k context went
   from ~40 min to 0.22 s; verified token-identical (13/13 + 5,500 randomized cases).
+- **dflash2 / SWA / argmax / speculative-round op families + Volta GQA attention
+  (2026-10-01)** — draft-verify and small-batch decode paths with per-shard NCCL
+  collectives and `ExecutionCore.tp` bookkeeping fixes for the tp4 handoff
+  (2026-10-02/03).
+- **SM70 NVFP4 decode fast path + load-side prepack (2026-10-04)** — QPN/CUTLASS
+  Volta kernels for the attn/gdn input projections; greedy decode **113.5 → 146.3 tok/s
+  (+29%)** under the controlled probe, prefill unchanged (−0.6% on the 8k–120k ladder);
+  cross-tree bit-comparison is a wrong criterion here (reduction-order micro-perturbations
+  amplify under greedy+MTP — verify determinism-in-binary, quality probes, and perf).
+- **QUASAR QAT artifact support (2026-10-04)** — load plan + artifact reader fix for the
+  QUASAR NVFP4-QAT variant; same-protocol decode +7–14% vs the K3 artifact
+  (systematically higher MTP draft acceptance: smaller quantization damage).
+- **Multimodal vision on tp4 (2026-10-05)** — a single Vision session encodes on rank 0
+  and the [hidden, len] media residual is D2D-copied to every peer under event ordering
+  (tp4 has no peer access; `enable_peer_access` is only opened for tp2). The MTP
+  alignment window and the prefix-reuse MTP bridge stage the shifted visual embeddings
+  per rank (embedding-side ranks only). Images only, no video. See
+  [the vision write-up](docs/tp4/vision-tp4-2026-10-05.md).
 
 Technical history (W1→W6): [`docs/tp4/changelog.md`](docs/tp4/changelog.md) ·
 MTP root-cause analysis: [`docs/tp4/README_tp4_mtp_rca_2026-10-01.md`](docs/tp4/README_tp4_mtp_rca_2026-10-01.md) ·
-tokenizer report: [`docs/tp4/tokenizer-oklogk.md`](docs/tp4/tokenizer-oklogk.md)
+tokenizer report: [`docs/tp4/tokenizer-oklogk.md`](docs/tp4/tokenizer-oklogk.md) ·
+vision on tp4 (2026-10-05): [`docs/tp4/vision-tp4-2026-10-05.md`](docs/tp4/vision-tp4-2026-10-05.md)
 
 ## Measurements (this host, completed tp4)
 
@@ -84,6 +106,23 @@ Reference build graph and exact CMake option values: [`docs/tp4/build-config/`](
 The baseline fork's README (detailed TP2 measurements, build/run/convert instructions):
 [`docs/upstream-README-v100x2.md`](docs/upstream-README-v100x2.md).
 
+### Vision (added 2026-10-05)
+
+Image requests on the reference artifact (the vision tower ships in the same `.ninfer`):
+
+| Item | Value |
+|---|---:|
+| Image prompt (315 tokens, incl. 240 merged media tokens) | ttft ≈ 450 ms, prefill ≈ 1,800 tok/s |
+| Decode on image request | 155 tok/s, MTP 2.96 tok/round |
+| Text-only regression (same build) | 124–146 tok/s, unchanged |
+
+Probe coverage (all exact): embedded title text, embedded digits, shape/color/position
+questions, multi-turn conversations carrying an image with prefix reuse. Measured MTP
+acceptance with the visual alignment vs without (6 paired variants, full prefill each):
+2.890 vs 2.883 tok/round — inside run-to-run noise; the MTP stem's packed input is half
+target hidden states, which already carry the image semantics. Video is not supported
+by design scope; the 32,768 merged-token cap is unchanged.
+
 ## Model artifact provenance
 
 The measured artifact is `qwen3_8_27b_w4a4w8a8.ninfer` (21.0 GiB, 1,097 tensors), recipe
@@ -107,10 +146,18 @@ The measured artifact is `qwen3_8_27b_w4a4w8a8.ninfer` (21.0 GiB, 1,097 tensors)
 ```
 src/core/tp_comm.{h,cu}                  NCCL transport backend
 src/ops/wrapper/shard_extent.h           runtime shard geometry
+src/ops/{attn,gdn}_input_proj/nvfp4/*sm70*   SM70 NVFP4 decode fast path (2026-10-04)
+src/ops/kernel/swa_volta.cuh             Volta GQA attention (2026-10-01)
+src/targets/qwen3_6/impl/vision/         vision bindings; tp4 staging lives in
+                                         impl/runtime/{text_context,text_prefill_impl,mtp_impl}.h
+src/targets/qwen3_6_27b/impl/load/       per-variant load plans (incl. QUASAR, 2026-10-04)
 tests/ops/test_allreduce_nccl4.cpp       4-GPU collective test (opt-in; <4 GPUs → skip 77)
 tests/ops/test_tp4_issue_probe.cpp       caller-duty regression probe
+tests/targets/qwen3_6_27b/test_{quasar,dflash2_v3}_load_plan.cpp
+                                         artifact load-plan tests (2026-10-04)
 tools/convert/qwen3_8_27b/               W4A4W8A8 artifact conversion + replay verification
-docs/tp4/                                build guide, history, RCA, reference build config, scripts
+docs/tp4/                                build guide, history, RCA, vision write-up,
+                                         reference build config (incl. vision build), scripts
 ```
 
 ## License

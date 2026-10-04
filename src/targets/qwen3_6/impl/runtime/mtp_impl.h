@@ -272,7 +272,8 @@ inline void mtp_proposal_input_probe(const ExecutionContext& ec,
 
 void mtp_bridge_tp2(PrefillContext& state, const Tensor& next_token,
                      const Tensor& previous_hidden, std::int32_t position,
-                     std::span<const std::int32_t> rope_position, bool build_proposal) {
+                     std::span<const std::int32_t> rope_position, bool build_proposal,
+                     const Tensor* visual_embedding) {
     TpPeers peers = tp_executions(state.execution);
     // Every non-zero rank runs the bridge over ITS OWN MTP KV window and its own weight shards.
     // The bridge is not a rank-0-only prelude: the MTP module's projections are split across the
@@ -301,6 +302,47 @@ void mtp_bridge_tp2(PrefillContext& state, const Tensor& next_token,
     }
     state.execution.work.reset();
     const auto restored = resume_hidden(state.execution, previous_hidden);
+    // Per-rank MTP stem inputs when the bridge token is a MEDIA token. Allocation is ordered after
+    // the arena resets above, and the source lives in rank 0's Vision transient (not in the work
+    // arena), so the reset cannot invalidate it. The embedding side is ranks [0, tp/2): rank 0
+    // owns the composed embedding and the others pull a copy ordered by one event.
+    TpArray<const Tensor*> bridge_embeddings{};
+    TpArray<Tensor> bridge_embedding_storage{};
+    if (visual_embedding != nullptr) {
+        if (visual_embedding->dtype != DType::BF16 || !visual_embedding->is_contiguous() ||
+            visual_embedding->data == nullptr ||
+            visual_embedding->numel() != static_cast<std::int64_t>(TextConfig::hidden)) {
+            throw std::invalid_argument(
+                "MTP bridge embedding must be contiguous BF16 [hidden,1]");
+        }
+        bridge_embedding_storage[0] = *visual_embedding;
+        bridge_embeddings[0]        = &bridge_embedding_storage[0];
+        const std::int32_t half     = ec.tp / 2;
+        if (half > 1) {
+            cudaEvent_t bridge_ready = nullptr;
+            CUDA_CHECK(cudaEventCreateWithFlags(&bridge_ready, cudaEventDisableTiming));
+            {
+                const CurrentDevice restore;
+                CUDA_CHECK(cudaSetDevice(state.execution.device.device));
+                CUDA_CHECK(cudaEventRecord(bridge_ready, state.execution.device.stream));
+                for (std::int32_t rank = 1; rank < half; ++rank) {
+                    const TpPeerCore* lane =
+                        state.execution.peer_at(static_cast<std::size_t>(rank));
+                    if (lane == nullptr) { continue; }
+                    const auto slot = static_cast<std::size_t>(rank);
+                    CUDA_CHECK(cudaSetDevice(lane->device->device));
+                    bridge_embedding_storage[slot] =
+                        lane->work->alloc(DType::BF16, {TextConfig::hidden, 1});
+                    CUDA_CHECK(cudaStreamWaitEvent(lane->device->stream, bridge_ready, 0));
+                    CUDA_CHECK(cudaMemcpyAsync(bridge_embedding_storage[slot].data,
+                                               visual_embedding->data, visual_embedding->bytes(),
+                                               cudaMemcpyDeviceToDevice, lane->device->stream));
+                    bridge_embeddings[slot] = &bridge_embedding_storage[slot];
+                }
+            }
+            CUDA_CHECK(cudaEventDestroy(bridge_ready));
+        }
+    }
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.execution.rope_frequency, state.text_kv,
                      state.execution.linear_attention, state.execution.io,
@@ -327,7 +369,8 @@ void mtp_bridge_tp2(PrefillContext& state, const Tensor& next_token,
     mtp_stage_barrier(state.execution, "bridge: entered");
     card.mtp_forward_batch(next_token, restored, positions, rope, {visible, visible}, ar_hidden,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
-                           build_proposal ? &draft0 : nullptr);
+                           build_proposal ? &draft0 : nullptr,
+                           visual_embedding != nullptr ? &bridge_embeddings : nullptr);
     mtp_stage_barrier(state.execution, "bridge: forward batch + proposal argmax");
     if (build_proposal) {
         for_each_rank(ec, [&](int rank) {
@@ -388,10 +431,13 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
         throw std::logic_error("MTP bridge proposal extent is outside the configured window");
     }
     if (state.execution.peer_at(1) != nullptr) {
-        if (next_embedding != nullptr) {
-            throw std::logic_error("tensor-parallel MTP bridge supports text inputs only");
-        }
-        mtp_bridge_tp2(state, next_token, previous_hidden, position, rope_position, build_proposal);
+        // A media bridge token arrives as a composed [hidden,1] embedding on rank 0 (the Vision
+        // session's device). `mtp_bridge_tp2` stages it onto the other EMBEDDING-SIDE ranks the
+        // same way the multimodal prefill stages its residual, because tp > 2 opens no peer
+        // access: without that, a reused prefix ending exactly at a media token used to fail the
+        // request outright (\"tensor-parallel MTP bridge supports text inputs only\").
+        mtp_bridge_tp2(state, next_token, previous_hidden, position, rope_position, build_proposal,
+                       next_embedding);
         return;
     }
     state.execution.work.reset();

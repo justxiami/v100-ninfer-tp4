@@ -56,19 +56,22 @@ void require_supported_tp_features(const EngineOptions& options) {
     // the draft head is vocabulary-split with an allgather before the proposal argmax, and the GDN
     // verify round records and folds per device. DFlash has a separate split-aware proposal path;
     // its rank-0-only selector gather is deliberately not a full bidirectional all-gather.
-    // The Vision encoder runs entirely on the primary device against replicated weights and has no
-    // split path; the target layer states the same rule (layouts_impl.h validate_target_options).
-    if (options.enable_vision) {
-        throw std::invalid_argument("tp > 1 does not support Vision in this build; use --tp 1");
-    }
+    // Vision is deliberately NOT rejected here: the encoder weights are replicated onto every
+    // rank (shard map `vision/*` -> Replicated, qwen3_6_27b load bindings.cpp); the single
+    // Vision session encodes on rank 0 and a media-bearing chunk copies its residual to the
+    // peers (text_context_impl.h prefill_impl_tp2). DFlash+Vision remains mutually exclusive;
+    // that constraint is enforced in layouts_impl.h validate_target_options. (2026-10-04/05:
+    // opened for TP2/TP4 vision, image-only in practice,
+    // ~/work/docs/ninfer_vision_tp4_2026-10-04.md)
     // DFlash's proposal path is rank0-centric by construction (gather_columns_rank0 /
-    // broadcast_rank0, the selector image rank 0 alone consumes). There is no rank0 generalization
-    // above two ranks, so refuse instead of running a two-rank protocol on a four-rank context --
-    // those two ops throw for tp > 2 as a second line of defence. MTP has no such assumption.
-    if (options.tp > 2 && options.speculative.backend == SpeculativeBackend::DFlash) {
-        throw std::invalid_argument(
-            "--spec dflash is a two-rank path; it is not supported at tp > 2 (use --spec mtp)");
-    }
+    // broadcast_rank0, the selector image rank 0 alone consumes). The `tp > 2` rejection that
+    // lived here was written 10/01 against the two-rank protocol (both ops then threw for
+    // tp > 2). The N-rank generalization landed 10/02: the ops loop over ec.tp, the dflash_impl.h
+    // call sites loop rank 1..tp-1 with per-rank work/model peers, and PeerEvents holds one
+    // (inputs_ready, pull_done) event pair per rank for all ranks. The guard was therefore
+    // removed 10/02 (takeover, ~/work/docs/ninfer_tp4_dflash_blockers_2026-10-02.md D1); tp4
+    // DFlash correctness is established by the serve smoke + bench A/B + the seed/greedy parity
+    // probe in ab_tp4_dflash.sh, not by this statement. MTP has no such assumption.
 }
 
 // Resolves EngineOptions.tp/.device/.devices into the device id list ExecutionContext should

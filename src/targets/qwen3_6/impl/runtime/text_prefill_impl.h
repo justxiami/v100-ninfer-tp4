@@ -97,11 +97,22 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
     if (state.dflash != nullptr) {
         throw std::logic_error("DFlash staged multimodal prefill is unavailable");
     }
+    // Same rank wiring as `prefill_text_chunk`: without the peers the card falls back to the
+    // single-device leaf ops, which reject per-rank sharded GDN weights at tp > 1.
+    // (2026-10-05: opened for TP2/TP4 vision, ~/work/docs/ninfer_vision_tp4_2026-10-04.md)
+    TpPeers peers = tp_executions(state.execution);
+    for (std::size_t r = 1; r < peers.size(); ++r) {
+        if (!peers[r].has_value()) { continue; }
+        peers[r]->mtp_kv = state.mtp_kv_peers[r];
+        if (peers[r]->mtp_kv.valid() != state.mtp_kv.valid()) {
+            throw std::logic_error("tensor-parallel MTP KV windows disagree between ranks");
+        }
+    }
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.execution.rope_frequency, state.text_kv,
                      state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache, peers);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);

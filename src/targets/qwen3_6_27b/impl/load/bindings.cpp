@@ -44,6 +44,7 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
         return NumericFormat::Q6G64_F16S;
     case WeightsProfile::Qwen38GroupwiseInt:
     case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38QuasarNvfp4:
         return NumericFormat::W8G32_F16S;
     case WeightsProfile::Qwen38Nvfp4:
         return NumericFormat::FP8_E4M3FN_ROW_BF16S;
@@ -227,10 +228,20 @@ load_attention_projection(const FullAttentionPlan& plan,
         };
     }
     const auto& fused = std::get<FusedAttentionProjectionPlan>(plan.projection);
-    return FusedAttentionProjectionPayload{
+    FusedAttentionProjectionPayload out{
         .query_key_gate_value =
             materialized_weight(materialized, fused.query_key_gate_value, 14336 / tp, 5120, device),
     };
+#ifdef NINFER_VOLTA_BUILD
+    // [local patch 2026-10-04, ported from upstream e27de9bf] The SM70 QPN fast path
+    // (nvfp4_attn_input_sm70.cu) reads this weight in the pre-packed QPN layout; without the
+    // prepack the kernel mis-reads raw NVFP4 data and decode diverges from prefill-correct
+    // numerics (10/04 bit test: coherent output diverging @char 483 vs upstream, deterministic).
+    if (out.query_key_gate_value.qtype == QType::NVFP4) {
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.query_key_gate_value);
+    }
+#endif
+    return out;
 }
 
 GdnInputProjectionPayload
@@ -245,10 +256,18 @@ load_gdn_input_projection(const GdnPlan& plan, const artifact::MaterializedArtif
         };
     }
     const auto& fused = std::get<FusedGdnInputProjectionPlan>(plan.input_projection);
-    return FusedGdnInputProjectionPayload{
+    FusedGdnInputProjectionPayload out{
         .query_key_value_z =
             materialized_weight(materialized, fused.query_key_value_z, 16384 / tp, 5120, device),
     };
+#ifdef NINFER_VOLTA_BUILD
+    // [local patch 2026-10-04, ported from upstream e27de9bf] Same QPN-layout contract as the
+    // attention input projection (see load_attention_projection).
+    if (out.query_key_value_z.qtype == QType::NVFP4) {
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.query_key_value_z);
+    }
+#endif
+    return out;
 }
 
 GdnControlProjectionPayload
@@ -643,6 +662,13 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
     // geometry for its selector/codebooks and costs less than one Q4 target layer per rank.
     if (object.find("dflash/") != std::string_view::npos) { return {}; }
 
+    // Vision tower: replicated on every rank (shard map `vision/*` -> Replicated), same
+    // treatment as the dflash payload above. At tp > 1 the single Vision session lives on the
+    // prefill driver's device (rank 0) and encodes each media item once; the peers receive the
+    // scanned residual, not their own encode. (2026-10-04/05: opened for TP2/TP4 vision,
+    // ~/work/docs/ninfer_vision_tp4_2026-10-04.md)
+    if (object.find("vision/") != std::string_view::npos) { return {}; }
+
     // GDN depthwise conv1d weight: channel-split, NOT replicated.
     //
     // Artifact shape is [4, 10240]: 4 taps x convolution_dim channels, i.e. the CHANNEL axis is
@@ -934,12 +960,18 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                     " device(s) but bind_artifact was asked for tp " +
                                     std::to_string(tp));
     }
+    const bool quasar = weights_profile == WeightsProfile::Qwen38QuasarNvfp4;
+    if (quasar && tp != 2 && tp != 4) {
+        throw std::invalid_argument("qwen3.8-27b/quasar-nvfp4 supports TP2/TP4 only");
+    }
     if (tp > 1) {
-        if (features.vision) {
-            // The vision tower is out of scope for TP2 and has no shard map, so reject here
-            // rather than silently replicating a 4.6 GB backbone onto both devices.
-            throw std::invalid_argument("qwen3_6_27b: vision is not supported with tp > 1");
-        }
+        // Vision is admissible at tp > 1: every `vision/` object resolves to Replicated in the
+        // shard map below (full copy on each rank). The media item is encoded ONCE, on rank 0
+        // (the prefill driver owns the single Vision session), and a media-bearing chunk hands
+        // the peers its finished residual over their own streams. The quantized QUASAR/NVFP4
+        // tower costs ~0.3 GB per rank, not the 4.6 GB BF16 figure the original tp2 rejection
+        // was written against. (2026-10-04/05: opened for TP2/TP4 vision, image-only in
+        // practice, ~/work/docs/ninfer_vision_tp4_2026-10-04.md)
         const TextConfig config{};
         binder.set_shard_resolver([config, tp, weights_profile](std::string_view name) {
             return shard_placement(name, tp, config, weights_profile);
@@ -969,6 +1001,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     case WeightsProfile::Qwen36Nvfp4:
         bind_nvfp4_text_layers(binder, out);
         break;
+    case WeightsProfile::Qwen38QuasarNvfp4:
     case WeightsProfile::Qwen38Nvfp4:
         bind_qwen38_fused_text_layers(binder, out, false);
         break;
@@ -1018,14 +1051,17 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         .format = out.mtp_format};
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {5120});
 
-    // Optional Qwen3.8 DFlash2 draft package.  All checkpoint tensors are BF16 and are kept in
-    // the same .ninfer container as the Q4_K target weights; ValidateOnly is used when another
-    // speculative backend is selected so the artifact remains a single registered identity.
+    // Optional Qwen3.8 DFlash2 package: native GGUF-derived artifacts carry BF16 projections;
+    // official NVFP4 v3 carries W8 projections. Norms, convolution and selector stay BF16.
+    // Disabled draft objects are validated without making them resident.
     const bool has_dflash2 = binder.has_tensor("dflash/feature_projection");
     if (features.dflash() && !has_dflash2) {
         throw std::invalid_argument("qwen3.8-27b: --spec dflash requires the DFlash2 package in the artifact");
     }
     if (has_dflash2) {
+        out.dflash.projection_format =
+            (weights_profile == WeightsProfile::Qwen38Nvfp4 || quasar)
+                ? NumericFormat::W8G32_F16S : NumericFormat::BF16;
         const artifact::TensorPlacement dflash_placement =
             features.dflash() ? artifact::TensorPlacement::Device
                                : artifact::TensorPlacement::ValidateOnly;
@@ -1034,19 +1070,24 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
             return artifact::bind_tensor(binder, name, NumericFormat::BF16, shape,
                                          dflash_placement);
         };
-        out.dflash.feature_projection = bind_dflash("dflash/feature_projection", {5120, 25600});
+        const auto bind_projection = [&](std::string_view name,
+                                          std::initializer_list<std::uint64_t> shape) {
+            return artifact::bind_tensor(binder, name, out.dflash.projection_format, shape,
+                                         dflash_placement);
+        };
+        out.dflash.feature_projection = bind_projection("dflash/feature_projection", {5120, 25600});
         out.dflash.context_norm       = bind_dflash("dflash/context_norm", {5120});
         for (std::size_t layer = 0; layer < out.dflash.layers.size(); ++layer) {
             auto& target = out.dflash.layers[layer];
             const std::string prefix = "dflash/layers/" + std::to_string(layer) + "/";
             target.input_norm = bind_dflash(prefix + "input_norm", {5120});
-            target.query_key_value = bind_dflash(prefix + "attention/query_key_value", {6144, 5120});
+            target.query_key_value = bind_projection(prefix + "attention/query_key_value", {6144, 5120});
             target.query_norm = bind_dflash(prefix + "attention/query_norm", {128});
             target.key_norm = bind_dflash(prefix + "attention/key_norm", {128});
-            target.attention_output = bind_dflash(prefix + "attention/output", {5120, 4096});
+            target.attention_output = bind_projection(prefix + "attention/output", {5120, 4096});
             target.post_attention_norm = bind_dflash(prefix + "post_attention_norm", {5120});
-            target.gate_up = bind_dflash(prefix + "mlp/gate_up", {34816, 5120});
-            target.down = bind_dflash(prefix + "mlp/down", {5120, 17408});
+            target.gate_up = bind_projection(prefix + "mlp/gate_up", {34816, 5120});
+            target.down = bind_projection(prefix + "mlp/down", {5120, 17408});
             target.attention_conv_base_kernel = bind_dflash(
                 prefix + "attention_conv/base_kernel", {5120, 2, 2});
             target.attention_conv_kernel_projection = bind_dflash(
@@ -1249,7 +1290,7 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
     if (plan.features.dflash()) {
         auto& draft = runtime.dflash.emplace();
         draft.feature_projection = artifact::materialized_weight(
-            backing, plan.dflash.feature_projection, NumericFormat::BF16, 5120, 25600, device);
+            backing, plan.dflash.feature_projection, plan.dflash.projection_format, 5120, 25600, device);
         draft.context_norm = artifact::materialized_tensor(backing, plan.dflash.context_norm,
                                                             NumericFormat::BF16, {5120}, device);
         for (std::size_t layer = 0; layer < draft.layers.size(); ++layer) {
@@ -1257,22 +1298,23 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
             auto& target = draft.layers[layer];
             target.input_norm = artifact::materialized_tensor(backing, source.input_norm,
                                                                 NumericFormat::BF16, {5120}, device);
-            target.query_key_value = artifact::materialized_weight(
-                backing, source.query_key_value, NumericFormat::BF16, 6144, 5120, device);
-            target.context_key = row_view(target.query_key_value, 4096, 1024);
-            target.context_value = row_view(target.query_key_value, 5120, 1024);
+            const Weight packed = artifact::materialized_weight(
+                backing, source.query_key_value, plan.dflash.projection_format, 6144, 5120, device);
+            target.query = row_view(packed, 0, 4096);
+            target.key = row_view(packed, 4096, 1024);
+            target.value = row_view(packed, 5120, 1024);
             target.query_norm = artifact::materialized_tensor(backing, source.query_norm,
                                                                 NumericFormat::BF16, {128}, device);
             target.key_norm = artifact::materialized_tensor(backing, source.key_norm,
                                                              NumericFormat::BF16, {128}, device);
             target.attention_output = artifact::materialized_weight(
-                backing, source.attention_output, NumericFormat::BF16, 5120, 4096, device);
+                backing, source.attention_output, plan.dflash.projection_format, 5120, 4096, device);
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {5120}, device);
             target.gate_up = artifact::materialized_weight(backing, source.gate_up,
-                                                            NumericFormat::BF16, 34816, 5120, device);
+                                                            plan.dflash.projection_format, 34816, 5120, device);
             target.down = artifact::materialized_weight(backing, source.down,
-                                                        NumericFormat::BF16, 5120, 17408, device);
+                                                        plan.dflash.projection_format, 5120, 17408, device);
             target.attention_conv_base_kernel = artifact::materialized_tensor(
                 backing, source.attention_conv_base_kernel, NumericFormat::BF16, {5120, 2, 2}, device);
             target.attention_conv_kernel_projection = artifact::materialized_weight(
@@ -1293,17 +1335,20 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
     }
 
     if (plan.features.vision) {
-        if (tp != 1) {
-            throw std::invalid_argument(
-                "qwen3_6_27b: Vision has no tensor-parallel forward path yet");
-        }
+        // Vision at tp > 1: the tower is replicated per rank (shard map `vision/*` -> Replicated),
+        // so each rank materializes its own full copy on ITS device and encodes media locally in
+        // the SPMD prefill path. Passing `device` here is load-bearing: materialized_* default to
+        // device 0, so omitting it would point ranks 1..3 at device 0's copy.
+        // (2026-10-04/05: opened for TP2/TP4 vision, ~/work/docs/ninfer_vision_tp4_2026-10-04.md)
         auto& vision  = runtime.vision.emplace();
         vision.common = qwen3_6::materialize_vision_common(
-            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
+            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm,
+            device);
         vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
-                                                               NumericFormat::W8G32_F16S, 5120, 4608);
+                                                               NumericFormat::W8G32_F16S, 5120, 4608,
+                                                               device);
         vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
-                                                               NumericFormat::BF16, {5120});
+                                                               NumericFormat::BF16, {5120}, device);
     }
 }
 

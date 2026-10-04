@@ -308,12 +308,13 @@ public:
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
-                             Tensor& target_tokens);
+                             Tensor& target_tokens, bool greedy_target = false);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
-                             Tensor& target_tokens, DFlashFeatureSink& sink);
+                             Tensor& target_tokens, DFlashFeatureSink& sink,
+                             bool greedy_target = false);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -352,7 +353,8 @@ public:
                              ops::GqaExecutionEnvelope envelope,
                              const TpArray<Tensor>& hidden,
                              const TpArray<Tensor>& logits,
-                             const TpArray<Tensor>& target_tokens);
+                             const TpArray<Tensor>& target_tokens,
+                             bool greedy_target = false);
     void target_verify_batch(const TpArray<Tensor>& ids,
                              const TpArray<Tensor>& cache_positions,
                              const TpArray<Tensor>& rope_positions,
@@ -363,7 +365,10 @@ public:
                              const TpArray<Tensor>& hidden,
                              const TpArray<Tensor>& logits,
                              const TpArray<Tensor>& target_tokens,
-                             DFlashFeatureSink& sink);
+                             DFlashFeatureSink& sink, bool greedy_target = false);
+    // NOTE (10/02 tp4 port): the greedy per-shard argmax route (theirs' target_argmax_tp2) is not
+    // ported yet; the full-logit overload above remains the only verify route (correct, matches
+    // the production MTP path). The shard-argmax optimization is a follow-up performance item.
     void mtp_forward_decode_batch(const Tensor& ids, const TpArray<Tensor>& hidden,
                                   const TpArray<Tensor>& cache_positions,
                                   const TpArray<Tensor>& rope_positions,
@@ -378,7 +383,8 @@ public:
                            const TpArray<Tensor>& rope_positions,
                            ops::GqaExecutionEnvelope envelope,
                            const TpArray<Tensor>& mtp_hidden, int logits_column,
-                           const TpArray<Tensor>* logits, Tensor* draft_token);
+                           const TpArray<Tensor>* logits, Tensor* draft_token,
+                           const TpArray<const Tensor*>* input_embeddings = nullptr);
     void mtp_forward_ar_step(const Tensor& token, const TpArray<Tensor>& previous_hidden,
                              const TpArray<Tensor>& position,
                              ops::GqaExecutionEnvelope envelope,
@@ -539,7 +545,8 @@ private:
     // rank 1's the NORMALIZED HIDDEN half, so device 1 never embeds a token in the MTP stem.
     void mtp_forward_stem_tp2(const Tensor& ids, const TpArray<Tensor>& hidden,
                               TpArray<Tensor>& x, TpArray<Tensor>& ah,
-                              const TpArray<Tensor>& staging);
+                              const TpArray<Tensor>& staging,
+                              const TpArray<const Tensor*>* input_embeddings = nullptr);
     void mtp_forward_tail_tp2(TpArray<Tensor>& x, const TpArray<Tensor>& ah,
                               const TpArray<Tensor>& positions,
                               const TpArray<Tensor>& rope_positions,
@@ -550,13 +557,15 @@ private:
                               const TpArray<Tensor>& positions,
                               const TpArray<Tensor>& rope_positions,
                               ops::GqaExecutionEnvelope envelope,
-                              const TpArray<Tensor>& mtp_hidden);
+                              const TpArray<Tensor>& mtp_hidden,
+                              const TpArray<const Tensor*>* input_embeddings = nullptr);
     void mtp_prefill_chunk_tp2(const Tensor& ids, const TpArray<Tensor>& hidden,
                                const TpArray<Tensor>& positions,
                                const TpArray<Tensor>& rope_positions,
                                ops::GqaExecutionEnvelope envelope, bool final_chunk,
                                const TpArray<Tensor>* final_hidden,
-                               const TpArray<Tensor>* logits, Tensor* draft_token);
+                               const TpArray<Tensor>* logits, Tensor* draft_token,
+                               const TpArray<const Tensor*>* input_embeddings = nullptr);
     // Vocabulary-split proposal head: each rank computes its own half of the proposal logits and
     // one allgather leaves the FULL vector on both, because the winning row is a GLOBAL argmax
     // that can land in either half and `draft_head_token_ids` is replicated for exactly that
@@ -616,7 +625,8 @@ private:
     [[nodiscard]] PrefillChunkResult prefill_impl_tp2(std::span<const int> ids,
                                                  const TextPrefill& text_prefill,
                                                  bool finalize_at_end,
-                                                 DFlashFeatureSink* dflash_sink = nullptr);
+                                                 DFlashFeatureSink* dflash_sink = nullptr,
+                                                 const MultimodalPrefill* multimodal = nullptr);
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;

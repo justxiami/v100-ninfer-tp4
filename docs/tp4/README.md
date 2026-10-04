@@ -15,8 +15,10 @@ with a second instance.
 | `changelog.md` | Full technical history (W1 → W6): design decisions, failures, root causes |
 | `README_tp4_mtp_rca_2026-10-01.md` | Root-cause analysis of the tp4 MTP (draft) acceptance problem and its fixes |
 | `tokenizer-oklogk.md` | Tokenizer BPE O(k²) → O(k·log k) fix: root cause + semantic verification |
+| `vision-tp4-2026-10-05.md` | tp4 vision (images) port write-up (2026-10-05): the six tp>1+vision gates, per-rank staging, MTP visual alignment, paired A/B measurement |
 | `build-config/build.ninja` | Complete build graph + exact compiler flags of the reference build |
 | `build-config/CMakeCache.txt` | Actual values of all CMake options of the reference build |
+| `build-config/vision/` | Same, for the reference **vision** build (`build-v100-tp4-vision`, 2026-10-05) |
 | `scripts/` | Regression gate + tp4 diagnostics: tp2 A/B serve gate, MTP diff/quality/repro, determinism, transport A/B (`tp4_transport_ab.cu`) |
 
 > Paths inside `build-config/` are scrubbed: `$HOME` marks the original author's home
@@ -78,3 +80,29 @@ Per-batch TP2 regression gate (serve A/B; pass criteria include `graph-nodes=256
 With four free V100s: `ninfer-serve --tp 4 --devices 0,1,2,3`. Reference runs used int8
 KV and 131072 max context; exact reference commands and acceptance data are in
 `changelog.md` (W6) and `scripts/`.
+
+## Vision build (added 2026-10-05)
+
+The production build is the **vision** build: same tree, same CMake parameters, separate
+build directory.
+
+```bash
+cmake -S . -B build-v100-tp4-vision -G Ninja <same options as build-v100-tp4>
+ninja -C build-v100-tp4-vision ninfer-serve -j4
+```
+
+Serve it with `--vision` (images only; no video by design scope). The vision tower ships
+inside the `.ninfer` artifact (333 objects / 0.30 GB for the reference model); a
+vision-tower-less artifact still serves text with `--vision` on.
+
+- The tp4 staging is in `src/targets/qwen3_6/impl/runtime/` (text_context / text_prefill
+  / mtp): one Vision session on rank 0, event-ordered D2D residual to every peer
+  (tp4 has no peer access), per-rank MTP alignment + bridge visual embeddings.
+- Text-only behavior is byte-identical without `--vision`; with `--vision` the text
+  path is unchanged (probe-verified).
+- Full write-up, including the paired acceptance A/B and the cross-tree bit-comparison
+  pitfall: [`vision-tp4-2026-10-05.md`](vision-tp4-2026-10-05.md).
+
+Note: since 2026-10-04 the tree also carries the SM70 NVFP4 decode fast path
+(`src/ops/{attn,gdn}_input_proj/nvfp4/*sm70*`, QPN/CUTLASS kernels + load-side
+prepack). It builds with the same CUTLASS dependency listed above; no extra options.
