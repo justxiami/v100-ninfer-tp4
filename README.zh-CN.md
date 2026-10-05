@@ -2,6 +2,13 @@
 
 [English](README.md) · [构建指南](docs/tp4/README.md) · [技术史](docs/tp4/changelog.md)
 
+## TL;DR / 一句话简介
+
+**中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill 3.4k tok/s、128k int8 KV 下每卡 ~9.4 GiB.
+
+**EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, 3.4k tok/s prefill, ~9.4 GiB/GPU at 128k int8 KV.
+
+
 在 **4 × Tesla V100-SXM2 16 GB**（`sm_70` / Volta，CUDA 12.8）上用 4 路张量并行
 跑单实例 Qwen3.8-27B 推理。**2026-10-05 起支持多模态（图像）**；纯文本路径保持
 字节级不变，作为每批改动的回归闸门。
