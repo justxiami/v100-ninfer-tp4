@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/program.h"
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
+#include "targets/qwen3_6/impl/runtime/volta_long_attention_switch.h"
 #include "targets/qwen3_6/impl/runtime/yarn_rope.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
@@ -89,11 +90,17 @@ schedule::MtpGqaEnvelopes mtp_gqa_envelopes(std::uint32_t max_frontier, std::uin
     const auto visible = [capacity](std::uint64_t value) {
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, value));
     };
+    // [port1013] 长上下文 decode 路由的开关在**构造 envelope 处**取值：envelope 是 launcher 与
+    // CUDA 图 profile 的唯一输入，所以这一处置位就同时覆盖「运行时发射」与「图捕获」两条路。
+    // 关闭时该字段为 false ⇒ gqa_volta_long_i8_splits 返回 0 ⇒ 与基线逐位同路。
+    const bool long_target = volta_long_attention_target();
+    const bool long_draft  = volta_long_attention_draft();
     schedule::MtpGqaEnvelopes out;
-    out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + 1ULL)};
+    out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + 1ULL), long_target};
     out.batch         = out.target_verify;
     for (std::uint32_t step = 0; step + 1 < k; ++step) {
-        out.ar[step] = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + step + 2ULL)};
+        out.ar[step] = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + step + 2ULL),
+                        long_draft};
     }
     return out;
 }
@@ -864,6 +871,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         sequence.mtp_draft_count   = 0;
         sequence.tail_hidden_valid = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
+        sequence.ledger_prompt_tokens = prompt_tokens;
+        // The ledger now holds a DIFFERENT token sequence, and it may be longer than the previous
+        // request's, in which case `sync` cannot notice by length alone (lookup_draft.h `reset`).
+        sequence.lookup_index.reset();
         sequence.prefix_identity.assign(prompt);
 
         if (speculative_backend == SpeculativeBackend::DFlash) {
@@ -1148,6 +1159,19 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                             mtp_host_egress->next_drafts[step * max_concurrency + row];
                     }
                 }
+                // Debug-only (NINFER_TP4_LOOKUP=1, see lookup_draft.h): keep the backend's own
+                // proposal unless the token ledger already contains a copy of the current suffix,
+                // in which case propose what followed that copy. Host-side and content-only: the
+                // decode graph bakes this ingress record in by ADDRESS and reads its content at
+                // replay, so nothing here costs a re-capture, a kernel, or a numerics change.
+                lookup::apply_lookup_drafts(sequence.lookup_index, lookup::lookup_runtime_config(),
+                                            capacity, sequence.ledger, committed, terminal[row],
+                                            sequence.lane, draft_window, sequence.mtp_drafts.data(),
+                                            sequence.mtp_draft_count);
+                if (terminal[row]) {
+                    lookup::dump_request_ledger(lookup::lookup_runtime_config(), sequence.lane,
+                                                sequence.ledger_prompt_tokens, sequence.ledger);
+                }
             } else {
                 sequence.dflash_context_frontier =
                     terminal[row] ? sequence.execution_frontier : pending.base_E;
@@ -1202,6 +1226,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.execution_frontier = 0;
     sequence.ledger_frontier    = 0;
     sequence.ledger.clear();
+    sequence.ledger_prompt_tokens = 0;
     sequence.prefix_identity.clear();
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;

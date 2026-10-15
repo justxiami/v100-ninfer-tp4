@@ -137,7 +137,10 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     const auto add_shifted = [&](std::uint32_t visible_end, std::uint32_t offset) {
         if (visible_end >= offset) { ends.push_back(visible_end - offset); }
     };
-    for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
+    // [port1013] 加 65536：长档路由（长分段 + FP32 PV）要求 window > 65536，而**图 profile 是按
+    // max 捕获内核选择的** ⇒ 没有这条边界时 20k–32k 的请求会落进「[32761, capacity]」那个 profile、
+    // 按 capacity 选成长档内核（实测 32k 档因此回退 2–5%）。有边界后 ≤65536 与 >65536 各自成 profile。
+    for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U, 65536U}) {
         add_shifted(visible_end, 2 * draft_window);
     }
     // Target verify and MTP batch both have T=K+1 and W=E+K+1. Preserve one concrete INT8

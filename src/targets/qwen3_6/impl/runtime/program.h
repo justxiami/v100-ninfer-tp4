@@ -12,6 +12,7 @@
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+#include "targets/qwen3_6/impl/runtime/lookup_draft.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -169,6 +170,13 @@ struct SequenceState {
     std::uint32_t execution_frontier = 0;
     std::uint32_t ledger_frontier    = 0;
     std::vector<TokenId> ledger;
+    // Where the CURRENT request's prompt ended inside `ledger`. Prefix reuse keeps tokens from
+    // earlier turns in the ledger, so this is the only boundary that separates "given context"
+    // from "generated this turn"; the lookup drafter's diagnostics dumps it verbatim.
+    std::uint32_t ledger_prompt_tokens = 0;
+    // Host-side n-gram index over `ledger` (lookup_draft.h). Debug-gated: it stays unallocated and
+    // unread unless NINFER_TP4_LOOKUP=1.
+    lookup::LookupDraftIndex lookup_index;
     qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
     std::int32_t rope_delta               = 0;
     std::uint32_t text_kv_valid           = 0;

@@ -216,6 +216,24 @@ __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][
     }
 }
 
+// [prefetch 臂] 与 readout_and_store 同构，但 q 的 lane 由调用方预取后传入。
+template <bool Normalize>
+__device__ __forceinline__ void readout_and_store_pre(float (&state)[kDvPerWarp][kQkPerLane],
+                                                      QkLane q, __nv_bfloat16* output,
+                                                      std::uint32_t dv_base, int lane, float scale) {
+    normalize_qk_lane<Normalize>(q.value, lane);
+    float attn_val = 0.0f;
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        float partial = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * q.value[c]; }
+        partial = warp_sum<kWarpSize>(partial);
+        if (lane == r) { attn_val = partial; }
+    }
+    if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
+}
+
 template <bool Normalize, typename QK>
 __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQkPerLane],
                                                   const QK* query, __nv_bfloat16* output,
@@ -261,23 +279,38 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                      dqk_base);
     }
 
-    QkLane key = load_recurrent_qk(k + static_cast<std::int64_t>(h_qk) * kStateDim, dqk_base);
+    // [prefetch 臂] token 0 的输入先全部发出去，循环内只消费与「为 token+1 发射」。
+    QkLane            key   = load_recurrent_qk(k + static_cast<std::int64_t>(h_qk) * kStateDim, dqk_base);
     normalize_qk_lane<NormalizeQK>(key.value, lane);
-    for (std::int32_t token = 0; token < width; ++token) {
-        const std::int64_t column = token;
-        const RawGatePair gate    = load_source_gate(g, beta, column * heads.H_v + h_v);
-        const RawValueLane value =
-            load_value_lane(v + (column * heads.H_v + h_v) * kStateDim, lane, dv_base);
-        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+    RawGatePair       gate  = load_source_gate(g, beta, h_v);
+    RawValueLane      value = load_value_lane(v + static_cast<std::int64_t>(h_v) * kStateDim, lane, dv_base);
+    QkLane            qcur  = load_recurrent_qk(q + static_cast<std::int64_t>(h_qk) * kStateDim, dqk_base);
 
+    for (std::int32_t token = 0; token < width; ++token) {
+        // 先为下一 token 发全部装载（都不依赖 state），再算本 token。
+        RawGatePair  gate_n{};
+        RawValueLane value_n{};
+        QkLane       key_n{};
+        QkLane       q_n{};
         if (token + 1 < width) {
-            key = load_recurrent_qk(k + ((column + 1) * heads.H_qk + h_qk) * kStateDim, dqk_base);
-            normalize_qk_lane<NormalizeQK>(key.value, lane);
+            const std::int64_t col_n = token + 1;
+            gate_n  = load_source_gate(g, beta, col_n * heads.H_v + h_v);
+            value_n = load_value_lane(v + (col_n * heads.H_v + h_v) * kStateDim, lane, dv_base);
+            key_n   = load_recurrent_qk(k + (col_n * heads.H_qk + h_qk) * kStateDim, dqk_base);
+            normalize_qk_lane<NormalizeQK>(key_n.value, lane);
+            q_n     = load_recurrent_qk(q + (col_n * heads.H_qk + h_qk) * kStateDim, dqk_base);
         }
 
-        readout_and_store<NormalizeQK>(state, q + (column * heads.H_qk + h_qk) * kStateDim,
-                                       out + (column * heads.H_v + h_v) * kStateDim, dqk_base,
-                                       dv_base, lane, scale);
+        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+        readout_and_store_pre<NormalizeQK>(state, qcur,
+                                           out + static_cast<std::int64_t>(token) * heads.H_v * kStateDim
+                                               + static_cast<std::int64_t>(h_v) * kStateDim,
+                                           dv_base, lane, scale);
+
+        key   = key_n;
+        gate  = gate_n;
+        value = value_n;
+        qcur  = q_n;
     }
 
     float* write_h = state_write + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
