@@ -4,9 +4,10 @@
 
 ## TL;DR / 一句话简介
 
-**中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill 3.4k tok/s、128k int8 KV 下每卡 ~9.4 GiB.
+**中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill 3.4k tok/s、128k int8 KV 下每卡 ~9.4 GiB。
+长注意力 decode 路由 + MTP4（2026-10-15）：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**。
 
-**EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, 3.4k tok/s prefill, ~9.4 GiB/GPU at 128k int8 KV.
+**EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, 3.4k tok/s prefill, ~9.4 GiB/GPU at 128k int8 KV. Long-attention decode routing + MTP4 (2026-10-15): pi-shaped 120k decode **96.0 → 109.1 tok/s (1.136x)**.
 
 
 在 **4 × Tesla V100-SXM2 16 GB**（`sm_70` / Volta，CUDA 12.8）上用 4 路张量并行
@@ -48,11 +49,18 @@
   `enable_peer_access` 只对 tp2 开）；MTP 对齐窗与 prefix-reuse 的 MTP bridge
   按 rank 分发移位视觉 embedding（仅 embedding 侧 rank）。只支持图像，不支持视频。
   见[视觉专文](docs/tp4/vision-tp4-2026-10-05.md)。
+- **上游 decode 内核回迁 + 长窗路由（2026-10-15）** —— 上游 `861633e8` 的长 decode 内核族
+  （gqa_attention_decode 分裂、int8 KV 量化、GDN recurrent、lookup 草稿）移植进 tp4；
+  `NINFER_TP4_VOLTA_LONG_ATTN` 选路由侧（0 全关 / 1 两侧 / 2 只 target / 3 只草稿头）；
+  长档门 65536 与 KV 分段策略同门槛，CUDA graph profile 边界同步补齐。生产 = MTP4 +
+  只开 target：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**，客户端中位、
+  3 boot × 3 rep、副作用闸全过（≥0.98）。见[decode 回迁专文](docs/tp4/decode-backport-2026-10-15.md)。
 
 技术史（W1→W6）：[`docs/tp4/changelog.md`](docs/tp4/changelog.md) ·
 MTP 根因分析：[`docs/tp4/README_tp4_mtp_rca_2026-10-01.md`](docs/tp4/README_tp4_mtp_rca_2026-10-01.md) ·
 tokenizer 报告：[`docs/tp4/tokenizer-oklogk.md`](docs/tp4/tokenizer-oklogk.md) ·
-tp4 视觉（2026-10-05）：[`docs/tp4/vision-tp4-2026-10-05.md`](docs/tp4/vision-tp4-2026-10-05.md)
+tp4 视觉（2026-10-05）：[`docs/tp4/vision-tp4-2026-10-05.md`](docs/tp4/vision-tp4-2026-10-05.md) ·
+decode 回迁 + 长窗路由（2026-10-15）：[`docs/tp4/decode-backport-2026-10-15.md`](docs/tp4/decode-backport-2026-10-15.md)
 
 ## 实测（本机，tp4 完成态）
 

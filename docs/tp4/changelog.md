@@ -816,3 +816,14 @@ content: 'We need to reply with a short phrase: "PROMised and the user says 'Dia
   回归：tp2 闸门 2562/84.8% ✓、tp4 数数 100%/128.4 t/s ✓、tp4 4-prompt 3/4 逐字相同 ✓。
 - **tp4 batch>1 已测**：`--max-concurrency 4` + 4 并发请求，4 条答案全部正确、接受率 45–100%、
   wall 1.47 s ⇒ 之前悬着的 `next_drafts` 形状/注释不一致在实测下无害。
+
+## 2026-10-15（九续）decode 内核回迁 + 长窗路由落生产：详记见 docs/tp4/decode-backport-2026-10-15.md
+
+- **回迁**：上游 `861633e8`（10/13「optimize long decode」）decode 侧内核族 12 文件补进 tp4；
+  新增 `NINFER_TP4_VOLTA_LONG_ATTN` 侧选开关（0 全关 / 1 两侧 / 2 只 target / 3 只草稿头）。
+- **修两处「图 profile 连带」**：launcher 长档门 16390→65536、MTP 图 profile 边界加 65536。
+  promote 窗（10/15 01:33–02:03，3 boot×2 rep）短档回退 general 0.960 / long32k 0.949 即其影子，该窗判中间态不收。
+- **pi 形状窗（10/15 02:54–03:37，3 boot×3 rep，修复后，客户端中位）**：C1（MTP4+只开 target）
+  pi120k **96.0 → 109.1 tok/s = 1.136×**，闸全过（0.980–1.136）；M3T 主判 1.098 过、pi64k 0.961 挂闸 ⇒ 按判据取 C1。
+- **落生产**：`--draft-tokens 4` + `NINFER_TP4_VOLTA_LONG_ATTN=2`，:8901 重启 10/15 03:51；
+  回滚 = draft 3 + 路由 0（切换脚本一条命令）。

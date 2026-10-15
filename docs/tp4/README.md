@@ -106,3 +106,19 @@ vision-tower-less artifact still serves text with `--vision` on.
 Note: since 2026-10-04 the tree also carries the SM70 NVFP4 decode fast path
 (`src/ops/{attn,gdn}_input_proj/nvfp4/*sm70*`, QPN/CUTLASS kernels + load-side
 prepack). It builds with the same CUTLASS dependency listed above; no extra options.
+## Long-window decode routing (added 2026-10-15)
+
+Reference production launch (tp4, text + vision), env-gated — no new build options:
+
+```
+NINFER_TP4_VOLTA_LONG_ATTN=2 apps/ninfer-serve <artifact>.ninfer \
+  --tp 4 --devices 0,1,2,3 --max-context 204800 --kv-capacity 409600 \
+  --kv-dtype int8 --prefill-chunk 4096 --max-concurrency 2 \
+  --spec mtp --draft-tokens 4 --lm-head-draft --vision
+```
+
+- `NINFER_TP4_VOLTA_LONG_ATTN` picks the routing side on target verify:
+  `0` off, `1` both sides, `2` target-only (production), `3` draft-head-only.
+  Active only when KV=int8, window > 65536, verify width in {4,5,6}.
+- Full window history, the profile-envelope fix and the promote criteria:
+  [`decode-backport-2026-10-15.md`](decode-backport-2026-10-15.md).

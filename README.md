@@ -6,9 +6,9 @@
 
 ## TL;DR / 一句话简介
 
-**EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, 3.4k tok/s prefill, ~9.4 GiB/GPU at 128k int8 KV.
+**EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, 3.4k tok/s prefill, ~9.4 GiB/GPU at 128k int8 KV. Long-attention decode routing + MTP4 (2026-10-15): pi-shaped 120k decode **96.0 → 109.1 tok/s (1.136x)**.
 
-**中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill 3.4k tok/s、128k int8 KV 下每卡 ~9.4 GiB。
+**中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill 3.4k tok/s、128k int8 KV 下每卡 ~9.4 GiB。长注意力 decode 路由 + MTP4（2026-10-15）：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**。
 
 
 Single-instance Qwen3.8-27B inference across **4 × Tesla V100-SXM2 16 GB**
@@ -64,11 +64,20 @@ and adds `--tp 4`, which runs one instance across all four GPUs.
   alignment window and the prefix-reuse MTP bridge stage the shifted visual embeddings
   per rank (embedding-side ranks only). Images only, no video. See
   [the vision write-up](docs/tp4/vision-tp4-2026-10-05.md).
+- **Upstream decode kernel backport + long-window routing (2026-10-15)** — the upstream
+  `861633e8` long-decode kernel family (gqa_attention_decode split, int8 KV-quant, GDN
+  recurrent, lookup-draft) ported into tp4; `NINFER_TP4_VOLTA_LONG_ATTN` picks the routing
+  side (`0` off / `1` both / `2` target-only / `3` draft-only); the long-window gate (65536)
+  is shared with the KV split policy and CUDA-graph profile boundaries were extended to
+  match. Production = MTP4 + target-only routing: pi-shaped 120k decode **96.0 → 109.1
+  tok/s (1.136x)** — client-side median, 3 boots x 3 reps, all side-effect gates >= 0.98.
+  See [the decode backport write-up](docs/tp4/decode-backport-2026-10-15.md).
 
 Technical history (W1→W6): [`docs/tp4/changelog.md`](docs/tp4/changelog.md) ·
 MTP root-cause analysis: [`docs/tp4/README_tp4_mtp_rca_2026-10-01.md`](docs/tp4/README_tp4_mtp_rca_2026-10-01.md) ·
 tokenizer report: [`docs/tp4/tokenizer-oklogk.md`](docs/tp4/tokenizer-oklogk.md) ·
-vision on tp4 (2026-10-05): [`docs/tp4/vision-tp4-2026-10-05.md`](docs/tp4/vision-tp4-2026-10-05.md)
+vision on tp4 (2026-10-05): [`docs/tp4/vision-tp4-2026-10-05.md`](docs/tp4/vision-tp4-2026-10-05.md) ·
+decode backport + long-window routing (2026-10-15): [`docs/tp4/decode-backport-2026-10-15.md`](docs/tp4/decode-backport-2026-10-15.md)
 
 - **分片几何改为运行时尺寸** —— 编译期双卡假设被彻底移除：运行时、op wrapper 与
   op 家族（NVFP4 / FP8 / Q4-Q5 / W8）里 1,177 处类型加宽 + 89 处 rank 循环，
@@ -96,11 +105,18 @@ vision on tp4 (2026-10-05): [`docs/tp4/vision-tp4-2026-10-05.md`](docs/tp4/visio
   `enable_peer_access` 只对 tp2 开）；MTP 对齐窗与 prefix-reuse 的 MTP bridge
   按 rank 分发移位视觉 embedding（仅 embedding 侧 rank）。只支持图像，不支持视频。
   见[视觉专文](docs/tp4/vision-tp4-2026-10-05.md)。
+- **上游 decode 内核回迁 + 长窗路由（2026-10-15）** —— 上游 `861633e8` 的长 decode 内核族
+  （gqa_attention_decode 分裂、int8 KV 量化、GDN recurrent、lookup 草稿）移植进 tp4；
+  `NINFER_TP4_VOLTA_LONG_ATTN` 选路由侧（0 全关 / 1 两侧 / 2 只 target / 3 只草稿头）；
+  长档门 65536 与 KV 分段策略同门槛，CUDA graph profile 边界同步补齐。生产 = MTP4 +
+  只开 target：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**，客户端中位、
+  3 boot × 3 rep、副作用闸全过（≥0.98）。见[decode 回迁专文](docs/tp4/decode-backport-2026-10-15.md)。
 
 技术史（W1→W6）：[`docs/tp4/changelog.md`](docs/tp4/changelog.md) ·
 MTP 根因分析：[`docs/tp4/README_tp4_mtp_rca_2026-10-01.md`](docs/tp4/README_tp4_mtp_rca_2026-10-01.md) ·
 tokenizer 报告：[`docs/tp4/tokenizer-oklogk.md`](docs/tp4/tokenizer-oklogk.md) ·
-tp4 视觉（2026-10-05）：[`docs/tp4/vision-tp4-2026-10-05.md`](docs/tp4/vision-tp4-2026-10-05.md)
+tp4 视觉（2026-10-05）：[`docs/tp4/vision-tp4-2026-10-05.md`](docs/tp4/vision-tp4-2026-10-05.md) ·
+decode 回迁 + 长窗路由（2026-10-15）：[`docs/tp4/decode-backport-2026-10-15.md`](docs/tp4/decode-backport-2026-10-15.md)
 
 ## Measurements (this host, completed tp4) / 实测（本机，tp4 完成态）
 
