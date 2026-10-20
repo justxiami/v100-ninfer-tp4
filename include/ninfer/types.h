@@ -432,6 +432,7 @@ enum class PrefixReusePath : std::uint8_t {
     AppendAtFrontier,
     RestoreTurnCheckpoint,
     RestoreResponseCheckpoint,
+    RestorePrefixCheckpoint,
 };
 
 struct GenerationResult {
@@ -443,6 +444,11 @@ struct GenerationResult {
     FinishReason finish_reason         = FinishReason::None;
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
+    // Diagnostic only (2026-10-21): reuse mismatch accounting.
+    std::uint32_t diag_common_prefix   = 0;
+    std::uint32_t diag_resident_tokens = 0;
+    std::uint32_t diag_frontier        = 0;
+    std::uint8_t diag_block_reason     = 0;
     GenerationTimings timings;
     SpeculativeStats speculative;
 };

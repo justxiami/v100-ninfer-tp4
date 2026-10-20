@@ -106,6 +106,11 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    base->capture_prefix_checkpoints =
+        options.allow_prefix_reuse && prompt.identity.reusable && !prompt.has_media() &&
+        speculative_backend != SpeculativeBackend::DFlash &&
+        prefix_checkpoint_bytes() <=
+            kPrefixCheckpointBudget / static_cast<std::size_t>(std::max<std::uint32_t>(1, max_concurrency));
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
@@ -190,7 +195,10 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+    plan->capture_prefix_checkpoints  = base.capture_prefix_checkpoints;
 
+    bool diag_mtp_downgrade    = false;
+    bool diag_dflash_downgrade = false;
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
@@ -221,6 +229,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
             plan->reuse      = ReusePath::FullReset;
             plan->reuse_base = 0;
+            diag_mtp_downgrade = true;
         }
     }
 
@@ -231,6 +240,36 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
          sequence.dflash_context_frontier < plan->reuse_base)) {
         plan->reuse      = ReusePath::FullReset;
         plan->reuse_base = 0;
+        diag_dflash_downgrade = true;
+    }
+
+    // Longest-common-prefix restore from a host prefix checkpoint. Only positions with a
+    // complete continuation image are eligible; the farthest such position wins.
+    if (plan->reuse == ReusePath::FullReset && base.allow_prefix_reuse &&
+        prompt.identity.reusable && sequence.retained && !sequence.prefix_checkpoints.empty() &&
+        !sequence.ledger.empty()) {
+        const std::size_t limit =
+            std::min<std::size_t>(prompt.token_ids.size(), sequence.ledger.size());
+        std::size_t lcp = 0;
+        while (lcp < limit && prompt.token_ids[lcp] == sequence.ledger[lcp]) { ++lcp; }
+        std::uint32_t frontier_limit = static_cast<std::uint32_t>(lcp);
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            const std::uint32_t mtp_limit =
+                sequence.mtp_kv_valid == 0 ? 0 : sequence.mtp_kv_valid + 1;
+            frontier_limit = std::min(frontier_limit, mtp_limit);
+        }
+        frontier_limit = std::min(frontier_limit, sequence.text_kv_valid);
+        for (auto it = sequence.prefix_checkpoints.rbegin();
+             it != sequence.prefix_checkpoints.rend(); ++it) {
+            if (it->frontier == 0 || it->frontier > frontier_limit || !it->image) { continue; }
+            if (qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                                it->frontier)) {
+                plan->reuse                      = ReusePath::RestorePrefixCheckpoint;
+                plan->reuse_base                 = it->frontier;
+                plan->prefix_checkpoint_frontier = it->frontier;
+                break;
+            }
+        }
     }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
@@ -256,10 +295,42 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     }
 
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
+    // Diagnostic only (2026-10-21): quantify the retained-prefix match for full_reset requests.
+    if (prompt.identity.reusable && sequence.retained) {
+        const std::size_t limit =
+            std::min<std::size_t>(prompt.token_ids.size(), sequence.ledger.size());
+        std::size_t lcp = 0;
+        while (lcp < limit && prompt.token_ids[lcp] == sequence.ledger[lcp]) { ++lcp; }
+        plan->diag_common_prefix   = static_cast<std::uint32_t>(lcp);
+        plan->diag_resident_tokens = static_cast<std::uint32_t>(sequence.ledger.size());
+        plan->diag_frontier        = sequence.execution_frontier;
+        if (plan->reuse != ReusePath::FullReset) {
+            plan->diag_block_reason = 0;
+        } else if (sequence.execution_frontier == 0) {
+            plan->diag_block_reason = 1; // no resident frontier
+        } else if (lcp == 0) {
+            plan->diag_block_reason = 2; // no common prefix
+        } else if (diag_mtp_downgrade) {
+            plan->diag_block_reason = 5; // MTP continuation state not ready
+        } else if (diag_dflash_downgrade) {
+            plan->diag_block_reason = 6; // DFlash frontier mismatch
+        } else if (lcp < sequence.execution_frontier) {
+            plan->diag_block_reason = 3; // tokens diverge before the retained frontier
+        } else {
+            plan->diag_block_reason = 4; // identity/checkpoint mismatch at the frontier
+        }
+    } else if (plan->reuse == ReusePath::FullReset) {
+        plan->diag_block_reason = 1; // nothing retained for this lane
+    }
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan->reuse == ReusePath::FullReset) {
             plan->prepare_mtp = true;
         } else if (plan->reuse == ReusePath::AppendAtFrontier) {
+            plan->prepare_mtp = true;
+            plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
+                                    ? MtpBridgeMode::BeforeSuffix
+                                    : MtpBridgeMode::AfterExactHit;
+        } else if (is_prefix_checkpoint_restore(plan->reuse)) {
             plan->prepare_mtp = true;
             plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
                                     ? MtpBridgeMode::BeforeSuffix

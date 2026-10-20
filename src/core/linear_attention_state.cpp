@@ -223,4 +223,55 @@ void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream)
     }
 }
 
+std::size_t LinearAttentionStatePool::slot_bytes() const {
+    if (layer_count() == 0) { return 0; }
+    return static_cast<std::size_t>(layer_count()) *
+           (conv_slot(0, 0).bytes() + recurrent_slot(0, 0).bytes());
+}
+
+void LinearAttentionStatePool::export_slot(std::int32_t slot, std::span<std::byte> image,
+                                           cudaStream_t stream) {
+    export_slot_async(slot, image, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void LinearAttentionStatePool::export_slot_async(std::int32_t slot, std::span<std::byte> image,
+                                                 cudaStream_t stream) {
+    validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool export_slot");
+    if (image.size() != slot_bytes()) {
+        throw std::invalid_argument("LinearAttentionStatePool export_slot image size mismatch");
+    }
+    std::size_t offset = 0;
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        for (const Tensor source : {conv_slot(layer, slot), recurrent_slot(layer, slot)}) {
+            CUDA_CHECK(cudaMemcpyAsync(image.data() + offset, source.data, source.bytes(),
+                                       cudaMemcpyDeviceToHost, stream));
+            offset += source.bytes();
+        }
+    }
+}
+
+void LinearAttentionStatePool::import_slot(std::int32_t slot, std::span<const std::byte> image,
+                                           cudaStream_t stream) {
+    import_slot_async(slot, image, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void LinearAttentionStatePool::import_slot_async(std::int32_t slot,
+                                                 std::span<const std::byte> image,
+                                                 cudaStream_t stream) {
+    validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool import_slot");
+    if (image.size() != slot_bytes()) {
+        throw std::invalid_argument("LinearAttentionStatePool import_slot image size mismatch");
+    }
+    std::size_t offset = 0;
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        for (const Tensor destination : {conv_slot(layer, slot), recurrent_slot(layer, slot)}) {
+            CUDA_CHECK(cudaMemcpyAsync(destination.data, image.data() + offset,
+                                       destination.bytes(), cudaMemcpyHostToDevice, stream));
+            offset += destination.bytes();
+        }
+    }
+}
+
 } // namespace ninfer

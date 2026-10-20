@@ -38,6 +38,11 @@ struct GenerationMetrics {
     std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
+    // Diagnostic only (2026-10-21).
+    std::uint32_t diag_common_prefix   = 0;
+    std::uint32_t diag_resident_tokens = 0;
+    std::uint32_t diag_frontier        = 0;
+    std::uint8_t diag_block_reason     = 0;
 };
 
 struct GenerationOutcome {

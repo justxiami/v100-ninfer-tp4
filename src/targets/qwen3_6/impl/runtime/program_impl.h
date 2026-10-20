@@ -778,6 +778,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.ledger.clear();
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
+            // Invalidate images from the previous sequence on this lane; keep their
+            // storage so the next capture does not reallocate hundreds of MiB.
+            if (request_plan.capture_prefix_checkpoints) {
+                for (auto& checkpoint : sequence.prefix_checkpoints) { checkpoint.frontier = 0; }
+            } else {
+                sequence.prefix_checkpoints.clear();
+            }
             reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
                                 request_plan.backend_kv_page_entitlement);
         } else if (request_plan.reuse == ReusePath::AppendAtFrontier) {
@@ -801,6 +808,26 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
+            sequence.ledger.resize(base);
+        } else if (is_prefix_checkpoint_restore(request_plan.reuse)) {
+            if (!sequence.kv || sequence.text_kv_valid < base) {
+                throw std::logic_error("resident prefix checkpoint has no complete KV allocation");
+            }
+            sequence.text_kv_valid = base;
+            if (speculative_backend == SpeculativeBackend::Mtp) {
+                const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
+                if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
+                    throw std::logic_error(
+                        "prefix-checkpoint MTP KV is shorter than the bridge frontier");
+                }
+                sequence.mtp_kv_valid = mtp_base;
+            } else if (speculative_backend == SpeculativeBackend::DFlash) {
+                throw std::logic_error("prefix checkpoints do not support the DFlash backend");
+            }
+            trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
+                                           request_plan.backend_kv_page_entitlement);
+            import_prefix_checkpoint(sequence, base);
             sequence.ledger.resize(base);
         } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
             if (!sequence.kv || sequence.text_kv_valid < base) {
@@ -905,6 +932,23 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         }
         if (prompt.has_media() && !request_plan.vision) { prompt.release_all_media_payloads(); }
 
+        sequence.history_enabled = request_plan.capture_prefix_checkpoints;
+        std::uint32_t prefix_capture_interval = 0;
+        if (request_plan.capture_prefix_checkpoints) {
+            const std::size_t bytes = prefix_checkpoint_bytes();
+            const std::size_t images =
+                bytes == 0 ? 0
+                           : kPrefixCheckpointBudget /
+                                 static_cast<std::size_t>(std::max<std::uint32_t>(1, max_concurrency)) /
+                                 bytes;
+            if (images >= 2) {
+                const std::uint64_t segment =
+                    (static_cast<std::uint64_t>(prompt_tokens) + images - 2) / (images - 1);
+                const std::uint64_t quantum = std::max<std::uint64_t>(1, prefill_chunk);
+                prefix_capture_interval = static_cast<std::uint32_t>(
+                    ((segment + quantum - 1) / quantum) * quantum);
+            }
+        }
         RequestControl::Prefill prefill{
             .prompt                     = std::move(prompt),
             .vision_plan                = std::move(request_plan.vision),
@@ -919,6 +963,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .prepare_mtp                = request_plan.prepare_mtp,
             .reuse                      = request_plan.reuse,
             .mtp_bridge                 = request_plan.mtp_bridge,
+            .capture_prefix_checkpoints = request_plan.capture_prefix_checkpoints,
+            .prefix_capture_interval    = prefix_capture_interval,
+            .next_prefix_capture        = prefix_capture_interval,
+            .diag_common_prefix         = request_plan.diag_common_prefix,
+            .diag_resident_tokens       = request_plan.diag_resident_tokens,
+            .diag_frontier              = request_plan.diag_frontier,
+            .diag_block_reason          = request_plan.diag_block_reason,
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
@@ -1235,7 +1286,147 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
     sequence.rewrite_checkpoint      = {};
+    sequence.prefix_checkpoints.clear();
+    sequence.history_enabled         = false;
     request.pending                  = {};
+}
+
+
+namespace {
+// Prefix-checkpoint images are streamed once per capture; pinned host memory keeps the
+// D2H/H2D transfer off the pageable staging path. Fall back to pageable memory if the
+// driver refuses the pin.
+std::shared_ptr<std::byte[]> allocate_prefix_image(std::size_t bytes) {
+    void* memory = nullptr;
+    if (cudaHostAlloc(&memory, bytes, cudaHostAllocDefault) == cudaSuccess) {
+        return std::shared_ptr<std::byte[]>(static_cast<std::byte*>(memory),
+                                            [](std::byte* pointer) { cudaFreeHost(pointer); });
+    }
+    cudaGetLastError();
+    return std::shared_ptr<std::byte[]>(new std::byte[bytes]);
+}
+} // namespace
+
+std::size_t ProgramImplCore::prefix_checkpoint_bytes() const {
+    std::size_t bytes = decoder->linear_attention.slot_bytes() + sequences[0].tail_hidden.bytes();
+    for (std::size_t rank = 1; rank < peers.size(); ++rank) {
+        if (!peers[rank]) { continue; }
+        bytes += peers[rank]->decoder->linear_attention.slot_bytes();
+    }
+    return bytes;
+}
+
+PrefixCheckpoint ProgramImplCore::capture_prefix_checkpoint(SequenceState& sequence,
+                                                            std::uint32_t frontier,
+                                                            const Tensor& hidden,
+                                                            std::shared_ptr<std::byte[]> image) {
+    const std::size_t bytes = prefix_checkpoint_bytes();
+    PrefixCheckpoint checkpoint{frontier, std::move(image)};
+    if (!checkpoint.image) { checkpoint.image = allocate_prefix_image(bytes); }
+    std::size_t offset = 0;
+    const auto issue = [&](LinearAttentionStatePool& pool, DeviceContext& ctx) {
+        const ScopedDevice scope(ctx.device);
+        const auto size = pool.slot_bytes();
+        pool.export_slot_async(LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                               std::span<std::byte>(checkpoint.image.get() + offset, size),
+                               ctx.stream);
+        offset += size;
+    };
+    issue(decoder->linear_attention, device);
+    for (std::size_t rank = 1; rank < peers.size(); ++rank) {
+        if (!peers[rank]) { continue; }
+        issue(peers[rank]->decoder->linear_attention, peers[rank]->device);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(checkpoint.image.get() + offset, hidden.data, hidden.bytes(),
+                               cudaMemcpyDeviceToHost, device.stream));
+    const auto finish = [](DeviceContext& ctx) {
+        const ScopedDevice scope(ctx.device);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    };
+    finish(device);
+    for (std::size_t rank = 1; rank < peers.size(); ++rank) {
+        if (peers[rank]) { finish(peers[rank]->device); }
+    }
+    return checkpoint;
+}
+
+void ProgramImplCore::save_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier,
+                                             const Tensor& hidden) {
+    const std::size_t bytes = prefix_checkpoint_bytes();
+    if (bytes == 0) { return; }
+    const std::size_t limit = kPrefixCheckpointBudget /
+                              static_cast<std::size_t>(std::max<std::uint32_t>(1, max_concurrency)) /
+                              bytes;
+    if (limit == 0) { return; }
+    auto& checkpoints = sequence.prefix_checkpoints;
+    if (!checkpoints.empty() && checkpoints.back().frontier == frontier) { return; }
+    std::shared_ptr<std::byte[]> reusable;
+    for (auto it = checkpoints.begin(); it != checkpoints.end(); ++it) {
+        if (it->frontier == 0) {
+            reusable = std::move(it->image);
+            checkpoints.erase(it);
+            break;
+        }
+    }
+    while (checkpoints.size() >= limit) {
+        std::size_t victim = 0;
+        if (limit > 1 && checkpoints.size() > 1) {
+            // Keep the first image and spread the remaining images over the history.
+            victim = 1;
+            std::uint32_t closest = std::numeric_limits<std::uint32_t>::max();
+            for (std::size_t i = 1; i < checkpoints.size(); ++i) {
+                const auto right =
+                    i + 1 < checkpoints.size() ? checkpoints[i + 1].frontier : frontier;
+                const auto span = right - checkpoints[i - 1].frontier;
+                if (span < closest) {
+                    closest = span;
+                    victim  = i;
+                }
+            }
+        }
+        checkpoints.erase(checkpoints.begin() + static_cast<std::ptrdiff_t>(victim));
+    }
+    checkpoints.push_back(
+        capture_prefix_checkpoint(sequence, frontier, hidden, std::move(reusable)));
+    std::sort(checkpoints.begin(), checkpoints.end(),
+              [](const auto& a, const auto& b) { return a.frontier < b.frontier; });
+}
+
+void ProgramImplCore::import_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier) {
+    const auto found = std::find_if(sequence.prefix_checkpoints.begin(),
+                                    sequence.prefix_checkpoints.end(),
+                                    [frontier](const auto& entry) {
+                                        return entry.frontier == frontier && entry.image;
+                                    });
+    if (found == sequence.prefix_checkpoints.end()) {
+        throw std::logic_error("planned prefix checkpoint image is unavailable");
+    }
+    const std::byte* image = found->image.get();
+    std::size_t offset     = 0;
+    const auto issue       = [&](LinearAttentionStatePool& pool, DeviceContext& ctx) {
+        const ScopedDevice scope(ctx.device);
+        const auto size = pool.slot_bytes();
+        pool.import_slot_async(LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                               std::span<const std::byte>(image + offset, size), ctx.stream);
+        offset += size;
+    };
+    issue(decoder->linear_attention, device);
+    for (std::size_t rank = 1; rank < peers.size(); ++rank) {
+        if (!peers[rank]) { continue; }
+        issue(peers[rank]->decoder->linear_attention, peers[rank]->device);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, image + offset,
+                               sequence.tail_hidden.bytes(), cudaMemcpyHostToDevice,
+                               device.stream));
+    const auto finish = [](DeviceContext& ctx) {
+        const ScopedDevice scope(ctx.device);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    };
+    finish(device);
+    for (std::size_t rank = 1; rank < peers.size(); ++rank) {
+        if (peers[rank]) { finish(peers[rank]->device); }
+    }
+    sequence.tail_hidden_valid = true;
 }
 
 qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
@@ -2390,7 +2581,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     RequestControl::Prefill& staged = *request.prefill;
     const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
                                         .reused_prompt_tokens = staged.base,
-                                        .prefix_reuse_path    = staged.reuse};
+                                        .prefix_reuse_path    = staged.reuse,
+                                        .diag_common_prefix   = staged.diag_common_prefix,
+                                        .diag_resident_tokens = staged.diag_resident_tokens,
+                                        .diag_frontier        = staged.diag_frontier,
+                                        .diag_block_reason    = staged.diag_block_reason};
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
@@ -2476,6 +2671,14 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
+            }
+            if (staged.capture_prefix_checkpoints && staged.prefix_capture_interval != 0 &&
+                staged.cursor < staged.prompt_tokens &&
+                staged.cursor >= staged.next_prefix_capture) {
+                const Tensor checkpoint_hidden = prefill_hidden.slice(
+                    1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1);
+                save_prefix_checkpoint(sequence, staged.cursor, checkpoint_hidden);
+                staged.next_prefix_capture += staged.prefix_capture_interval;
             }
 
             if (!result.finalized) {

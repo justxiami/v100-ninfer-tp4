@@ -62,6 +62,11 @@ struct BeginSummary {
     std::uint32_t prompt_tokens        = 0;
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
+    // Diagnostic only (2026-10-21): why a request did or did not reuse resident prefix state.
+    std::uint32_t diag_common_prefix   = 0;
+    std::uint32_t diag_resident_tokens = 0;
+    std::uint32_t diag_frontier        = 0;
+    std::uint8_t diag_block_reason     = 0;
 };
 
 struct GeneratedRound {

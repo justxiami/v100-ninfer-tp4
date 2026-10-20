@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -191,6 +192,38 @@ int main() {
     }
     failures += check_shape(fp32_conv.conv[0], {7, 2, 2, 1}, "fp32_conv.conv");
     failures += check_shape(fp32_conv.recurrent[0], {4, 3, 2, 2}, "fp32_conv.recurrent");
+
+    // Prefix-checkpoint host image: export/import must be byte-exact.
+    {
+        const std::size_t bytes = slotted.slot_bytes();
+        std::vector<std::byte> image(bytes);
+        std::vector<std::byte> roundtrip(bytes);
+        slotted.export_slot(1, image, ctx.stream);
+        slotted.zero_slot(1, ctx.stream);
+        slotted.import_slot(1, image, ctx.stream);
+        slotted.export_slot(1, roundtrip, ctx.stream);
+        if (image != roundtrip) {
+            ++failures;
+            std::cerr << "slot export/import round trip differs\n";
+        }
+        // Cross-slot import must reproduce the same image.
+        slotted.import_slot(0, image, ctx.stream);
+        slotted.export_slot(0, roundtrip, ctx.stream);
+        if (image != roundtrip) {
+            ++failures;
+            std::cerr << "cross-slot import differs\n";
+        }
+        // Wrong-size images are rejected.
+        bool rejected = false;
+        try {
+            std::vector<std::byte> small(bytes == 0 ? 1 : bytes - 1);
+            slotted.import_slot(0, small, ctx.stream);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) {
+            ++failures;
+            std::cerr << "wrong-size image accepted\n";
+        }
+    }
 
     return failures == 0 ? 0 : fail("linear attention state pool test failed");
 }

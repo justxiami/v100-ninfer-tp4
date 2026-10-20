@@ -38,6 +38,10 @@ using ReusePath = ninfer::PrefixReusePath;
     return path == ReusePath::RestoreTurnCheckpoint || path == ReusePath::RestoreResponseCheckpoint;
 }
 
+[[nodiscard]] constexpr bool is_prefix_checkpoint_restore(ReusePath path) noexcept {
+    return path == ReusePath::RestorePrefixCheckpoint;
+}
+
 [[nodiscard]] constexpr ReusePath restore_path(RewriteCheckpointKind kind) noexcept {
     return kind == RewriteCheckpointKind::TurnClosure ? ReusePath::RestoreTurnCheckpoint
                                                       : ReusePath::RestoreResponseCheckpoint;
@@ -71,6 +75,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
+    bool capture_prefix_checkpoints = false;
 };
 
 template <>
@@ -78,9 +83,16 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
     NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::FullReset;
     std::uint32_t reuse_base                  = 0;
+    // Diagnostic only (2026-10-21): reuse mismatch accounting.
+    std::uint32_t diag_common_prefix   = 0;
+    std::uint32_t diag_resident_tokens = 0;
+    std::uint32_t diag_frontier        = 0;
+    std::uint8_t diag_block_reason     = 0;
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;
+    bool capture_prefix_checkpoints = false;
+    std::uint32_t prefix_checkpoint_frontier = 0;
     std::optional<NINFER_QWEN36_RUNTIME_NS::VisionPrefillPlan> vision;
     NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
@@ -125,6 +137,16 @@ struct RewriteCheckpoint {
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
     std::uint32_t frontier     = 0;
 };
+
+struct PrefixCheckpoint {
+    // 0 marks an invalidated image kept only for storage reuse.
+    std::uint32_t frontier = 0;
+    // All ranks' GDN convolution/recurrent slots followed by rank 0's tail hidden.
+    std::shared_ptr<std::byte[]> image;
+};
+
+// Host budget for prefix-checkpoint images, divided by max_concurrency.
+inline constexpr std::size_t kPrefixCheckpointBudget = 2ULL * 1024 * 1024 * 1024;
 
 struct SequenceKVBundle {
     PagedKVAllocation text;
@@ -187,6 +209,9 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     RewriteCheckpoint rewrite_checkpoint;
+    // Host images of the GDN continuation state at prefill frontiers.
+    std::vector<PrefixCheckpoint> prefix_checkpoints;
+    bool history_enabled = false;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -212,6 +237,15 @@ struct RequestControl {
         bool prepare_mtp                 = false;
         ReusePath reuse                  = ReusePath::FullReset;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
+        // Prefix-checkpoint capture during this prefill.
+        bool capture_prefix_checkpoints = false;
+        std::uint32_t prefix_capture_interval = 0;
+        std::uint32_t next_prefix_capture     = 0;
+        // Diagnostic only (2026-10-21).
+        std::uint32_t diag_common_prefix   = 0;
+        std::uint32_t diag_resident_tokens = 0;
+        std::uint32_t diag_frontier        = 0;
+        std::uint8_t diag_block_reason     = 0;
     };
 
     std::optional<Prefill> prefill;
@@ -262,7 +296,15 @@ public:
     [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane,
                                                     const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base);
-    [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
+    [[nodiscard]] bool
+    can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
+    [[nodiscard]] std::size_t prefix_checkpoint_bytes() const;
+    PrefixCheckpoint capture_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier,
+                                               const Tensor& hidden,
+                                               std::shared_ptr<std::byte[]> image = nullptr);
+    void save_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier,
+                                const Tensor& hidden);
+    void import_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier);
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan& plan) const noexcept;

@@ -395,6 +395,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
+    outcome.metrics.diag_common_prefix          = result.diag_common_prefix;
+    outcome.metrics.diag_resident_tokens        = result.diag_resident_tokens;
+    outcome.metrics.diag_frontier               = result.diag_frontier;
+    outcome.metrics.diag_block_reason           = result.diag_block_reason;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;
