@@ -827,3 +827,23 @@ content: 'We need to reply with a short phrase: "PROMised and the user says 'Dia
   pi120k **96.0 → 109.1 tok/s = 1.136×**，闸全过（0.980–1.136）；M3T 主判 1.098 过、pi64k 0.961 挂闸 ⇒ 按判据取 C1。
 - **落生产**：`--draft-tokens 4` + `NINFER_TP4_VOLTA_LONG_ATTN=2`，:8901 重启 10/15 03:51；
   回滚 = draft 3 + 路由 0（切换脚本一条命令）。
+
+## 2026-10-21（十续）prefix checkpoint + TCP_NODELAY 落生产：详记见 docs/tp4/prefix-checkpoint-2026-10-21.md
+
+- **TCP_NODELAY**（`src/serve/http_server.cpp`，1 行调用）：复用 SSE 连接首帧 40.9→0.5 ms、
+  首个 content token 40.85→18.85 ms（−22.0 ms / −53.8%）；A/B/B/A 各 2 fresh boot，
+  文本指纹一致；新连接不变。
+- **前缀 checkpoint + LCP 恢复**：每张镜像 = 4 rank GDN slot 36.7 MiB + tail hidden（共 146.8 MiB），
+  不含 KV；预算 2 GiB / 并发 2 ⇒ 6 张/lane，捕获间隔对齐 prefill_chunk。
+  32k 分支：全量 10.26 s → 恢复 2.95 s（base 24576）/ 回到旧分支 1.51 s（base 28672）；
+  文档内两处 needle（16k/31.5k）均答对；同 seed 接受率不降。
+  稳态全量 prefill +1.1%（pinned host + 跨 rank 批量同步后）。
+- **复用诊断**：`done` 行新增 `lcp/led/fr/why`，用于统计 full_reset 的可恢复前缀比例。
+- **上游 10-19 审计**：verify5（width==5）、GDN 记录融合（`w.n==8192`，TP4 为 4096）、
+  GDN 门控 `tp2_exact`（kShardN=24，TP4 为 12）、allreduce packet（仅 device_count==2 分配）、
+  QPN 融合行加（device_count==2）均为 TP2 硬门；residual_add 全量仅 0.6%/轮、
+  `__ldcs` 实测 +0.3% 更慢；w8 MTP GEMV 未跑（上限 3.9%/轮，且改约减顺序）。
+- **落生产**：`4456bd9b`，unit `ninfer-8901` 起服；回滚链 57d76adb（仅诊断）→ 5cb21aad（仅 TCP）
+  → e97e3bce（无 TCP）。
+- **非字节一致说明**：同 seed 下恢复与全量首 token 一致、后段文本有差异；现有
+  `restore_turn_checkpoint` 同样如此，故回归闸门用质量+接受率。

@@ -5,7 +5,7 @@
 ## TL;DR / 一句话简介
 
 **中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill 3.4k tok/s、128k int8 KV 下每卡 ~9.4 GiB。
-长注意力 decode 路由 + MTP4（2026-10-15）：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**。
+长注意力 decode 路由 + MTP4（2026-10-15）：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**。2026-10-21：复用连接首 token **−22 ms**；分支/换题 TTFT **10.3 s → 1.5–3.0 s**。
 
 **EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, 3.4k tok/s prefill, ~9.4 GiB/GPU at 128k int8 KV. Long-attention decode routing + MTP4 (2026-10-15): pi-shaped 120k decode **96.0 → 109.1 tok/s (1.136x)**.
 
@@ -20,6 +20,23 @@
 [Neroued/ninfer](https://github.com/Neroued/ninfer) 链路上调优过的
 **双卡（TP2）** fork。本树保持 TP2 行为字节级不变（每批改动的回归闸门），
 并新增 `--tp 4`：一个实例横跨全部四张卡。
+
+## 2026-10-21: reuse latency / 复用延迟
+
+**EN** — Two measured changes. (1) `TCP_NODELAY` on the HTTP server removes the Nagle/delayed-ACK
+stall on reused SSE connections: first content token **40.85 → 18.85 ms (−22.0 ms, −53.8%)**,
+two fresh boots per arm, byte-identical text. (2) Host prefix checkpoints capture the GDN state
+plus tail hidden (146.8 MiB per image, 2 GiB host budget) during prefill; a request whose prompt
+shares a long prefix picks the farthest checkpoint ≤ LCP and resumes instead of re-prefilling.
+On a 32k branch: **10.26 s → 2.95 s**, return branch **1.51 s**. Cost: **+1.1%** on a full prefill.
+Details: [prefix-checkpoint-2026-10-21.md](docs/tp4/prefix-checkpoint-2026-10-21.md).
+
+**中文** — 两项实测改动。(1) HTTP 服务端开 `TCP_NODELAY`，去掉复用 SSE 连接上的 Nagle/延迟 ACK
+停顿：首个 content token **40.85 → 18.85 ms（−22.0 ms，−53.8%）**，两臂各 2 次重启，文本字节一致。
+(2) prefill 期间把 GDN 状态 + tail hidden 存成 host 前缀 checkpoint（每张 146.8 MiB，2 GiB 预算）；
+后续请求若共享长前缀，选 frontier ≤ LCP 的最远 checkpoint 续播，不再重算。32k 分支：
+**10.26 s → 2.95 s**，回到旧分支 **1.51 s**；代价是全量 prefill **+1.1%**。
+详记：[prefix-checkpoint-2026-10-21.md](docs/tp4/prefix-checkpoint-2026-10-21.md)。
 
 ## 本 fork 新增了什么
 
