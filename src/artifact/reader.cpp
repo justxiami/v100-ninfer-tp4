@@ -2,6 +2,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "artifact/qwen38_v3_chat_template.inc"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -75,6 +77,17 @@ void require_members(const Json& value, const std::array<const char*, N>& member
             throw ArtifactError(std::string(label) + " has missing or extra members");
         }
     }
+}
+
+// Published v3 artifacts carry either the bare model id or a variant suffix
+// (e.g. qwen3.8-27b-coder390-w4a4-w8a8-mtp-dflash2). Accept the family plus an
+// optional "-suffix"; anything outside qwen3.8-27b is still rejected.
+bool is_qwen38_v3_artifact_name(std::string_view name) noexcept {
+    constexpr std::string_view family = "qwen3.8-27b";
+    if (name.size() < family.size() || name.substr(0, family.size()) != family) {
+        return false;
+    }
+    return name.size() == family.size() || name[family.size()] == '-';
 }
 
 const std::string& require_string(const Json& value, std::string_view label) {
@@ -294,7 +307,7 @@ public:
         quasar_ = std::equal(quasar_id.begin(), quasar_id.end(), file_.data() + 16);
         if (!directory_.is_object() || !directory_.contains("metadata") ||
             !directory_.at("metadata").is_object() ||
-            directory_.at("metadata").value("name", "") != "qwen3.8-27b") {
+            !is_qwen38_v3_artifact_name(directory_.at("metadata").value("name", ""))) {
             throw ArtifactError("NInfer v3 compatibility is limited to qwen3.8-27b");
         }
         if (!directory_.contains("files") || !directory_.at("files").is_array() ||
@@ -536,11 +549,15 @@ private:
             const std::string prefix = "dflash2/" + suffix;
             add(old_prefix + "attention/query_key_value",
                 {prefix + "attention/query", prefix + "attention/key", prefix + "attention/value"});
-            // Context K/V are aliases of the same QKV rows, not independent parameters.
+            // Context K/V are aliases of the same QKV rows in older v3 artifacts and
+            // standalone objects in newer ones (the engine never binds either logical
+            // name). Aliases stay fused; standalone objects are only validated here.
             for (const char* role : {"key", "value"}) {
-                if (binding_parts(prefix + "attention/context_" + role) !=
-                    binding_parts(prefix + "attention/" + role)) {
-                    throw ArtifactError(prefix + "attention/context_" + role + ": alias differs");
+                const auto context = binding_parts(prefix + "attention/context_" + role);
+                if (context != binding_parts(prefix + "attention/" + role)) {
+                    for (const auto& part : context) {
+                        (void)object(require_string(part.at("object"), "v3 binding object"));
+                    }
                 }
             }
             add(old_prefix + "mlp/gate_up", {prefix + "mlp/gate", prefix + "mlp/up"});
@@ -685,10 +702,10 @@ private:
     }
 
     std::vector<std::byte> embedded_chat_template() const {
-        const auto& components = directory_.at("components");
-        const auto id = require_string(
-            components.at("text").at("resources").at("tokenizer_config.json"),
-            "tokenizer_config.json resource");
+        const auto& components  = directory_.at("components");
+        const auto& resources   = components.at("text").at("resources");
+        const auto id = require_string(resources.at("tokenizer_config.json"),
+                                       "tokenizer_config.json resource");
         const auto bytes = object_payload(object(id));
         Json config;
         try {
@@ -696,6 +713,15 @@ private:
             config = Json::parse(begin, begin + bytes.size());
         } catch (const Json::exception& error) {
             throw ArtifactError(std::string("invalid tokenizer_config.json: ") + error.what());
+        }
+        if (!config.contains("chat_template")) {
+            // Newer v3 converters ship the template as its own resource and drop the
+            // tokenizer_config.json field the engine hashes. Use the registered
+            // ReasoningEffort template instead: the standalone resource carries the
+            // same semantics but a digest outside the engine whitelist.
+            const auto fallback = std::as_bytes(
+                std::span(kQwen38V3ChatTemplate.data(), kQwen38V3ChatTemplate.size()));
+            return {fallback.begin(), fallback.end()};
         }
         const auto& value = require_string(config.at("chat_template"), "chat_template");
         const auto raw = std::as_bytes(std::span(value.data(), value.size()));
