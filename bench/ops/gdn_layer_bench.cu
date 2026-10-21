@@ -75,6 +75,8 @@ struct Options {
     std::string norm_control = "fused";
     std::string gated_rms    = "auto";
     std::string csv_out;
+    std::string mode       = "snapshot"; // snapshot (small-T slot path) | prefill (large-T GDN segment)
+    std::string geometry   = "tp4";      // tp4 (Hq=4,Hv=12 Qwen3.8-27B per-GPU) | tp1 (Hq=16,Hv=32)
 };
 
 struct Result {
@@ -131,8 +133,8 @@ std::vector<std::int32_t> parse_t_sweep(std::string_view raw) {
         const std::string token(
             raw.substr(begin, end == std::string_view::npos ? raw.size() - begin : end - begin));
         const long value = std::stol(token);
-        if (value <= 0 || value > kSnapshotSlots - 1) {
-            throw std::invalid_argument("--t-sweep values must be in [1,16]");
+        if (value <= 0) {
+            throw std::invalid_argument("--t-sweep values must be positive");
         }
         result.push_back(static_cast<std::int32_t>(value));
         if (end == std::string_view::npos) { break; }
@@ -152,6 +154,16 @@ Options parse_options(int argc, char** argv) {
         };
         if (arg == "--t-sweep") {
             options.t_sweep = parse_t_sweep(next("--t-sweep value"));
+        } else if (arg == "--mode") {
+            options.mode = next("--mode value");
+            if (options.mode != "snapshot" && options.mode != "prefill") {
+                throw std::invalid_argument("--mode must be snapshot or prefill");
+            }
+        } else if (arg == "--geometry") {
+            options.geometry = next("--geometry value");
+            if (options.geometry != "tp4" && options.geometry != "tp1") {
+                throw std::invalid_argument("--geometry must be tp4 or tp1");
+            }
         } else if (arg == "--warmup") {
             options.warmup = std::stoi(std::string(next("--warmup value")));
         } else if (arg == "--repeat") {
@@ -183,7 +195,8 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("--gated-rms-route must be auto or dv10-b1024");
             }
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: %s [--t-sweep 1,2,...,16] [--warmup N] [--repeat N] "
+            std::printf("Usage: %s [--mode snapshot|prefill] [--geometry tp4|tp1] "
+                        "[--t-sweep 1,2,...,16 | prefill any positive] [--warmup N] [--repeat N] "
                         "[--flush-mib N] [--route fused|composed] "
                         "[--qk-norm fused|composed] [--norm-control fused|composed] "
                         "[--gated-rms-route auto|dv10-b1024] "
@@ -196,6 +209,13 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
+    }
+    if (options.mode == "snapshot") {
+        for (const auto t : options.t_sweep) {
+            if (t > kSnapshotSlots - 1) {
+                throw std::invalid_argument("snapshot --t-sweep values must be in [1,16]");
+            }
+        }
     }
     return options;
 }
@@ -504,6 +524,114 @@ void print_results(const Options& options, const std::vector<Result>& results) {
     print_route_legend(results, 'O', "output", &Result::output_route, output_routes);
 }
 
+// === Prefill mode: large-T GDN segment sensor ===
+// Times the single-layer GDN segment through ops::gated_delta_net -- the exact region a chunked
+// SM70 kernel would replace: normalized-Q/K prepare plus the sequential recurrent state
+// transition on the VOLTA route. Geometry is the per-GPU Qwen3.8-27B fold: tp4 = <Hq=4, Hv=12>,
+// tp1 = <Hq=16, Hv=32>. Each T captures one CUDA Graph of the single op call; device timing
+// events bracket each replay and a 256 MiB L2 flush precedes every measured replay.
+
+struct PrefillResult {
+    std::int32_t tokens  = 0;
+    std::string geometry;
+    bench::ColdTiming timing;
+};
+
+struct PrefillResources {
+    std::int32_t qk_heads    = 0;
+    std::int32_t value_heads = 0;
+    std::int32_t max_tokens  = 0;
+
+    explicit PrefillResources(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t max_tokens)
+        : qk_heads(qk_heads),
+          value_heads(value_heads),
+          max_tokens(max_tokens),
+          q(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * qk_heads * max_tokens)),
+          k(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * qk_heads * max_tokens)),
+          v(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * value_heads * max_tokens)),
+          out(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * value_heads * max_tokens *
+                                sizeof(std::uint16_t))),
+          g(make_prefill_constant_f32(static_cast<std::size_t>(value_heads) * max_tokens, -1.0F)),
+          beta(make_prefill_constant_f32(static_cast<std::size_t>(value_heads) * max_tokens, 0.5F)),
+          ssm_state(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kHeadDim * value_heads *
+                                      sizeof(float))),
+          workspace(ops::gated_delta_net_workspace_capacity_bytes(qk_heads, value_heads, true,
+                                                                  max_tokens, max_tokens)) {}
+
+    static ninfer::DeviceBuffer make_prefill_constant_f32(std::size_t elements, float value) {
+        std::vector<float> host(elements, value);
+        ninfer::DeviceBuffer device(elements * sizeof(float));
+        CUDA_CHECK(cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice));
+        return device;
+    }
+
+    ninfer::DeviceBuffer q;
+    ninfer::DeviceBuffer k;
+    ninfer::DeviceBuffer v;
+    ninfer::DeviceBuffer out;
+    ninfer::DeviceBuffer g;
+    ninfer::DeviceBuffer beta;
+    ninfer::DeviceBuffer ssm_state;
+    WorkspaceArena workspace;
+};
+
+PrefillResult run_prefill_case(PrefillResources& resources, ninfer::DeviceBuffer& flush,
+                               cudaStream_t stream, const Options& options, std::int32_t tokens,
+                               const std::string& geometry) {
+    Tensor q(resources.q.p, DType::BF16, {kHeadDim, resources.qk_heads, tokens, 1});
+    Tensor k(resources.k.p, DType::BF16, {kHeadDim, resources.qk_heads, tokens, 1});
+    Tensor v(resources.v.p, DType::BF16, {kHeadDim, resources.value_heads, tokens, 1});
+    Tensor g(resources.g.p, DType::FP32, {resources.value_heads, tokens, 1, 1});
+    Tensor beta(resources.beta.p, DType::FP32, {resources.value_heads, tokens, 1, 1});
+    Tensor ssm_state(resources.ssm_state.p, DType::FP32, {kHeadDim, kHeadDim, resources.value_heads, 1});
+    Tensor out(resources.out.p, DType::BF16, {kHeadDim, resources.value_heads, tokens, 1});
+
+    const auto layer = [&](cudaStream_t s) {
+        ops::gated_delta_net(q, k, v, g, beta, kGdnScale, true, resources.workspace, ssm_state, out, s);
+    };
+
+    // Resolve the kernels and validate the route once before capture.
+    layer(stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    bench::TimedGraph graph;
+    graph.capture(stream, layer);
+    const bench::ColdTiming timing =
+        bench::measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
+    return {tokens, geometry, timing};
+}
+
+void print_prefill_results(const Options& options, const std::vector<PrefillResult>& results) {
+    std::printf("Qwen3.8-27B GDN prefill segment sensor (per-GPU %s)\n", options.geometry.c_str());
+    std::printf("  segment    gated_delta_net: normalized-Q/K prepare + sequential recurrent state\n");
+    std::printf("  execution  CUDA Graph replay of the single op call\n");
+    std::printf("  cache      cold L2 (%zu MiB flush before each sample)\n", options.flush_bytes >> 20);
+    std::printf("  samples    %d warmup + %d measured per T\n\n", options.warmup, options.repeat);
+    std::printf("Latency (us) and throughput\n");
+    std::printf("  T     median       min       p95     tok/s(layer)  48-layer(us)\n");
+    std::printf("------  ---------  ---------  ---------  ------------  -------------\n");
+    for (const PrefillResult& result : results) {
+        const double tok_per_s =
+            static_cast<double>(result.tokens) * 1.0e6 / result.timing.median_us;
+        std::printf("%5d  %9.3f  %9.3f  %9.3f  %12.1f  %13.1f\n", result.tokens,
+                    result.timing.median_us, result.timing.min_us, result.timing.p95_us, tok_per_s,
+                    result.timing.median_us * 48.0);
+    }
+}
+
+void write_prefill_csv(const Options& options, const std::vector<PrefillResult>& results) {
+    if (options.csv_out.empty()) { return; }
+    const std::filesystem::path path(options.csv_out);
+    if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
+    std::ofstream out(path);
+    out << "T,geometry,cold_median_us,cold_min_us,cold_p95_us,flush_bytes,warmup,repeat\n";
+    for (const PrefillResult& result : results) {
+        out << result.tokens << ',' << result.geometry << ',' << result.timing.median_us << ','
+            << result.timing.min_us << ',' << result.timing.p95_us << ',' << options.flush_bytes
+            << ',' << options.warmup << ',' << options.repeat << '\n';
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -518,6 +646,27 @@ int main(int argc, char** argv) {
             *std::max_element(options.t_sweep.begin(), options.t_sweep.end());
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        if (options.mode == "prefill") {
+            const std::int32_t qk_heads    = options.geometry == "tp4" ? 4 : 16;
+            const std::int32_t value_heads = options.geometry == "tp4" ? 12 : 32;
+            PrefillResources resources(qk_heads, value_heads, max_tokens);
+            ninfer::DeviceBuffer flush(options.flush_bytes);
+            std::vector<PrefillResult> results;
+            results.reserve(options.t_sweep.size());
+            for (const std::int32_t tokens : options.t_sweep) {
+                PrefillResult result =
+                    run_prefill_case(resources, flush, stream, options, tokens, options.geometry);
+                results.push_back(std::move(result));
+            }
+            print_prefill_results(options, results);
+            write_prefill_csv(options, results);
+            if (!options.csv_out.empty()) {
+                std::printf("\nCSV written to %s\n", options.csv_out.c_str());
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            return 0;
+        }
         Resources resources(max_tokens);
         ninfer::DeviceBuffer flush(options.flush_bytes);
         std::vector<Result> results;

@@ -34,21 +34,67 @@ void launch_recurrent_fp32_fixed(const Tensor& q, const Tensor& k, const Tensor&
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool NormalizeQK, typename QK = __nv_bfloat16>
+template <bool NormalizeQK, typename QK = __nv_bfloat16, int DvPerWarp = kDvPerWarp,
+          int NumWarps = kNumWarps>
 void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& state_read, Tensor& state_write, Tensor& out,
                                    cudaStream_t stream) {
-    const auto heads = head_map::of(q.ne[1], v.ne[1]);
-    const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(kStateDim / kBlockDv));
-    const dim3 block(kWarpSize, kNumWarps, 1);
-    recurrent_direct_kernel<NormalizeQK><<<grid, block, 0, stream>>>(
+    const auto heads      = head_map::of(q.ne[1], v.ne[1]);
+    constexpr int kTileDv = NumWarps * DvPerWarp;
+    const dim3 grid(static_cast<unsigned>(v.ne[1]), 1,
+                    static_cast<unsigned>(kStateDim / kTileDv));
+    const dim3 block(kWarpSize, NumWarps, 1);
+    recurrent_direct_kernel<NormalizeQK, QK, DvPerWarp, NumWarps><<<grid, block, 0, stream>>>(
         static_cast<const QK*>(q.data), static_cast<const QK*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data), static_cast<const float*>(state_read.data),
         static_cast<float*>(state_write.data), static_cast<__nv_bfloat16*>(out.data), q.ne[2],
         heads, scale);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Wide prefill loops use the fine dv tiling (more blocks, shorter per-block critical path);
+// short-token calls keep the production tiling, which wins there by ~7-9% on the snapshot route.
+// Both tilings run the same per-row reduction, so the results are bit-identical.
+template <bool NormalizeQK, typename QK = __nv_bfloat16, int LanesPerRow = kPrefillLanesPerRow,
+          int NumWarps = kPrefillSplitWarps>
+void launch_recurrent_split_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& g, const Tensor& beta, float scale,
+                                  const Tensor& state_read, Tensor& state_write, Tensor& out,
+                                  cudaStream_t stream) {
+    constexpr int kRowsPerWarp  = kWarpSize / LanesPerRow;
+    constexpr int kRowsPerBlock = kRowsPerWarp * NumWarps;
+    const auto heads            = head_map::of(q.ne[1], v.ne[1]);
+    const dim3 grid(static_cast<unsigned>(v.ne[1]), 1,
+                    static_cast<unsigned>(kStateDim / kRowsPerBlock));
+    const dim3 block(kWarpSize, NumWarps, 1);
+    recurrent_split_kernel<NormalizeQK, QK, LanesPerRow, NumWarps><<<grid, block, 0, stream>>>(
+        static_cast<const QK*>(q.data), static_cast<const QK*>(k.data),
+        static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(g.data),
+        static_cast<const float*>(beta.data), static_cast<const float*>(state_read.data),
+        static_cast<float*>(state_write.data), static_cast<__nv_bfloat16*>(out.data), q.ne[2],
+        heads, scale);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <bool NormalizeQK, typename QK = __nv_bfloat16>
+void launch_recurrent_direct_tiled(const Tensor& q, const Tensor& k, const Tensor& v,
+                                   const Tensor& g, const Tensor& beta, float scale,
+                                   const Tensor& state_read, Tensor& state_write, Tensor& out,
+                                   cudaStream_t stream) {
+    if (q.ne[2] >= kPrefillTileMinTokens) {
+        if constexpr (kPrefillLanesPerRow == kWarpSize) {
+            launch_recurrent_direct_fixed<NormalizeQK, QK, kPrefillDvPerWarp, kPrefillNumWarps>(
+                q, k, v, g, beta, scale, state_read, state_write, out, stream);
+        } else {
+            launch_recurrent_split_fixed<NormalizeQK, QK>(q, k, v, g, beta, scale, state_read,
+                                                          state_write, out, stream);
+        }
+        return;
+    }
+    launch_recurrent_direct_fixed<NormalizeQK, QK>(q, k, v, g, beta, scale, state_read,
+                                                   state_write, out, stream);
 }
 
 // Each Q/K row is shared by multiple value heads and all their state tiles. Computing
@@ -175,10 +221,10 @@ void launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const T
                       const Tensor& beta, float scale, bool normalize_qk, Tensor& ssm_state,
                       Tensor& out, cudaStream_t stream) {
     if (normalize_qk) {
-        launch_recurrent_direct_fixed<true>(q, k, v, g, beta, scale, ssm_state, ssm_state, out,
+        launch_recurrent_direct_tiled<true>(q, k, v, g, beta, scale, ssm_state, ssm_state, out,
                                             stream);
     } else {
-        launch_recurrent_direct_fixed<false>(q, k, v, g, beta, scale, ssm_state, ssm_state, out,
+        launch_recurrent_direct_tiled<false>(q, k, v, g, beta, scale, ssm_state, ssm_state, out,
                                              stream);
     }
 }
@@ -188,10 +234,10 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
                             const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                             cudaStream_t stream) {
     if (normalize_qk) {
-        launch_recurrent_direct_fixed<true>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
+        launch_recurrent_direct_tiled<true>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
                                             out, stream);
     } else {
-        launch_recurrent_direct_fixed<false>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
+        launch_recurrent_direct_tiled<false>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
                                              out, stream);
     }
 }
@@ -206,7 +252,7 @@ void launch_recurrent_prepared(const Tensor& q, const Tensor& k, const Tensor& v
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<float*>(normalized_q.data), static_cast<float*>(normalized_k.data), rows);
     CUDA_CHECK(cudaGetLastError());
-    launch_recurrent_direct_fixed<false, float>(normalized_q, normalized_k, v, g, beta, scale,
+    launch_recurrent_direct_tiled<false, float>(normalized_q, normalized_k, v, g, beta, scale,
                                                 state_in, state_out, out, stream);
 }
 

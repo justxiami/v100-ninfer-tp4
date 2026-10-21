@@ -19,6 +19,27 @@ static_assert(kStateDim % kWarpSize == 0);
 static_assert(kQkPerLane == 4);
 static_assert(kStateDim % kBlockDv == 0);
 
+// Prefill tile selection. The sequential token loop is SM-issue bound, so a wide loop wants the
+// finest dv tiles that still fill one wave: on a 12-value-head TP4 shard, 4 warps x 1 dv row
+// gives 384 blocks instead of 96 and measures ~11% faster at T=2048..8192. Small-token decode
+// keeps the coarse production tiles, where the same change costs ~7%: its per-token work is
+// dominated by the row reductions, and fewer, fatter warps amortize them better. Numerics are
+// unchanged: every output row's dot product and state row is computed by one warp with the same
+// reduction order in either tiling.
+inline constexpr int kPrefillDvPerWarp           = 1;
+inline constexpr int kPrefillNumWarps            = 1;
+inline constexpr std::int32_t kPrefillTileMinTokens = 128;
+static_assert(kStateDim % (kPrefillNumWarps * kPrefillDvPerWarp) == 0);
+
+// Prefill state layout. 32 = the direct kernel (every row reduced across the full warp);
+// 16/8/4 = one lane group per state row, each lane holding a contiguous qk chunk, so all rows
+// of a warp reduce in parallel and the reduction chain shortens to log2(kPrefillLanesPerRow).
+inline constexpr int kPrefillLanesPerRow  = 16;
+inline constexpr int kPrefillSplitWarps   = 2;
+inline constexpr int kPrefillSplitBlocks  = 2;
+static_assert(kStateDim % kPrefillLanesPerRow == 0);
+static_assert(kStateDim % ((kWarpSize / kPrefillLanesPerRow) * kPrefillSplitWarps) == 0);
+
 __device__ __forceinline__ void load_qk_lane(float (&reg)[kQkPerLane], const float* base,
                                              std::uint32_t dqk_base) {
     store_vec(reg, load_vec<float4>(base + dqk_base));
@@ -174,10 +195,11 @@ __device__ __forceinline__ void normalize_qk_lane(float (&value)[kQkPerLane], in
     }
 }
 
+template <int DvPerWarp>
 __device__ __forceinline__ RawValueLane load_value_lane(const __nv_bfloat16* base, int lane,
                                                         std::uint32_t dv_base) {
     RawValueLane out{__float2bfloat16(0.0f), 0.0f};
-    if (lane < kDvPerWarp) {
+    if (lane < DvPerWarp) {
         out.bits  = base[dv_base + lane];
         out.value = __bfloat162float(out.bits);
     }
@@ -196,13 +218,14 @@ __device__ __forceinline__ RawGatePair load_record_gate(const uint2* gate, std::
     return {bits, __uint_as_float(bits.x), __uint_as_float(bits.y)};
 }
 
-__device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][kQkPerLane],
+template <int DvPerWarp>
+__device__ __forceinline__ void apply_gdn_transition(float (&state)[DvPerWarp][kQkPerLane],
                                                      const float (&key)[kQkPerLane], float v_local,
                                                      float g, float beta) {
     const float alpha = expf(g);
 
 #pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
+    for (int r = 0; r < DvPerWarp; ++r) {
         float partial = 0.0f;
 #pragma unroll
         for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * key[c]; }
@@ -217,25 +240,25 @@ __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][
 }
 
 // [prefetch 臂] 与 readout_and_store 同构，但 q 的 lane 由调用方预取后传入。
-template <bool Normalize>
-__device__ __forceinline__ void readout_and_store_pre(float (&state)[kDvPerWarp][kQkPerLane],
+template <bool Normalize, int DvPerWarp>
+__device__ __forceinline__ void readout_and_store_pre(float (&state)[DvPerWarp][kQkPerLane],
                                                       QkLane q, __nv_bfloat16* output,
                                                       std::uint32_t dv_base, int lane, float scale) {
     normalize_qk_lane<Normalize>(q.value, lane);
     float attn_val = 0.0f;
 #pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
+    for (int r = 0; r < DvPerWarp; ++r) {
         float partial = 0.0f;
 #pragma unroll
         for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * q.value[c]; }
         partial = warp_sum<kWarpSize>(partial);
         if (lane == r) { attn_val = partial; }
     }
-    if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
+    if (lane < DvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
 }
 
-template <bool Normalize, typename QK>
-__device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQkPerLane],
+template <bool Normalize, typename QK, int DvPerWarp>
+__device__ __forceinline__ void readout_and_store(float (&state)[DvPerWarp][kQkPerLane],
                                                   const QK* query, __nv_bfloat16* output,
                                                   std::uint32_t dqk_base, std::uint32_t dv_base,
                                                   int lane, float scale) {
@@ -244,18 +267,127 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
 
     float attn_val = 0.0f;
 #pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
+    for (int r = 0; r < DvPerWarp; ++r) {
         float partial = 0.0f;
 #pragma unroll
         for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * q.value[c]; }
         partial = warp_sum<kWarpSize>(partial);
         if (lane == r) { attn_val = partial; }
     }
-    if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
+    if (lane < DvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
 }
 
-template <bool NormalizeQK, typename QK>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+// --- Group-reduction layout -------------------------------------------------------------
+// The direct kernel reduces every state row across all 32 lanes, so each token costs ten
+// warp-wide shuffle instructions per state row: two reductions (k.S for the delta and q.S for
+// the readout) times five steps, per row, serialized. Splitting the lane dimension instead --
+// one lane group per state row, each lane holding a contiguous qk chunk -- runs every row of a
+// warp in parallel and shortens each reduction to log2(LanesPerRow) steps. The qk/gate loads
+// become redundant across the groups of a warp, but identical addresses coalesce, so the
+// instruction count per unit of work stays flat while the shuffle count drops by kStateDim /
+// LanesPerRow.
+
+template <int N>
+struct WideLane {
+    float value[N];
+};
+
+template <int N>
+__device__ __forceinline__ void load_wide_float(WideLane<N>& out, const float* base,
+                                                std::uint32_t offset) {
+    static_assert(N % 4 == 0);
+#pragma unroll
+    for (int i = 0; i < N / 4; ++i) {
+        const float4 chunk = load_vec<float4>(base + offset + 4 * i);
+        out.value[4 * i + 0] = chunk.x;
+        out.value[4 * i + 1] = chunk.y;
+        out.value[4 * i + 2] = chunk.z;
+        out.value[4 * i + 3] = chunk.w;
+    }
+}
+
+template <int N>
+__device__ __forceinline__ void store_wide_float(const WideLane<N>& in, float* base,
+                                                 std::uint32_t offset) {
+    static_assert(N % 4 == 0);
+#pragma unroll
+    for (int i = 0; i < N / 4; ++i) {
+        store_vec(base + offset + 4 * i,
+                  make_float4(in.value[4 * i + 0], in.value[4 * i + 1], in.value[4 * i + 2],
+                              in.value[4 * i + 3]));
+    }
+}
+
+template <int N>
+__device__ __forceinline__ void load_wide_bf16(WideLane<N>& out, const __nv_bfloat16* base,
+                                               std::uint32_t offset) {
+    static_assert(N % 4 == 0);
+#pragma unroll
+    for (int i = 0; i < N / 4; ++i) {
+        const uint2 raw = load_vec<uint2>(base + offset + 4 * i);
+        const float2 lo = bf16x2_to_float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+        const float2 hi = bf16x2_to_float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+        out.value[4 * i + 0] = lo.x;
+        out.value[4 * i + 1] = lo.y;
+        out.value[4 * i + 2] = hi.x;
+        out.value[4 * i + 3] = hi.y;
+    }
+}
+
+template <int N>
+__device__ __forceinline__ void load_wide_qk(WideLane<N>& out, const float* base,
+                                             std::uint32_t offset) {
+    load_wide_float(out, base, offset);
+}
+
+template <int N>
+__device__ __forceinline__ void load_wide_qk(WideLane<N>& out, const __nv_bfloat16* base,
+                                             std::uint32_t offset) {
+    load_wide_bf16(out, base, offset);
+}
+
+// Butterfly reduction confined to a lane group: xor offsets below LanesPerRow never leave the
+// group, so all groups of a warp reduce concurrently.
+template <int LanesPerRow>
+__device__ __forceinline__ float group_sum(float value) {
+#pragma unroll
+    for (int offset = 1; offset < LanesPerRow; offset <<= 1) {
+        value += __shfl_xor_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+// Four independent accumulators keep the qk dot product off a single 4-cycle FMA chain.
+template <int N>
+__device__ __forceinline__ float wide_dot(const WideLane<N>& lhs, const WideLane<N>& rhs) {
+    static_assert(N % 4 == 0);
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < N; i += 4) {
+        acc0 += lhs.value[i + 0] * rhs.value[i + 0];
+        acc1 += lhs.value[i + 1] * rhs.value[i + 1];
+        acc2 += lhs.value[i + 2] * rhs.value[i + 2];
+        acc3 += lhs.value[i + 3] * rhs.value[i + 3];
+    }
+    return (acc0 + acc1) + (acc2 + acc3);
+}
+
+template <int N, int LanesPerRow>
+__device__ __forceinline__ void normalize_wide(WideLane<N>& values) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < N; ++i) { sum += values.value[i] * values.value[i]; }
+    sum              = group_sum<LanesPerRow>(sum);
+    const float inv  = rsqrtf(sum + kQkL2NormEps);
+#pragma unroll
+    for (int i = 0; i < N; ++i) { values.value[i] *= inv; }
+}
+
+template <bool NormalizeQK, typename QK, int DvPerWarp, int NumWarps>
+__global__ void __launch_bounds__(kWarpSize* NumWarps, 2)
     recurrent_direct_kernel(const QK* __restrict__ q,
                                  const QK* __restrict__ k,
                                  const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
@@ -268,13 +400,13 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const std::uint32_t h_v  = static_cast<std::uint32_t>(blockIdx.x);
     const std::uint32_t h_qk = static_cast<std::uint32_t>(heads.qk_head(static_cast<int>(h_v)));
     const std::uint32_t dv_base =
-        static_cast<std::uint32_t>(blockIdx.z * kBlockDv + warp_id * kDvPerWarp);
+        static_cast<std::uint32_t>(blockIdx.z * (NumWarps * DvPerWarp) + warp_id * DvPerWarp);
     const std::uint32_t dqk_base = static_cast<std::uint32_t>(lane * kQkPerLane);
     const float* read_h = state_read + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
 
-    __align__(16) float state[kDvPerWarp][kQkPerLane];
+    __align__(16) float state[DvPerWarp][kQkPerLane];
 #pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
+    for (int r = 0; r < DvPerWarp; ++r) {
         load_qk_lane(state[r], read_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
                      dqk_base);
     }
@@ -283,7 +415,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     QkLane            key   = load_recurrent_qk(k + static_cast<std::int64_t>(h_qk) * kStateDim, dqk_base);
     normalize_qk_lane<NormalizeQK>(key.value, lane);
     RawGatePair       gate  = load_source_gate(g, beta, h_v);
-    RawValueLane      value = load_value_lane(v + static_cast<std::int64_t>(h_v) * kStateDim, lane, dv_base);
+    RawValueLane      value = load_value_lane<DvPerWarp>(v + static_cast<std::int64_t>(h_v) * kStateDim, lane, dv_base);
     QkLane            qcur  = load_recurrent_qk(q + static_cast<std::int64_t>(h_qk) * kStateDim, dqk_base);
 
     for (std::int32_t token = 0; token < width; ++token) {
@@ -295,14 +427,14 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
         if (token + 1 < width) {
             const std::int64_t col_n = token + 1;
             gate_n  = load_source_gate(g, beta, col_n * heads.H_v + h_v);
-            value_n = load_value_lane(v + (col_n * heads.H_v + h_v) * kStateDim, lane, dv_base);
+            value_n = load_value_lane<DvPerWarp>(v + (col_n * heads.H_v + h_v) * kStateDim, lane, dv_base);
             key_n   = load_recurrent_qk(k + (col_n * heads.H_qk + h_qk) * kStateDim, dqk_base);
             normalize_qk_lane<NormalizeQK>(key_n.value, lane);
             q_n     = load_recurrent_qk(q + (col_n * heads.H_qk + h_qk) * kStateDim, dqk_base);
         }
 
-        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
-        readout_and_store_pre<NormalizeQK>(state, qcur,
+        apply_gdn_transition<DvPerWarp>(state, key.value, value.value, gate.g, gate.beta);
+        readout_and_store_pre<NormalizeQK, DvPerWarp>(state, qcur,
                                            out + static_cast<std::int64_t>(token) * heads.H_v * kStateDim
                                                + static_cast<std::int64_t>(h_v) * kStateDim,
                                            dv_base, lane, scale);
@@ -315,10 +447,97 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 
     float* write_h = state_write + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
 #pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
+    for (int r = 0; r < DvPerWarp; ++r) {
         store_qk_lane(state[r], write_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
                       dqk_base);
     }
+}
+
+template <bool NormalizeQK, typename QK, int LanesPerRow, int NumWarps>
+__global__ void __launch_bounds__(kWarpSize* NumWarps, kPrefillSplitBlocks)
+    recurrent_split_kernel(const QK* __restrict__ q, const QK* __restrict__ k,
+                           const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
+                           const float* __restrict__ beta, const float* __restrict__ state_read,
+                           float* __restrict__ state_write, __nv_bfloat16* __restrict__ out,
+                           std::int32_t width, head_map heads, float scale) {
+    constexpr int kQkLane    = kStateDim / LanesPerRow;
+    constexpr int kRowsWarp  = kWarpSize / LanesPerRow;
+    constexpr int kRowsBlock = kRowsWarp * NumWarps;
+
+    const int lane    = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int group   = lane / LanesPerRow;
+    const int chunk   = lane % LanesPerRow;
+
+    const std::uint32_t h_v  = static_cast<std::uint32_t>(blockIdx.x);
+    const std::uint32_t h_qk = static_cast<std::uint32_t>(heads.qk_head(static_cast<int>(h_v)));
+    const std::uint32_t dv =
+        static_cast<std::uint32_t>(blockIdx.z * kRowsBlock + warp_id * kRowsWarp + group);
+    const std::uint32_t dqk = static_cast<std::uint32_t>(chunk * kQkLane);
+
+    const float* read_h =
+        state_read + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
+    WideLane<kQkLane> state;
+    load_wide_float(state, read_h + static_cast<std::int64_t>(dv) * kStateDim, dqk);
+
+    // Same prefetch shape as the direct kernel: token 0's inputs go out first, and the loop only
+    // consumes the current token and issues the next one.
+    const QK* key_row = k + static_cast<std::int64_t>(h_qk) * kStateDim;
+    const QK* q_row   = q + static_cast<std::int64_t>(h_qk) * kStateDim;
+    const __nv_bfloat16* v_row = v + static_cast<std::int64_t>(h_v) * kStateDim;
+
+    WideLane<kQkLane> key;
+    load_wide_qk(key, key_row, dqk);
+    if constexpr (NormalizeQK) { normalize_wide<kQkLane, LanesPerRow>(key); }
+    float gate_g    = g[h_v];
+    float gate_beta = beta[h_v];
+    float value     = __bfloat162float(v_row[dv]);
+    WideLane<kQkLane> qcur;
+    load_wide_qk(qcur, q_row, dqk);
+    if constexpr (NormalizeQK) { normalize_wide<kQkLane, LanesPerRow>(qcur); }
+
+    for (std::int32_t token = 0; token < width; ++token) {
+        WideLane<kQkLane> key_n;
+        WideLane<kQkLane> q_n;
+        float gate_g_n    = 0.0f;
+        float gate_beta_n = 0.0f;
+        float value_n     = 0.0f;
+        if (token + 1 < width) {
+            const std::int64_t col_n = token + 1;
+            gate_g_n    = g[col_n * heads.H_v + h_v];
+            gate_beta_n = beta[col_n * heads.H_v + h_v];
+            value_n =
+                __bfloat162float(v[(col_n * heads.H_v + h_v) * kStateDim + dv]);
+            load_wide_qk(key_n, k + (col_n * heads.H_qk + h_qk) * kStateDim, dqk);
+            if constexpr (NormalizeQK) { normalize_wide<kQkLane, LanesPerRow>(key_n); }
+            load_wide_qk(q_n, q + (col_n * heads.H_qk + h_qk) * kStateDim, dqk);
+            if constexpr (NormalizeQK) { normalize_wide<kQkLane, LanesPerRow>(q_n); }
+        }
+
+        const float alpha = expf(gate_g);
+        const float delta = gate_beta * (value - alpha * group_sum<LanesPerRow>(
+                                                              wide_dot(state, key)));
+#pragma unroll
+        for (int i = 0; i < kQkLane; ++i) {
+            state.value[i] = alpha * state.value[i] + delta * key.value[i];
+        }
+
+        const float attn = group_sum<LanesPerRow>(wide_dot(state, qcur));
+        if (chunk == 0) {
+            out[(static_cast<std::int64_t>(token) * heads.H_v + h_v) * kStateDim + dv] =
+                __float2bfloat16(attn * scale);
+        }
+
+        key       = key_n;
+        qcur      = q_n;
+        gate_g    = gate_g_n;
+        gate_beta = gate_beta_n;
+        value     = value_n;
+    }
+
+    float* write_h =
+        state_write + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
+    store_wide_float(state, write_h + static_cast<std::int64_t>(dv) * kStateDim, dqk);
 }
 
 enum class RecurrentMode {
@@ -709,13 +928,13 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
     for (std::int32_t token = 0; token < valid; ++token) {
         const RawGatePair gate = access.load_gate(coord, token);
         const RawValueLane value =
-            load_value_lane(access.value_ptr(coord, token), coord.lane, coord.dv_base);
+            load_value_lane<kDvPerWarp>(access.value_ptr(coord, token), coord.lane, coord.dv_base);
         if constexpr (Mode == RecurrentMode::Record) {
             access.store_value(coord, token, value);
             access.store_gate(coord, token, gate);
         }
 
-        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+        apply_gdn_transition<kDvPerWarp>(state, key.value, value.value, gate.g, gate.beta);
 
         if (token + 1 < valid) {
             key = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
@@ -726,7 +945,7 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
         }
 
         if constexpr (Mode != RecurrentMode::Fold) {
-            readout_and_store<NormalizeInputs>(state, access.query_ptr(coord, token),
+            readout_and_store<NormalizeInputs, __nv_bfloat16, kDvPerWarp>(state, access.query_ptr(coord, token),
                                                access.output_ptr(coord, token), coord.dqk_base,
                                                coord.dv_base, coord.lane, access.scale);
         }

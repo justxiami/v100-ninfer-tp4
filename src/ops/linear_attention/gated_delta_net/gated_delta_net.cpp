@@ -6,6 +6,7 @@
 #include "core/layout.h"
 #include "ops/common/math.h"
 #include "ops/linear_attention/gated_delta_net/common.h"
+#include "ops/linear_attention/gated_delta_net/chunked_volta.cuh"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include <cmath>
@@ -187,13 +188,18 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
                                             bool normalize_qk) {
     ChunkedWorkspace out;
 #ifdef NINFER_VOLTA_BUILD
-    if (normalize_qk && tokens >= detail::gated_delta_net::kChunkSize) {
+    const std::int32_t chunked_body = detail::gated_delta_net::chunked_body_tokens(tokens);
+    const bool chunked = detail::gated_delta_net::kChunkedEnabled &&
+                         chunked_body >= detail::gated_delta_net::kChunkedMinTokens;
+    if (chunked) {
+        detail::gated_delta_net::chunked_volta_allocate(allocator, value_heads, chunked_body);
+    }
+    if (!chunked && normalize_qk && tokens >= detail::gated_delta_net::kChunkSize) {
         out.normalized_q =
             allocator.alloc(DType::FP32, {detail::gated_delta_net::kStateDim, qk_heads, tokens});
         out.normalized_k =
             allocator.alloc(DType::FP32, {detail::gated_delta_net::kStateDim, qk_heads, tokens});
     }
-    (void)value_heads;
 #else
     const std::int32_t full =
         (tokens / detail::gated_delta_net::kChunkSize) * detail::gated_delta_net::kChunkSize;
@@ -262,6 +268,43 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
     auto scratch_scope   = ws.scope();
     const std::int32_t T = q.ne[2];
 #ifdef NINFER_VOLTA_BUILD
+    // Chunked route: FLA-style intra-chunk solve plus a chunk-sequential state scan. It wins for
+    // wide inputs and is skipped for short sequences; a partial last chunk falls back to the
+    // sequential kernel with the state carried through.
+    {
+        const std::int32_t chunk_tokens = detail::gated_delta_net::kChunkedTokens;
+        const std::int32_t body         = (T / chunk_tokens) * chunk_tokens;
+        if (detail::gated_delta_net::kChunkedEnabled &&
+            body >= detail::gated_delta_net::kChunkedMinTokens) {
+            if (body == T) {
+                detail::gated_delta_net::launch_chunked_volta(
+                    q, k, v, g, beta, scale, normalize_qk, ws, ssm_state_in, ssm_state_out, out,
+                    stream);
+                return;
+            }
+            Tensor q_body    = q.slice(2, 0, body);
+            Tensor k_body    = k.slice(2, 0, body);
+            Tensor v_body    = v.slice(2, 0, body);
+            Tensor g_body    = g.slice(1, 0, body);
+            Tensor beta_body = beta.slice(1, 0, body);
+            Tensor out_body  = out.slice(2, 0, body);
+            detail::gated_delta_net::launch_chunked_volta(q_body, k_body, v_body, g_body,
+                                                          beta_body, scale, normalize_qk, ws,
+                                                          ssm_state_in, ssm_state_out, out_body,
+                                                          stream);
+            Tensor q_tail    = q.slice(2, body, T - body);
+            Tensor k_tail    = k.slice(2, body, T - body);
+            Tensor v_tail    = v.slice(2, body, T - body);
+            Tensor g_tail    = g.slice(1, body, T - body);
+            Tensor beta_tail = beta.slice(1, body, T - body);
+            Tensor out_tail  = out.slice(2, body, T - body);
+            detail::gated_delta_net::launch_recurrent_inout(q_tail, k_tail, v_tail, g_tail,
+                                                            beta_tail, scale, normalize_qk,
+                                                            ssm_state_out, ssm_state_out, out_tail,
+                                                            stream);
+            return;
+        }
+    }
     // The SM70 route retains the FP32 sequential state transition. For wide normalized
     // inputs, prepare Q/K once instead of repeating their norms for every state tile.
     ChunkedWorkspace scratch = allocate_chunked_workspace(ws, q.ne[1], v.ne[1], T, normalize_qk);
