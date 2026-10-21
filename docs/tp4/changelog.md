@@ -847,3 +847,22 @@ content: 'We need to reply with a short phrase: "PROMised and the user says 'Dia
   → e97e3bce（无 TCP）。
 - **非字节一致说明**：同 seed 下恢复与全量首 token 一致、后段文本有差异；现有
   `restore_turn_checkpoint` 同样如此，故回归闸门用质量+接受率。
+
+## 2026-10-21（十一续）chunked GDN prefill 落生产：详记见 docs/tp4/gdn-chunked-prefill-2026-10-21.md
+
+- **动机**：GDN 段占 prefill 13.9%（8192 token 时 48 层 = 333.3 ms），顺序核已挖到 +26.3%
+  （行×lane 组布局），再往上是算法天花板。
+- **做法**：FLA 式分块。CS=32；块内 `(I+L)^-1` 前代求解（两处 RHS 并行）；块间状态扫描仍顺序
+  （8k 上 256 步而非 8192 步）；FP32 状态按 value 维切块常驻寄存器、喂 WMMA 时转 fp16；
+  衰减一律用 log 空间差值。
+- **选型实测**：CS 16/32/64 → 8.37/3.11/4.01 ms/层；BV 64/32/16 → 9.06/3.42/3.11；
+  拆收缩维（NT 128/256/512 或用原子归约）全部更慢或错。形状探针实测天花板 11.7 TFLOPS。
+- **接入**：新增 `chunked_volta.{cu,cuh}`，`T/32*32 ≥ 128` 走分块、tail 由顺序核续算；
+  workspace 容量与执行重放同样 6 次分配（测试要求峰值精确相等）。
+- **两个真 bug**：① op 的 q/k/v/out 是 BF16，移植时按 FP16 处理 → 输出全零而 state 正常；
+  ② GQA 映射是块状 `h_v/(H_v/H_qk)`，写成了取模（只在 24/8、32/16 暴露）。
+- **验收**：`ninfer_gated_delta_net_test` 全绿；段内 2.04×（6944.8→3400.7 µs/层）；
+  端到端 8k prefill 3502.7→3908.7 tok/s（+11.6%），ttft 2.40→2.15 s，needle 3/3；
+  decode 未动。回滚二进制：`~/backups/2026-10-21-gdn-chunked/serve-before/`。
+- **未做**：未达预注册 3.5× 门（state kernel 装载/计算未重叠，有效 5.5 TFLOPS vs 天花板 11）；
+  workspace 66 MB @prefill-chunk 4096。

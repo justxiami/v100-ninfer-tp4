@@ -38,6 +38,24 @@ Details: [prefix-checkpoint-2026-10-21.md](docs/tp4/prefix-checkpoint-2026-10-21
 **10.26 s → 2.95 s**，回到旧分支 **1.51 s**；代价是全量 prefill **+1.1%**。
 详记：[prefix-checkpoint-2026-10-21.md](docs/tp4/prefix-checkpoint-2026-10-21.md)。
 
+## 2026-10-21: 分块 GDN prefill
+
+48 层 GDN 过去逐 token 走状态（96 个 block，每 token 一次 `k·S` + 一次 `q·S` 的 warp 归约）。
+现在改成 FLA 式分块：32 token 的 chunk 内用前代求解耦合矩阵 `(I+L)^-1`，只有块间状态扫描
+仍是串行 —— 8k 上是 256 步块步，而不是 8,192 步 token 步。
+
+- GDN 段：**6,944.8 → 3,400.7 µs/层（2.04×）**（T=8192，TP4，冷 L2，CUDA Graph，40 samples 中位）
+- 端到端 prefill（llm-ladder，thinking on）：**3,502.7 → 3,908.7 tok/s（+11.6%）**
+- 8k ttft：**2.40 → 2.15 s**；16k：4.60 → 4.40 s；needle 全中
+- decode 路径未动（同一个 snapshot op，字节级回归闸门）
+
+实现要点：FP32 状态按 value 维切块常驻寄存器、喂 WMMA 时才转 fp16；衰减用 log 空间差值
+`exp(gcum_t − gcum_s)`，不做小量除法；块内 Gram 与 qk 走 tensor core，前代求解在线程内完成；
+`T/32*32 ≥ 128` 走分块路径，余下 tail 用顺序核续算（state 串接）。
+
+详记（算法推导、选型扫描、两个真 bug、验收数据、复现命令）：
+[gdn-chunked-prefill-2026-10-21.md](docs/tp4/gdn-chunked-prefill-2026-10-21.md)
+
 ## 本 fork 新增了什么
 
 - **分片几何改为运行时尺寸** —— 编译期双卡假设被彻底移除：运行时、op wrapper 与

@@ -6,9 +6,9 @@
 
 ## TL;DR / 一句话简介
 
-**EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, 3.4k tok/s prefill, ~9.4 GiB/GPU at 128k int8 KV. Long-attention decode routing + MTP4 (2026-10-15): pi-shaped 120k decode **96.0 → 109.1 tok/s (1.136x)**. 2026-10-21: keep-alive first token **−22 ms**; branch/prompt-switch TTFT **10.3 s → 1.5–3.0 s**.
+**EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, prefill **3.9k tok/s** (chunked GDN: +11.6% over 3,502.7), ~9.4 GiB/GPU at 128k int8 KV. Long-attention decode routing + MTP4 (2026-10-15): pi-shaped 120k decode **96.0 → 109.1 tok/s (1.136x)**. 2026-10-21: keep-alive first token **−22 ms**; branch/prompt-switch TTFT **10.3 s → 1.5–3.0 s**.
 
-**中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill 3.4k tok/s、128k int8 KV 下每卡 ~9.4 GiB。长注意力 decode 路由 + MTP4（2026-10-15）：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**。
+**中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill **3.9k tok/s**（分块 GDN：较 3,502.7 +11.6%）、128k int8 KV 下每卡 ~9.4 GiB。长注意力 decode 路由 + MTP4（2026-10-15）：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**。
 
 
 Single-instance Qwen3.8-27B inference across **4 × Tesla V100-SXM2 16 GB**
@@ -49,6 +49,24 @@ Details: [prefix-checkpoint-2026-10-21.md](docs/tp4/prefix-checkpoint-2026-10-21
 后续请求若共享长前缀，选 frontier ≤ LCP 的最远 checkpoint 续播，不再重算。32k 分支：
 **10.26 s → 2.95 s**，回到旧分支 **1.51 s**；代价是全量 prefill **+1.1%**。
 详记：[prefix-checkpoint-2026-10-21.md](docs/tp4/prefix-checkpoint-2026-10-21.md)。
+
+## 2026-10-21: chunked GDN prefill / 分块 GDN prefill
+
+**EN** — The 48 GDN layers used to walk the state one token at a time (96 blocks, one `k·S` plus
+one `q·S` warp reduction per token). They now run FLA-style chunked: a 32-token chunk solves its
+intra-chunk coupling with forward substitution, and only the chunk-to-chunk state scan stays
+sequential — 256 chunk steps instead of 8,192 token steps at 8k. GDN segment
+**6,944.8 → 3,400.7 µs/layer (2.04×)**, end-to-end prefill **3,502.7 → 3,908.7 tok/s (+11.6%)**,
+ttft at 8k **2.40 → 2.15 s**, needle 3/3. The FP32 state still lives in registers, decay is
+applied in log space, and the decode path is untouched (same snapshot op). Details:
+[gdn-chunked-prefill-2026-10-21.md](docs/tp4/gdn-chunked-prefill-2026-10-21.md).
+
+**中文** — 48 层 GDN 过去逐 token 走状态（96 个 block，每 token 两次 warp 归约）。现在改成
+FLA 式分块：32 token 的 chunk 内用前代求解耦合矩阵，只有块间状态扫描仍是串行 —— 8k 上是
+256 步块步，而不是 8,192 步 token 步。GDN 段 **6,944.8 → 3,400.7 µs/层（2.04×）**，端到端
+prefill **3,502.7 → 3,908.7 tok/s（+11.6%）**，8k ttft **2.40 → 2.15 s**，needle 3/3。
+FP32 状态仍常驻寄存器、衰减走 log 空间、decode 路径完全未动（同一个 snapshot op）。
+详记：[gdn-chunked-prefill-2026-10-21.md](docs/tp4/gdn-chunked-prefill-2026-10-21.md)。
 
 ## What this fork adds / 本 fork 新增了什么
 
@@ -150,6 +168,7 @@ ones.
 | Committed decode — 2,048-token thinking run (t=1.0 / top_p=0.95 / top_k=20) | 62.6 tok/s | **113.1 tok/s (1.81×)** |
 | MTP draft acceptance — same run | 30.8–34.1% | **47.5%** |
 | Prefill — 17.4k prompt (needle test, retrieval hit ✓) | — | **3,372.8 tok/s** |
+| Prefill — 8.1k prompt (chunked GDN, 2026-10-21) | 3,502.7 tok/s | **3,908.7 tok/s (1.12×)** |
 | Prefill — 5.8k prompt | — | 3,494.6 tok/s |
 | Short-answer decode — 96 tokens | — | 124–140 tok/s (acceptance 56–66%) |
 | VRAM per GPU (weights + 128k int8 KV + graphs) | 15.2 GiB | **9.39 GiB** |
@@ -170,6 +189,7 @@ decode tok/s 只计已提交的输出 token，不含被拒的 draft。
 | 已提交 decode — 2,048-token 思考跑（t=1.0 / top_p=0.95 / top_k=20） | 62.6 tok/s | **113.1 tok/s（1.81×）** |
 | MTP draft 接受率 — 同跑 | 30.8–34.1% | **47.5%** |
 | Prefill — 17.4k prompt（needle 测试，检索命中 ✓） | — | **3,372.8 tok/s** |
+| Prefill — 8.1k prompt (chunked GDN, 2026-10-21) | 3,502.7 tok/s | **3,908.7 tok/s (1.12×)** |
 | Prefill — 5.8k prompt | — | 3,494.6 tok/s |
 | 短答 decode — 96 token | — | 124–140 tok/s（接受率 56–66%） |
 | 每卡显存（权重 + 128k int8 KV + graph） | 15.2 GiB | **9.39 GiB** |
