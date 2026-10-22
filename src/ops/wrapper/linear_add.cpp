@@ -1,3 +1,5 @@
+#include "core/prefill_profile.h"
+
 #include "ninfer/ops/linear_add.h"
 
 #include "ninfer/ops/residual_add.h"
@@ -426,7 +428,11 @@ void linear_add_row_parallel(const TpArray<Tensor>& x, const TpArray<Weight>& w,
     // restated here. Its local combine is the same `x += y` computation issue_fused_rank's BF16
     // branch already used, so the two extra roundings a split evaluation always carries (linear.h's
     // row-parallel numerical note) are the only source of divergence from the tp1 fused kernel.
-    allreduce_sum(target, staging, ec, events);
+    {
+        // Nested inside the caller's projection segment: this is the collective's own share of it.
+        profile::Scope seg(profile::Seg::AllReduce, profile::profile_stream());
+        allreduce_sum(target, staging, ec, events);
+    }
 }
 
 void linear_add_row_parallel(const TpArray<Tensor>& x, const TpArray<Weight>& w,

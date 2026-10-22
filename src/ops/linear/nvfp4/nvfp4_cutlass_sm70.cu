@@ -209,7 +209,9 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
     // The same 64x64 warp contraction gains output-column reuse on the wide TP2 MLPs.
     // Narrow calls and other registered geometries retain their measured 128-column tile.
     if (x.ne[1] >= 2048 && ((w.n == 17408 && w.k == 5120) ||
-                             (w.n == 5120 && w.k == 8704))) {
+                             (w.n == 5120 && w.k == 8704) ||
+                             (w.n == 8704 && w.k == 5120) ||   // TP4 gate/up shard
+                             (w.n == 5120 && w.k == 4352))) {   // TP4 down shard
         launch_impl<ElementOutput, 256>(x, w, out, ws, stream);
     } else {
         launch_impl<ElementOutput, 128>(x, w, out, ws, stream);

@@ -69,6 +69,28 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
 // 12K prompt mask would be 288 MB and grows quadratically, one Q-block's is
 // ~25 MB at that length. Phase 4 sweeps this.
 inline constexpr std::int32_t kVoltaFlashQBlockTokens = 1024;
+// The Split-D route needs no causal-mask staging (its kernel derives the mask from
+// query_len/kv_len), so it is not bound by the mask's O(n_kv x tokens) footprint and can
+// take the whole prefill chunk in one call. That matters: the kernel's grid is
+// (tokens/64, 1, heads), so a 1024-token block gives 96 blocks on 80 SMs (1.2 waves) while a
+// 4096-token block gives 384 (4.8 waves). Measured in isolation: 37.1 TF at 8k, 46.9 at 120k.
+inline constexpr std::int32_t kSplitDQBlockTokens = 4096;
+// Route switch for the Split-D kernel. Default ON (measurd: neutral at 8k, +2.7~3.9% at 32k,
+// +9.2% at 120k); NINFER_ATTN_SPLITD=0 turns it off, which is also the A/B arm.
+//
+// The kernel derives its causal mask from (query_len, kv_len) and therefore ASSUMES the
+// chunk's positions are consecutive. That holds for every prefill call this route admits:
+// volu_flash_route_possible requires batch_size 1 and the envelope requires
+// min_visible_keys == max_visible_keys (a per-row visible-key spread, which a holey position
+// layout would produce, rejects the route). The llama.cpp route builds its mask from the
+// device-side positions explicitly, so it stays correct for anything this one would not.
+inline bool splitd_enabled() {
+    static const bool on = [] {
+        const char* raw = std::getenv("NINFER_ATTN_SPLITD");
+        return !(raw != nullptr && raw[0] == '0');
+    }();
+    return on;
+}
 
 // Below this width the chunked route's smaller fixed cost wins, and the staging
 // buffers are not worth allocating.

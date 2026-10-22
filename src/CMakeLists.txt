@@ -26,6 +26,7 @@ add_library(ninfer_core STATIC
   core/layout.cpp
   core/tensor.cpp
   core/decode_graph.cpp
+  core/prefill_profile.cu
   core/tp_comm.cu
   runtime/engine/admission_policy.cpp
   runtime/engine/kv_capacity.cpp
@@ -311,9 +312,16 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_volta_qpn.cu
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_qpn_split.cu
     ops/launcher/gqa_attention_volta_flash.cu
-    ops/launcher/vision_attention_volta_flash.cu)
+    ops/launcher/vision_attention_volta_flash.cu
+    ops/launcher/gqa_attention_splitd_sm70.cu)
   target_link_libraries(ninfer_ops PRIVATE nvidia::cutlass::cutlass)
   target_compile_options(ninfer_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  set_source_files_properties(
+    ops/launcher/gqa_attention_splitd_sm70.cu
+    TARGET_DIRECTORY ninfer_ops
+    PROPERTIES
+      INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/src/ops/vendor/flash_v100"
+      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-diag-suppress=940>")
   set_source_files_properties(
     ops/launcher/gqa_attention_volta_flash.cu
     ops/launcher/vision_attention_volta_flash.cu

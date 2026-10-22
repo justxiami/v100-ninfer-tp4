@@ -2,6 +2,8 @@
 #include "ninfer/ops/gqa_attention.h"
 
 #include "core/layout.h"
+#include <cstdlib>
+
 #include "ops/launcher/gqa_attention.h"
 
 #include <algorithm>
@@ -337,13 +339,18 @@ VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace, std::in
         ((visible + detail::kVoltaFlashKeyPad - 1) / detail::kVoltaFlashKeyPad) *
         detail::kVoltaFlashKeyPad;
     const std::int32_t tokens   = std::min(width, detail::kVoltaFlashQBlockTokens);
+    // The Split-D route runs the whole prefill chunk in one call and only needs the fp32
+    // staging buffers (q/out), never the mask, so size those two for the wider block.
+    const std::int32_t q_tokens =
+        detail::splitd_enabled() ? std::max(tokens, std::min(width, detail::kSplitDQBlockTokens))
+                                 : tokens;
 
     return {
         workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
         workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
         workspace.alloc(DType::FP16, {n_kv, tokens + detail::kVoltaFlashMaskRowPad, 1, 1}),
-        workspace.alloc(DType::FP32, {kHeadDim, q_heads, tokens, 1}),
-        workspace.alloc(DType::FP32, {kHeadDim, q_heads, tokens, 1}),
+        workspace.alloc(DType::FP32, {kHeadDim, q_heads, q_tokens, 1}),
+        workspace.alloc(DType::FP32, {kHeadDim, q_heads, q_tokens, 1}),
         workspace.alloc(DType::FP32,
                         {2, static_cast<std::int32_t>(
                                 detail::gqa_attention_volta_flash_meta_elements(q_heads, tokens)),
@@ -424,7 +431,14 @@ GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t
     //  - the envelope must cover the width, or `base` below would go negative.
     //  - the gather stages BF16 cache rows into FP16, or dequantizes INT8-G64
     //    cache rows into the same FP16 boundary once per layer.
-    if (volta_flash_route_possible(q_heads, width, batch_size, cache_dtype) &&
+    // [2026-10-22] 诊断开关（默认关）：强制走 ninfer 自有的 ChunkedSmallT 路线，用来给
+    // 「自研 Volta 核 vs vendored fattn」量出基线差距。生产不设此变量时行为完全不变。
+    static const bool force_chunked_small_t = [] {
+        const char* raw = std::getenv("NINFER_ATTN_FORCE_CHUNKED");
+        return raw != nullptr && raw[0] != '0';
+    }();
+    if (!force_chunked_small_t &&
+        volta_flash_route_possible(q_heads, width, batch_size, cache_dtype) &&
         envelope.min_visible_keys == envelope.max_visible_keys &&
         envelope.max_visible_keys >= static_cast<std::uint32_t>(width)) {
         return GqaAttentionRoute::VoltaFlash;

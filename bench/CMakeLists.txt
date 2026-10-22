@@ -21,6 +21,7 @@ ninfer_add_op_bench(ninfer_gated_delta_net_bench SOURCES ops/gated_delta_net_ben
 ninfer_add_op_bench(ninfer_gdn_replay_bench SOURCES ops/gdn_replay_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_layer_bench SOURCES ops/gdn_layer_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_chunked_shape_bench SOURCES ops/gdn_chunked_shape_bench.cu)
+ninfer_add_op_bench(ninfer_prefill_attn_volta_bench SOURCES ops/prefill_attn_volta_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_chunked_core_probe SOURCES ops/gdn_chunked_core_probe.cu)
 ninfer_add_op_bench(ninfer_gdn_chunked_op_probe SOURCES ops/gdn_chunked_op_probe.cu)
 ninfer_add_op_bench(ninfer_gdn_chunked_v3_probe SOURCES ops/gdn_chunked_v3_probe.cu)

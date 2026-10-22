@@ -1,5 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
+
+#include "core/prefill_profile.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "ninfer/ops/argmax.h"
@@ -132,12 +134,17 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         const auto context_roots =
             workspace_recipe::dflash_context<Config>(state.execution.work, columns);
         Tensor projected = context_roots.projected;
-        ops::linear(features.view({Config::feature_rows, columns}),
-                    state.execution.model.dflash->feature_projection, projected,
-                    state.execution.device.stream);
-        Tensor context = context_roots.normalized;
-        ops::rmsnorm(projected, state.execution.model.dflash->context_norm, Config::rms_epsilon,
-                     false, context, state.execution.device.stream);
+        Tensor context   = context_roots.normalized;
+        {
+            profile::Scope seg(profile::Seg::DFlashFeat,
+                               state.execution.device.stream);
+            ops::linear(features.view({Config::feature_rows, columns}),
+                        state.execution.model.dflash->feature_projection, projected,
+                        state.execution.device.stream);
+            ops::rmsnorm(projected, state.execution.model.dflash->context_norm,
+                         Config::rms_epsilon, false, context, state.execution.device.stream);
+        }
+        profile::Scope seg_layers(profile::Seg::DFlashLayers, state.execution.device.stream);
 
         for (int layer = 0; layer < Config::layers; ++layer) {
             auto layer_scope = state.execution.work.scope();

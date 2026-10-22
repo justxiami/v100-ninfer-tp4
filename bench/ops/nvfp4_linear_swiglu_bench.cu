@@ -107,10 +107,8 @@ Options parse_options(int argc, char** argv) {
     if (options.profile && options.t_sweep.size() != 1) {
         throw std::invalid_argument("--profile requires exactly one T");
     }
-    if (options.policy == ops::LinearPolicy::A16Only &&
-        *std::max_element(options.t_sweep.begin(), options.t_sweep.end()) > 16) {
-        throw std::invalid_argument("A16 policy is registered only through T=16");
-    }
+    // [2026-10-22] 该守卫已过期：Volta 构建上 A16 在任意 T 都走「反量化 + CUTLASS sm70」路线
+    // （text_policy() 在 NINFER_VOLTA_BUILD 下把 nvfp4 钉成 A16Only），生产 prefill 用的就是它。
     return options;
 }
 

@@ -26,9 +26,12 @@
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/launcher/gqa_attention.h"
+#include "ops/launcher/gqa_attention_splitd_sm70.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <map>
@@ -517,9 +520,52 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     // 3. Q-blocks. Bounding the block bounds mask memory, and lets earlier blocks
     //    attend over a shorter key range than later ones.
     const std::int32_t base = n_kv_total - width;
-    for (std::int32_t begin = 0; begin < width; begin += q_block_tokens) {
-        const std::int32_t tokens = std::min(q_block_tokens, width - begin);
+    // Env-gated route to the vendored Flash-V100 Split-D kernel (BSD-3, src/ops/vendor/flash_v100).
+    // Measured on this box at head_dim 256: 37.1 TF @8k, 40.5 @32k, 46.9 @120k vs 35.5 for the
+    // llama.cpp route. Default off so the two routes can be A/B'd without a rebuild.
+    const bool use_splitd = splitd_enabled();
+
+    // The Split-D kernel's grid is (tokens/64, 1, heads) with no KV splitting, so a 1024-token
+    // block leaves 96 blocks on 80 SMs (1.2 waves, ~60% utilisation) while 4096 gives 384 (4.8).
+    // It needs no mask staging, so it can take the whole chunk when the chunk divides evenly.
+    // Only widen the block when the Split-D kernel will handle EVERY block: the llama.cpp
+    // fallback still needs its mask, which is sized for kVoltaFlashQBlockTokens.
+    constexpr std::int32_t kSplitDMinKeys = 16384;
+    const bool splitd_wide =
+        use_splitd && width % kSplitDQBlockTokens == 0 && round_up_keys(base + width) >= kSplitDMinKeys;
+    const std::int32_t step = splitd_wide ? kSplitDQBlockTokens : q_block_tokens;
+
+    for (std::int32_t begin = 0; begin < width; begin += step) {
+        const std::int32_t tokens = std::min(step, width - begin);
         const std::int32_t n_kv   = round_up_keys(base + begin + tokens);
+        // Only worth it once attention dominates: +10.6% at 120k, +2.8% at 32k, ~-1% at 8k
+        // (there attention is 6% of the chunk and the two fp16 conversions are pure overhead).
+        // Threshold is in visible keys, not prompt length.
+        if (splitd_wide && splitd_supported(tokens, n_kv, kQHeads, kKVHeads)) {
+            // The Split-D kernel derives the causal mask from (tokens, n_kv) itself and writes
+            // fp16; reuse the fp32 workspace buffers (each is 2x the fp16 size) as the fp16
+            // staging so no extra workspace is needed.
+            const std::int64_t count = static_cast<std::int64_t>(tokens) * kQHeads * kHeadDim;
+            __half* q16 = reinterpret_cast<__half*>(q_f32.data);
+            __half* o16 = reinterpret_cast<__half*>(out_f32.data);
+            splitd_convert_q(static_cast<const __nv_bfloat16*>(q.data) +
+                                 static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
+                             q16, count, stream);
+            splitd_launch(q16, static_cast<const __half*>(k_gathered.data),
+                          static_cast<const __half*>(v_gathered.data), o16, tokens, n_kv, kQHeads,
+                          kKVHeads, scale, stream);
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                std::fprintf(stderr, "volta_flash: splitd route active (tokens=%d n_kv=%d heads=%d/%d)\n",
+                             tokens, n_kv, kQHeads, kKVHeads);
+            }
+            splitd_convert_out(o16,
+                               static_cast<__nv_bfloat16*>(out.data) +
+                                   static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
+                               count, stream);
+            continue;
+        }
         const std::int32_t rows_padded =
             ((tokens + kVoltaFlashMaskRowPad - 1) / kVoltaFlashMaskRowPad) * kVoltaFlashMaskRowPad;
 

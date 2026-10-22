@@ -6,6 +6,7 @@
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "core/nvtx.h"
+#include "core/prefill_profile.h"
 #include "targets/qwen3_6/impl/runtime/visual_scatter.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
@@ -1840,12 +1841,18 @@ void TextContext::attn_mix_tp2(TpArray<Tensor>& x, int fidx, Phase ph,
         k_flat[r]    = k[r].view({shard_kv_size(), T});
         v_flat[r]    = v[r].view({shard_kv_size(), T});
     }
-    for_each_rank(execution, [&](int rank) {
-        const auto r = static_cast<std::size_t>(rank);
-        ops::rmsnorm(x[r], *w[r]->input_norm, kCfg.rms_eps, true, h[r], stream_for(rank));
-    });
-    Variant::attention_projection(h, attention_projections(fidx), q_flat, gate_flat, k_flat, v_flat,
-                                  ph, ws, execution);
+    {
+        profile::Scope seg(profile::Seg::NormIn, stream_for(0));
+        for_each_rank(execution, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::rmsnorm(x[r], *w[r]->input_norm, kCfg.rms_eps, true, h[r], stream_for(rank));
+        });
+    }
+    {
+        profile::Scope seg(profile::Seg::AttnProj, stream_for(0));
+        Variant::attention_projection(h, attention_projections(fidx), q_flat, gate_flat, k_flat,
+                                      v_flat, ph, ws, execution);
+    }
 
     TpArray<Tensor> qn;
     TpArray<Tensor> kn;
@@ -1862,11 +1869,15 @@ void TextContext::attn_mix_tp2(TpArray<Tensor>& x, int fidx, Phase ph,
         cudaStream_t s      = stream_for(rank);
         const Tensor& cache = rank_cache_positions(rank);
         const Tensor& rope  = rank_rope_positions(rank);
-        ops::rmsnorm(q[r], *w[r]->q_norm, kCfg.rms_eps, true, qn[r], s);
-        ops::rmsnorm(k[r], *w[r]->k_norm, kCfg.rms_eps, true, kn[r], s);
-        Tensor rope_for_op = active_sequence_batch_ != 0 ? rope.view({T}) : rope;
-        ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn[r], kn[r],
-                  rope_frequency_[r], s);
+        {
+            profile::Scope seg(profile::Seg::AttnNormRope, s);
+            ops::rmsnorm(q[r], *w[r]->q_norm, kCfg.rms_eps, true, qn[r], s);
+            ops::rmsnorm(k[r], *w[r]->k_norm, kCfg.rms_eps, true, kn[r], s);
+            Tensor rope_for_op = active_sequence_batch_ != 0 ? rope.view({T}) : rope;
+            ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn[r], kn[r],
+                      rope_frequency_[r], s);
+        }
+        profile::Scope seg_core(profile::Seg::AttnCore, s);
 
         const qwen3_6::PagedKVCache& pages = rank_batch_kv(rank);
         if (active_sequence_batch_ != 0) {
@@ -1892,15 +1903,22 @@ void TextContext::attn_mix_tp2(TpArray<Tensor>& x, int fidx, Phase ph,
                                kAttnScale, pages.batch_layer_view(fidx), *active_gqa_envelope_,
                                *ws[r], a[r], s);
         }
-        ops::sigmoid_mul(gate[r], a[r], s);
+        seg_core.stop();
+        {
+            profile::Scope seg_gate(profile::Seg::AttnGate, s);
+            ops::sigmoid_mul(gate[r], a[r], s);
+        }
     });
 
     TpArray<Tensor> a_flat;
     for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         a_flat[r] = a[r].view({shard_q_size(), T});
     }
-    Variant::attention_output_projection(a_flat, attention_output_weights(fidx), x, staging, ph, ws,
-                                         execution, peer_events());
+    {
+        profile::Scope seg(profile::Seg::AttnOutProj, stream_for(0));
+        Variant::attention_output_projection(a_flat, attention_output_weights(fidx), x, staging, ph,
+                                             ws, execution, peer_events());
+    }
 }
 
 void TextContext::gdn_mix_tp2(TpArray<Tensor>& x, int gidx, Phase ph,
@@ -1933,11 +1951,17 @@ void TextContext::gdn_mix_tp2(TpArray<Tensor>& x, int gidx, Phase ph,
     // The tp1 leaf fuses this RMSNorm into the gating GEMM. There is no split form of the fused
     // kernel and no need for one: the norm is replicated elementwise work over the full-width
     // residual, so it runs per rank and the gating GEMM is the column-parallel leaf.
-    for_each_rank(execution, [&](int rank) {
-        const auto r = static_cast<std::size_t>(rank);
-        ops::rmsnorm(x[r], *w[r]->input_norm, kCfg.rms_eps, true, h[r], stream_for(rank));
-    });
-    Variant::gdn_control_projection(h, gdn_projections(gidx), g, beta, ws, execution);
+    {
+        profile::Scope seg(profile::Seg::NormIn, stream_for(0));
+        for_each_rank(execution, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::rmsnorm(x[r], *w[r]->input_norm, kCfg.rms_eps, true, h[r], stream_for(rank));
+        });
+    }
+    {
+        profile::Scope seg(profile::Seg::GdnCtrlProj, stream_for(0));
+        Variant::gdn_control_projection(h, gdn_projections(gidx), g, beta, ws, execution);
+    }
 
     if (ph == Phase::Verify) {
         if (active_sequence_batch_ == 0) {
@@ -2003,19 +2027,26 @@ void TextContext::gdn_mix_tp2(TpArray<Tensor>& x, int gidx, Phase ph,
             qkv[r]   = conv.projected;
             qkv_c[r] = conv.convolved;
         }
-        Variant::gdn_input_projection(h, gdn_projections(gidx), qkv, z, ph, ws, execution);
-        for_each_rank(execution, [&](int rank) {
-            const auto r      = static_cast<std::size_t>(rank);
-            cudaStream_t s    = stream_for(rank);
-            Tensor conv_state = state_for(rank).conv_slot(static_cast<std::uint32_t>(gidx),
-                                                          linear_state_current_slot_);
-            ops::causal_conv1d_silu(qkv[r], *w[r]->conv1d, conv_state, conv_state, qkv_c[r], s);
-            // Shard-local section offsets: this device's convolved block is its own
-            // q(1024) | k(1024) | v(3072), not the model's 2048 | 2048 | 6144.
-            ops::extract_bf16_columns(qkv_c[r], 0, qc[r], s);
-            ops::extract_bf16_columns(qkv_c[r], shard_key_dim(), kc[r], s);
-            ops::extract_bf16_columns(qkv_c[r], 2 * shard_key_dim(), vc[r], s);
-        });
+        {
+            profile::Scope seg(profile::Seg::GdnInProj, stream_for(0));
+            Variant::gdn_input_projection(h, gdn_projections(gidx), qkv, z, ph, ws, execution);
+        }
+        {
+            profile::Scope seg(profile::Seg::GdnConv, stream_for(0));
+            for_each_rank(execution, [&](int rank) {
+                const auto r      = static_cast<std::size_t>(rank);
+                cudaStream_t s    = stream_for(rank);
+                Tensor conv_state = state_for(rank).conv_slot(static_cast<std::uint32_t>(gidx),
+                                                              linear_state_current_slot_);
+                ops::causal_conv1d_silu(qkv[r], *w[r]->conv1d, conv_state, conv_state, qkv_c[r],
+                                        s);
+                // Shard-local section offsets: this device's convolved block is its own
+                // q(1024) | k(1024) | v(3072), not the model's 2048 | 2048 | 6144.
+                ops::extract_bf16_columns(qkv_c[r], 0, qc[r], s);
+                ops::extract_bf16_columns(qkv_c[r], shard_key_dim(), kc[r], s);
+                ops::extract_bf16_columns(qkv_c[r], 2 * shard_key_dim(), vc[r], s);
+            });
+        }
     }
 
     TpArray<Tensor> o;
@@ -2061,6 +2092,7 @@ void TextContext::gdn_mix_tp2(TpArray<Tensor>& x, int gidx, Phase ph,
                                               slots, slots, out_batch, s);
             }
         } else {
+            profile::Scope seg_core(profile::Seg::GdnCore, s);
             Tensor recurrent_state = state_for(rank).recurrent_slot(
                 static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
             ops::gated_delta_net(q_recurrent, k_recurrent, vv, g[r], beta[r], kGdnScale,
@@ -2068,15 +2100,21 @@ void TextContext::gdn_mix_tp2(TpArray<Tensor>& x, int gidx, Phase ph,
         }
         // `gdn_norm` is the per-head-DIMENSION gain {128}: replicated, so each rank applies the
         // whole weight over its own 24 value heads.
-        ops::gated_rmsnorm(o[r], *w[r]->gdn_norm, z[r], kCfg.rms_eps, on[r], s);
+        {
+            profile::Scope seg(profile::Seg::GdnNormOut, s);
+            ops::gated_rmsnorm(o[r], *w[r]->gdn_norm, z[r], kCfg.rms_eps, on[r], s);
+        }
     });
 
     TpArray<Tensor> on_flat;
     for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         on_flat[r] = on[r].view({shard_value_dim(), T});
     }
-    Variant::gdn_output_projection(on_flat, gdn_output_weights(gidx), x, staging, ph, ws, execution,
-                                   peer_events());
+    {
+        profile::Scope seg(profile::Seg::GdnOutProj, stream_for(0));
+        Variant::gdn_output_projection(on_flat, gdn_output_weights(gidx), x, staging, ph, ws,
+                                       execution, peer_events());
+    }
 }
 
 void TextContext::mlp_tail_tp2(TpArray<Tensor>& x, int index, bool full_attention, Phase ph,
@@ -2094,10 +2132,13 @@ void TextContext::mlp_tail_tp2(TpArray<Tensor>& x, int index, bool full_attentio
     for (std::size_t r = 0; r < static_cast<std::size_t>(execution.tp); ++r) {
         h[r] = workspace_recipe::post_mixer_hidden<TextConfig>(*ws[r], T);
     }
-    for_each_rank(execution, [&](int rank) {
-        const auto r = static_cast<std::size_t>(rank);
-        ops::rmsnorm(x[r], *norm[r], kCfg.rms_eps, true, h[r], stream_for(rank));
-    });
+    {
+        profile::Scope seg(profile::Seg::NormPost, stream_for(0));
+        for_each_rank(execution, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::rmsnorm(x[r], *norm[r], kCfg.rms_eps, true, h[r], stream_for(rank));
+        });
+    }
     const TpArray<const MlpWeights*> mixers =
         full_attention ? full_post_mixers(index) : gdn_post_mixers(index);
     Variant::post_mixer(h, mixers, x, staging, ph, ws, execution, peer_events());
@@ -2307,6 +2348,8 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
     const bool prepare_mtp_prompt     = mtp_enabled() && io_.mtp.has_value();
     nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                   static_cast<std::uint64_t>(len));
+    profile::set_profile_stream(stream_for(0));
+    profile::begin_chunk(len, base_i, tp_count_);
     work_.reset();
     reset_peer_workspaces();
     {
@@ -2345,24 +2388,27 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
             }
         }
         const bool media_chunk = !local_scatter_indices.empty();
-        for_each_rank(execution, [&](int rank) {
-            const auto r   = static_cast<std::size_t>(rank);
-            cudaStream_t s = stream_for(rank);
-            copy_i32(ids.data(), ids_device[r], s);
-            ops::fill_i32_positions(positions[r], base_i, s);
-            if (multimodal != nullptr) { copy_i32(rope_host.data(), rope_positions[r], s); }
-            // A media-bearing chunk is built once, on rank 0: it embeds, scatters the encoded
-            // Vision embeddings into its residual, and the peers' residual arrives as a copy of
-            // it (below). Every other chunk is the ordinary replicated embedding stage.
-            if (rank != 0 && media_chunk) { return; }
-            ops::embedding(ids_device[r], rank_embed(rank), x[r], s);
-            if (media_chunk) {
-                copy_i32(local_scatter_indices.data(), scatter_indices_device[r], s);
-                Tensor embeddings = vision_chunk.embeddings.slice(
-                    1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
-                ops::scatter(embeddings, scatter_indices_device[r], x[r], s);
-            }
-        });
+        {
+            profile::Scope seg(profile::Seg::Embed, stream_for(0));
+            for_each_rank(execution, [&](int rank) {
+                const auto r   = static_cast<std::size_t>(rank);
+                cudaStream_t s = stream_for(rank);
+                copy_i32(ids.data(), ids_device[r], s);
+                ops::fill_i32_positions(positions[r], base_i, s);
+                if (multimodal != nullptr) { copy_i32(rope_host.data(), rope_positions[r], s); }
+                // A media-bearing chunk is built once, on rank 0: it embeds, scatters the encoded
+                // Vision embeddings into its residual, and the peers' residual arrives as a copy
+                // of it (below). Every other chunk is the ordinary replicated embedding stage.
+                if (rank != 0 && media_chunk) { return; }
+                ops::embedding(ids_device[r], rank_embed(rank), x[r], s);
+                if (media_chunk) {
+                    copy_i32(local_scatter_indices.data(), scatter_indices_device[r], s);
+                    Tensor embeddings = vision_chunk.embeddings.slice(
+                        1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
+                    ops::scatter(embeddings, scatter_indices_device[r], x[r], s);
+                }
+            });
+        }
         if (media_chunk) {
             // The Vision embeddings live on rank 0's device, and no peer reads another device's
             // memory at tp > 2 (peer access is opened for the tp2 pair only): each peer waits on
@@ -2416,11 +2462,14 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
             xf[r] = retention.data != nullptr ? matrix_window(retention, len)
                                               : ws[r]->alloc(DType::BF16, {kCfg.hidden, len});
         }
-        for_each_rank(execution, [&](int rank) {
-            const auto r = static_cast<std::size_t>(rank);
-            ops::rmsnorm(x[r], rank_final_norm(rank), kCfg.rms_eps, true,
-                         xf[r], stream_for(rank));
-        });
+        {
+            profile::Scope seg(profile::Seg::FinalNorm, stream_for(0));
+            for_each_rank(execution, [&](int rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                ops::rmsnorm(x[r], rank_final_norm(rank), kCfg.rms_eps, true, xf[r],
+                             stream_for(rank));
+            });
+        }
 
         if (is_last) {
             TpArray<Tensor> last;
@@ -2430,13 +2479,17 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                 last[r]         = xf[r].slice(1, len - 1, 1);
                 chunk_logits[r] = matrix_window(io_for(rank).logits, 1);
             }
-            logits_tp2(last, chunk_logits);
+            {
+                profile::Scope seg(profile::Seg::LmHead, stream_for(0));
+                logits_tp2(last, chunk_logits);
+            }
             // Sampling belongs to rank 0 alone: it consumes the reconstructed FULL logits and
             // writes the single committed token.
             const CurrentDevice restore;
             CUDA_CHECK(cudaSetDevice(ctx_.device));
             ops::set_i32_scalar(io_.pos, base_i + T, ctx_.stream);
             ops::set_i32_scalar(io_.rope_pos, base_i + T, ctx_.stream);
+            profile::Scope seg_sample(profile::Seg::Sample, stream_for(0));
             if (sampling_config_ != nullptr) {
                 ops::sample(chunk_logits[0], io_.token, kCfg.token_domain, sampling_config_,
                             io_.pos, ops::kSamplePurposePrefill, work_, ctx_.stream);
@@ -2612,6 +2665,7 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         dflash_sink->consume_prefill_chunk(len, checkpoint_rel > 0 && len == checkpoint_rel);
         synchronize_all();
     }
+    profile::end_chunk();
     work_.reset();
     reset_peer_workspaces();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(len),
@@ -3029,35 +3083,46 @@ void TextContext::mtp_forward_stem_tp2(const Tensor& ids, const TpArray<Tensor>&
             continue;
         }
         // tp > 2: the rank's K-slice is a ROW RANGE of one normalized buffer. Those rows are
-        // adjacent, so the range is one contiguous run of bytes -- but the [K/tp, T] view of it is
-        // strided as a whole and the GEMM needs a compact activation. Copy the run once.
+        // adjacent within a column, but the [K/tp, T] view is strided as a whole and the GEMM
+        // needs a compact activation, so the run is copied.
         //
-        // ONE COPY PER COLUMN, because the buffer is COLUMN-MAJOR: ne[0] (= hidden) is the FAST
-        // axis, so rows [a, a + shard_rows) of every column are strided by `hidden`, NOT one
-        // contiguous run. The single memcpy this replaced read the range as if rows were
-        // contiguous, which handed every tp > 2 rank a slice of the wrong elements -- a silent
-        // defect, since the values are still real activations. tp2 never ran it (the `half == 1`
-        // shortcut below assigns the whole normalized buffer), which is why only the tp4 MTP was
-        // degraded; measured against a host reference: fc_input rel_l2 1.2-1.36 at tp4 versus
-        // 0.0018 at tp2, and every downstream stage inherits it.
+        // The copy is 2-D, not column-at-a-time: the buffer is COLUMN-MAJOR (ne[0] = hidden is the
+        // FAST axis), so rows [a, a + shard_rows) of every column sit at a fixed byte offset inside
+        // each `hidden`-element column. That is exactly cudaMemcpy2DAsync's contract -- one call
+        // per rank instead of T calls per rank.
+        //
+        // This replaces a `for (column < T)` loop that issued 4096 async copies per rank; at tp4
+        // `half == 2`, so all four ranks took that path: 16,384 host submissions per prefill chunk.
+        // Measured on this box (V100, 4x tp4): 9.41 ms per rank per chunk for the loop versus
+        // 0.073 ms for the 2-D form -- same bytes, ~130x. The byte ranges are identical by
+        // construction (same dst pitch, same src pitch, same offset, same width, same height) and
+        // were checked byte-for-byte against a host reference for both `within` values at the
+        // production geometry (hidden 5120, T 4096): see
+        // ~/backups/2026-10-21-mtp-stem-copy/mtp_copy_test.cu, RESULT: PASS.
         constexpr std::int64_t kElementBytes = sizeof(std::uint16_t);
+        // The pitch arithmetic below is the column loop's, made explicit: a strided source or a
+        // different leading extent would silently read the wrong elements (that is the defect this
+        // path already had once -- see the tp4 fc_input rel_l2 note in the design record).
+        if (!source.is_contiguous() || source.ne[0] != kCfg.hidden ||
+            source.ne[1] != static_cast<std::int64_t>(T)) {
+            throw std::logic_error("MTP stem K-slice source is not a contiguous [hidden, T] buffer");
+        }
         Tensor slice = ws[slot]->alloc(DType::BF16, {shard_rows, T});
         {
             const CurrentDevice restore;
             // `ranks_` holds slots 1..tp-1 only, so rank 0's device comes from the context.
             CUDA_CHECK(cudaSetDevice(
                 ec().dev[static_cast<std::size_t>(r)]->device));
-            for (std::int32_t column = 0; column < T; ++column) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    static_cast<std::uint8_t*>(slice.data) +
-                        static_cast<std::int64_t>(column) * shard_rows * kElementBytes,
-                    static_cast<const std::uint8_t*>(source.data) +
-                        (static_cast<std::int64_t>(column) * kCfg.hidden +
-                         static_cast<std::int64_t>(within) * shard_rows) * kElementBytes,
-                    static_cast<std::size_t>(shard_rows) *
-                        static_cast<std::size_t>(kElementBytes),
-                    cudaMemcpyDeviceToDevice, stream_for(r)));
-            }
+            const std::size_t column_bytes =
+                static_cast<std::size_t>(shard_rows) * static_cast<std::size_t>(kElementBytes);
+            const std::size_t source_pitch =
+                static_cast<std::size_t>(kCfg.hidden) * static_cast<std::size_t>(kElementBytes);
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                slice.data, column_bytes,
+                static_cast<const std::uint8_t*>(source.data) +
+                    static_cast<std::int64_t>(within) * shard_rows * kElementBytes,
+                source_pitch, column_bytes, static_cast<std::size_t>(T),
+                cudaMemcpyDeviceToDevice, stream_for(r)));
         }
         fc_input[slot] = slice;
     }
@@ -3878,7 +3943,10 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const TpArray<Tensor>
         auto bulk_scope_1 = rank_scopes();
         TpArray<Tensor> x;
         TpArray<Tensor> ah;
-        mtp_forward_stem_tp2(ids, hidden, x, ah, staging, input_embeddings);
+        {
+            profile::Scope seg(profile::Seg::MtpStem, stream_for(0));
+            mtp_forward_stem_tp2(ids, hidden, x, ah, staging, input_embeddings);
+        }
 
         TpArray<Tensor> k_flat;
         TpArray<Tensor> v_flat;
@@ -3886,6 +3954,7 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const TpArray<Tensor>
             k_flat[r] = ws[r]->alloc(DType::BF16, {shard_kv_size(), T});
             v_flat[r] = ws[r]->alloc(DType::BF16, {shard_kv_size(), T});
         }
+        profile::Scope seg_mtp_kv(profile::Seg::MtpKv, stream_for(0));
         Variant::mtp_kv_projection(
             ah, mtp_attention_weights(),
             k_flat, v_flat, ws, execution);
@@ -3914,10 +3983,12 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const TpArray<Tensor>
                                            cudaMemcpyDeviceToDevice, s));
             }
         });
+        seg_mtp_kv.stop();
     }
     mtp_stage_barrier(execution, "mtp_prefill: stem + kv append");
 
     if (!final_chunk) { return; }
+    profile::Scope seg_mtp_tail(profile::Seg::MtpTail, stream_for(0));
 
     TpArray<Tensor> q_flat;
     TpArray<Tensor> gate_flat;

@@ -1,5 +1,7 @@
 #include "targets/qwen3_6_27b/impl/variant.h"
 
+#include "core/prefill_profile.h"
+
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -854,12 +856,18 @@ void Variant::post_mixer(const TpArray<Tensor>& hidden,
         activation[rank] =
             workspace[rank]->alloc(DType::BF16, {shard_intermediate, hidden[0].ne[1]});
     }
-    ops::linear_swiglu_column_parallel(
-        hidden, rank_shards<Weight>(ec, w, [](const PostMixerWeights& x) { return x.gate_up; }),
-        activation, text_policy(w[0]->gate_up), workspace, ec);
-    ops::linear_add_row_parallel(
-        activation, rank_shards<Weight>(ec, w, [](const PostMixerWeights& x) { return x.down; }),
-        residual, staging, text_policy(w[0]->down), workspace, ec, ev);
+    {
+        profile::Scope seg(profile::Seg::MlpGateUp, profile::profile_stream());
+        ops::linear_swiglu_column_parallel(
+            hidden, rank_shards<Weight>(ec, w, [](const PostMixerWeights& x) { return x.gate_up; }),
+            activation, text_policy(w[0]->gate_up), workspace, ec);
+    }
+    {
+        profile::Scope seg(profile::Seg::MlpDown, profile::profile_stream());
+        ops::linear_add_row_parallel(
+            activation, rank_shards<Weight>(ec, w, [](const PostMixerWeights& x) { return x.down; }),
+            residual, staging, text_policy(w[0]->down), workspace, ec, ev);
+    }
 }
 
 void Variant::gdn_input_projection_record(
