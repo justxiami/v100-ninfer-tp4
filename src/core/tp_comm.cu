@@ -72,7 +72,25 @@ ncclDataType_t to_nccl_dtype(DType dtype) {
 
 struct TpComm::Impl {
     std::array<ncclComm_t, kMaximumDevices> comms{};
+    // Push AR buffers (single-process UVA, one per rank) + the device list so the destructor can
+    // free them on the correct device.
+    std::array<void*, kMaximumDevices> push_buf{};
+    int push_tp = 0;
+    std::array<int, kMaximumDevices> devices_{};
     ~Impl() {
+        // Free the push AR buffers on their own devices before destroying the NCCL comms.
+        for (int r = 0; r < push_tp; ++r) {
+            if (push_buf[static_cast<std::size_t>(r)] != nullptr) {
+                const cudaError_t set = cudaSetDevice(devices_[static_cast<std::size_t>(r)]);
+                if (set != cudaSuccess) {
+                    std::fprintf(stderr, "tp transport: cudaSetDevice (push_ar free) failed: %s\n",
+                                 cudaGetErrorName(set));
+                    continue;
+                }
+                cudaFree(push_buf[static_cast<std::size_t>(r)]);
+                push_buf[static_cast<std::size_t>(r)] = nullptr;
+            }
+        }
         for (ncclComm_t& comm : comms) {
             if (comm != nullptr) {
                 // Destructors must not throw; a destroy failure at teardown is worth reporting but
@@ -95,6 +113,13 @@ void* TpComm::comm_handle(int rank) const {
     if (rank < 0 || rank >= tp_) { fail("tp transport: comm_handle rank out of range"); }
     return static_cast<void*>(impl_->comms[static_cast<std::size_t>(rank)]);
 }
+
+void* TpComm::push_ar_buffer(int rank) const {
+    if (rank < 0 || rank >= tp_) { fail("tp transport: push_ar_buffer rank out of range"); }
+    return impl_->push_buf[static_cast<std::size_t>(rank)];
+}
+
+int TpComm::push_ar_tp() const noexcept { return impl_->push_tp; }
 
 std::unique_ptr<TpComm> TpComm::create(const ExecutionContext& ec) {
     if (ec.tp <= 2) {
@@ -168,6 +193,38 @@ std::unique_ptr<TpComm> TpComm::create(const ExecutionContext& ec) {
         check_cuda(cudaSetDevice(devices[slot]), "cudaSetDevice");
         check_cuda(cudaFree(warm[slot]), "cudaFree warmup");
         if (!errors[slot].empty()) { fail("tp transport: " + errors[slot]); }
+    }
+
+    // Push AR: enable peer access for every ordered pair (explicitly, checking the return code --
+    // this is the step the first attempt missed), then allocate one buffer per rank and pre-fill
+    // the payload with the sentinel byte. The buffer layout is [ epoch words: 384 B ][ payload:
+    // 2 epochs x 4 ranks x 81920 B ]. The epoch words start at 0 (memset 0), and the payload is
+    // memset with 0x7f (every 16-byte pack = 0x7f7f7f... = 8 sentinel bf16 NaNs).
+    constexpr std::size_t kPushSignalBytes = 384;  // 80 epoch words, 128-aligned
+    constexpr std::size_t kPushMaxBytes    = 81920;  // M8: 8 x 5120 x 2
+    constexpr int kPushEpochs              = 2;
+    const std::size_t kPushTotal = kPushSignalBytes + kPushEpochs * ec.tp * kPushMaxBytes;
+    for (int r = 0; r < ec.tp; ++r) { comm->impl_->devices_[static_cast<std::size_t>(r)] = devices[static_cast<std::size_t>(r)]; }
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        check_cuda(cudaSetDevice(devices[static_cast<std::size_t>(rank)]), "cudaSetDevice (push_ar)");
+        check_cuda(cudaMalloc(&comm->impl_->push_buf[static_cast<std::size_t>(rank)], kPushTotal),
+                   "cudaMalloc push_ar buffer");
+        check_cuda(cudaMemset(comm->impl_->push_buf[static_cast<std::size_t>(rank)], 0, kPushTotal),
+                   "cudaMemset push_ar buffer (epoch words -> 0)");
+        check_cuda(cudaMemset(reinterpret_cast<char*>(comm->impl_->push_buf[static_cast<std::size_t>(rank)]) +
+                                 kPushSignalBytes,
+                             0x7f, kPushTotal - kPushSignalBytes),
+                   "cudaMemset push_ar buffer (payload -> sentinel)");
+    }
+    comm->impl_->push_tp = ec.tp;
+    for (int i = 0; i < ec.tp; ++i) {
+        for (int j = 0; j < ec.tp; ++j) {
+            if (i == j) { continue; }
+            check_cuda(cudaSetDevice(devices[static_cast<std::size_t>(i)]), "cudaSetDevice (peer)");
+            cudaError_t e = cudaDeviceEnablePeerAccess(devices[static_cast<std::size_t>(j)], 0);
+            if (e == cudaErrorPeerAccessAlreadyEnabled) { e = cudaSuccess; }
+            check_cuda(e, "cudaDeviceEnablePeerAccess");
+        }
     }
     return comm;
 }
