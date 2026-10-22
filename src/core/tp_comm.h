@@ -43,6 +43,12 @@ public:
     // Opaque `ncclComm_t` for `rank`; only tp_comm.cu interprets it.
     [[nodiscard]] void* comm_handle(int rank) const;
 
+    // Push AR buffer base for `rank` (non-null only if push AR buffers were allocated).
+    [[nodiscard]] void* push_ar_buffer(int rank) const;
+
+    // Number of push AR buffers (0 if push AR was not allocated).
+    [[nodiscard]] int push_ar_tp() const noexcept;
+
 private:
     struct Impl;
     TpComm(int tp, std::unique_ptr<Impl> impl);
