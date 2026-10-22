@@ -24,6 +24,7 @@
 #include "ninfer/ops/allreduce.h"
 
 #include "core/tp_comm.h"           // tp > 2 collectives (NCCL)
+#include "core/push_ar.h"           // one-shot push AR (tp == 4, single-process UVA)
 #include "ops/common/split_launch.h" // detail::require_split_context
 #include "ops/launcher/residual_add.h" // detail::residual_add_launch
 
@@ -415,9 +416,13 @@ PeerEvents& PeerEvents::operator=(PeerEvents&& other) noexcept {
 void allreduce_sum(const TpArray<Tensor>& buffer, const TpArray<Tensor>& staging,
                    const ExecutionContext& ec, const PeerEvents& events) {
     // Two transports, one contract (see src/core/tp_comm.h): tp == 2 uses the hand-written pull
-    // below, tp > 2 hands the same in-place sum to NCCL. `staging` is the pull protocol's scratch
-    // and NCCL ignores it.
+    // below, tp > 2 first tries the one-shot push AR (src/core/push_ar.h), and falls back to NCCL
+    // when the push path cannot handle the call. `staging` is the pull protocol's scratch and is
+    // ignored by both the push and NCCL paths.
     if (ec.tp > 2) {
+        if (ops::push_ar_try(ec, buffer)) {
+            return;
+        }
         ops::nccl_allreduce_sum(ec, buffer, staging);
         return;
     }
