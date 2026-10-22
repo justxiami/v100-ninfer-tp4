@@ -866,3 +866,49 @@ content: 'We need to reply with a short phrase: "PROMised and the user says 'Dia
   decode 未动。回滚二进制：`~/backups/2026-10-21-gdn-chunked/serve-before/`。
 - **未做**：未达预注册 3.5× 门（state kernel 装载/计算未重叠，有效 5.5 TFLOPS vs 天花板 11）；
   workspace 66 MB @prefill-chunk 4096。
+
+## 2026-10-22（十二）段传感器 + MTP 批次 + Flash-V100 Split-D 长档注意力落生产：详记见 docs/tp4/flash-v100-splitd-attn-2026-10-22.md
+
+- **段传感器**（`src/core/prefill_profile.{h,cu}`，env `NINFER_PREFILL_PROFILE=1`）：
+  4096 chunk 段表 mlp_gate_up 32.4% / mlp_down 21.7% / gdn_in_proj 14.8% / gdn_out_proj 7.8% /
+  attn_core 4.4% / allreduce 4.6% / GDN 段（chunked 后）3.1%。绕开 nsys 抓不到引擎内核的墙，
+  92% 非 GDN prefill 第一次有段级可见性。
+- **基线阶梯**（`461cbb62`，3 reps 中位，真冷 salt，think on，1530 MHz）：
+  8k 3917.0 / 16k 3755.2 / 32k 3470.0 / 64k 2996.0 / 120k 2392.1 tok/s（客户端），needle 5 档 3/3。
+- **MTP 批次**（`f2f4b3a1` 已上线）：stem 逐列拷贝 → 每 rank 一次 `cudaMemcpy2DAsync`
+  （39,778 → 6,914 µs/chunk，−82.6%，逐字节等价单独证）+ TP4 MLP 256 宽 CUTLASS tile
+  （mlp_gate_up −1.9%、mlp_down −2.9%）。8k 客户端 3917.0 → 4076.0（+4.06%），3 reps 同 argv。
+  判死：chunk 8192（−26%，T=8192 时 GEMM 效率腰斩 77.6→39.9 TF 是根因）、`NCCL_ALGO=Tree`
+  （引擎坏）、CUTLASS 3 stages（静态 smem 编译期不可实例化）。
+- **GEMM 线四条路全判死**：CUTLASS 加深流水（48 KB 静态 smem 编译期不可实例化）、
+  换 swizzle（接口不匹配）、INT8（sm_70 无 PTX int8 MMA；cuBLAS int8 实测 50.9 TOPS <
+  fp16 77.6）、cuBLAS fp16（裸 GEMM 1.35× 但引擎内 +1.5% 变慢，已回退）。
+  归因修正：「GEMM 段 62% 峰值」里 ~25% 是反量化/staging 周边开销，MMA 内核本身 ~75–78%。
+- **注意力自研线四方案全判死**：vendored fattn 平台 35.5 TF（28.4% 峰值）；纯 mma 探针
+  117.7 TF = 94% 峰值；冗余模型 `上限=2·eff/(r+1)` 对现役核（r=4）预测 35.8 TF vs 实测 35.5
+  （误差 <1%）；自写 q-major dim-split 24.66 TF（Bc 放大/多链/软件流水/高占用全 ≤24.7 TF）；
+  转置版正确但只有 7.4–8.3 TF（1/3）。配置空间两侧夹死（ncols64 注意力段 +38% 但 8k −6.7%；
+  occ4+combine32 32k −33.4%）。现役配置是局部最优。
+- **Flash-V100 Split-D 接入并落生产**（`6ac5c8b5`，默认开启，env `NINFER_ATTN_SPLITD=0` 可关）：
+  来自 1Cat-vLLM 的 Flash-V100 (SM70) Split-D 注意力核（BSD-3，剥离 ATen），vendor 到
+  `src/ops/vendor/flash_v100/`（9 文件），launcher `gqa_attention_splitd_sm70.cu`。
+  机理：warp 对各持 8 行 Q 算 QK，P tile 共享、QK 不重复（我们此前所有 dim-split 都复制 QK
+  2×/4×，这是 24.6 TF 卡住的根因）。孤立实测 8k 37.1 / 32k 40.5 / 120k **46.9 TF**
+  （llama.cpp 35.5、自研 24.63）。
+  两坑留证：① q-block 1024 → 96 blocks/80 SM 只有 1.2 波，反而慢 7~21%；该核不需要 mask，
+  故按 4096 整 chunk 一次调用（384 blocks）；② step 与生效条件不同源 → 小档落回 llama 路径
+  却用 4096 块、mask 仅 1024 → 写坏注意力（needle 全 MISS 而吞吐虚高 120k 2900.6）。
+  触发条件：n_kv≥16384、tokens%64==0、n_kv%32==0、heads_q%heads_kv==0、宽度%4096==0。
+- **闸门结果**（08:14，生产二进制 `6ac5c8b5` 默认开启，needle 四档全 hit，strict 全 true）：
+  8k 3955.4（+0.2%，噪声内）/ 32k 3677.4（+4.0%）/ 64k 3318.4（+10.2%）/ 120k 2735.9（+9.9%），
+  均为引擎口径；客户端口径 32k +5.3%、120k +13.8%。decode 2048 en/zh/mixed 111.3/112.5/114.0，
+  spec 37.1/37.5/38.8%（噪声内，该路线不涉 decode）。预测 64k +1.1~3.1% 被实测 +10.2% 否证（低估）。
+- **口径审计**（第三方复核，如实记录）：8k「+0.2%」是误导数字——Split-D 在 8k 不触发（n_kv<16384），
+  8k 真实净收益 = MTP 批次的 +4.05%（00:25 的 3-reps 数字 4109.1）；闸门 8k = 3955.4 比它低 3.8%
+  是跨 boot 时钟态差（1312↔1530 MHz 漂移可造 ±12% 假差），闸门只有 1 rep。64k「+10.2%」混了
+  两个优化（基线 3010.0 不含 MTP 批次，闸门二进制两者都有），拆不开。站得住的是 32k +4.0% 与
+  120k +9.9%（引擎口径）：同栈 A/B 给出 +2.7~3.9% / +9.2%，生产构建略快，方向一致。
+  长上下文 decode（window>65536 路径）不在闸门覆盖内。
+- **回滚**：`~/backups/2026-10-22-splitd-attn/ninfer-serve.before`（sha256 `a2744327…`）；
+  MTP 批次回滚点 `~/backups/2026-10-22-mtp-tile-batch/serve-before/`（sha256 `461cbb62…`）。
+  生产 health 200，running == 磁盘 == `6ac5c8b5` 已核对。

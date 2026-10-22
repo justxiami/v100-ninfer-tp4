@@ -6,9 +6,9 @@
 
 ## TL;DR / 一句话简介
 
-**EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, prefill **3.9k tok/s** (chunked GDN: +11.6% over 3,502.7), ~9.4 GiB/GPU at 128k int8 KV. Long-attention decode routing + MTP4 (2026-10-15): pi-shaped 120k decode **96.0 → 109.1 tok/s (1.136x)**. 2026-10-21: keep-alive first token **−22 ms**; branch/prompt-switch TTFT **10.3 s → 1.5–3.0 s**.
+**EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, prefill **3.9k tok/s** (chunked GDN: +11.6% over 3,502.7), ~9.4 GiB/GPU at 128k int8 KV. Long-attention decode routing + MTP4 (2026-10-15): pi-shaped 120k decode **96.0 → 109.1 tok/s (1.136x)**. 2026-10-21: keep-alive first token **−22 ms**; branch/prompt-switch TTFT **10.3 s → 1.5–3.0 s**. 2026-10-22: long-context prefill attention swapped to the **Flash-V100 Split-D** kernel (1Cat-vLLM, BSD-3): **120k prefill +9.9%, 32k +4.0%** (engine tok/s), needle 4/4 hit, decode untouched; an MTP copy batch added +4.05% on the 8k prefill.
 
-**中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill **3.9k tok/s**（分块 GDN：较 3,502.7 +11.6%）、128k int8 KV 下每卡 ~9.4 GiB。长注意力 decode 路由 + MTP4（2026-10-15）：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**。
+**中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill **3.9k tok/s**（分块 GDN：较 3,502.7 +11.6%）、128k int8 KV 下每卡 ~9.4 GiB。长注意力 decode 路由 + MTP4（2026-10-15）：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**。 2026-10-21：keep-alive 首 token **−22 ms**；分支/换 prompt 的 TTFT **10.3 s → 1.5–3.0 s**。2026-10-22：长上下文 prefill 注意力换成 **Flash-V100 Split-D** 核（1Cat-vLLM，BSD-3）：**120k prefill +9.9%、32k +4.0%**（引擎口径），needle 4/3 全中，decode 未动；MTP 拷贝批次另给 8k prefill +4.05%。
 
 
 Single-instance Qwen3.8-27B inference across **4 × Tesla V100-SXM2 16 GB**
@@ -67,6 +67,14 @@ FLA 式分块：32 token 的 chunk 内用前代求解耦合矩阵，只有块间
 prefill **3,502.7 → 3,908.7 tok/s（+11.6%）**，8k ttft **2.40 → 2.15 s**，needle 3/3。
 FP32 状态仍常驻寄存器、衰减走 log 空间、decode 路径完全未动（同一个 snapshot op）。
 详记：[gdn-chunked-prefill-2026-10-21.md](docs/tp4/gdn-chunked-prefill-2026-10-21.md)。
+
+## 2026-10-22: Flash-V100 Split-D long-context attention / Flash-V100 Split-D 长上下文注意力
+
+**EN** — The 16 full-attention layers ran on the vendored llama.cpp SM70 kernel, capped at 35.5 TFLOPS (28% of peak); every home-grown MMA variant measured on this host lands at ≤25 TF. The long-context prefill now runs the **Flash-V100 Split-D** kernel from 1Cat-vLLM (BSD-3, vendored under `src/ops/vendor/flash_v100/`, ATen stripped): its warp pairs each own eight distinct Q rows for QK, then share the P tile so the QK product is never duplicated — the duplication is exactly what capped every dim-split kernel. Isolated: 46.9 TFLOPS at 120k. In-engine A/B (same stack, env-gated `NINFER_ATTN_SPLITD`): **120k 2489.5 → 2735.9 tok/s (+9.9%)**, **32k +4.0%** (engine tok/s), needle 4/4 hit, decode untouched (this route never touches decode). The kernel fires only when n_kv ≥ 16384, so the 8k prefill is unchanged — its +4.05% gain came from a separate MTP batch (stem per-column copies → one `cudaMemcpy2DAsync` per rank, 39.8→6.9 ms/chunk; plus 256-wide CUTLASS MLP tiles). Both batches shipped in one production binary (`6ac5c8b5`, gate passed, needle 4/4). Two integration bugs are documented in the write-up: a 1024 q-block grid that made the kernel *slower* (fixed by issuing the whole 4096 chunk at once), and a step-size gate that disagreed with the dispatch predicate and silently corrupted attention (caught by the needle check while throughput looked better). Details:
+[flash-v100-splitd-attn-2026-10-22.md](docs/tp4/flash-v100-splitd-attn-2026-10-22.md).
+
+**中文** — 16 层全注意力跑的是 vendored llama.cpp SM70 核，上限 35.5 TFLOPS（峰值的 28%）；本机实测的自研 MMA 变体全部 ≤25 TF。长上下文 prefill 现在跑 1Cat-vLLM 的 **Flash-V100 Split-D** 核（BSD-3，vendor 到 `src/ops/vendor/flash_v100/`，剥离 ATen）：每个 warp 对各持 8 行不同的 Q 算 QK，然后共享 P tile，QK 从不重复 —— 重复正是所有 dim-split 核卡住的根因。孤立实测 120k 达 46.9 TFLOPS。引擎内 A/B（同栈、env 开关 `NINFER_ATTN_SPLITD`）：**120k 2489.5 → 2735.9 tok/s（+9.9%）**、**32k +4.0%**（引擎口径），needle 4/4 全中，decode 未动（该路线不经过 decode）。核只在 n_kv ≥ 16384 时触发，8k prefill 不变 —— 它的 +4.05% 来自另一个 MTP 批次（stem 逐列拷贝 → 每 rank 一次 `cudaMemcpy2DAsync`，39.8→6.9 ms/chunk；外加 256 宽 CUTLASS MLP tile）。两个批次打进同一份生产二进制（`6ac5c8b5`，闸门通过，needle 4/4）。两个集成坑写在详记里：1024 q-block 的 grid 让核反而变慢（改成整 4096 chunk 一次调用解决）；step 与生效条件不同源会悄悄写坏注意力（吞吐好看但 needle 挂掉，被 needle 检查逮住）。详记：
+[flash-v100-splitd-attn-2026-10-22.md](docs/tp4/flash-v100-splitd-attn-2026-10-22.md)。
 
 ## What this fork adds / 本 fork 新增了什么
 
@@ -169,6 +177,8 @@ ones.
 | MTP draft acceptance — same run | 30.8–34.1% | **47.5%** |
 | Prefill — 17.4k prompt (needle test, retrieval hit ✓) | — | **3,372.8 tok/s** |
 | Prefill — 8.1k prompt (chunked GDN, 2026-10-21) | 3,502.7 tok/s | **3,908.7 tok/s (1.12×)** |
+| Prefill — 120k prompt (Flash-V100 Split-D, 2026-10-22) | 2,489.5 tok/s | **2,735.9 tok/s (1.10×)** |
+| Prefill — 32k prompt (Flash-V100 Split-D, 2026-10-22) | 3,492.7 tok/s | **3,677.4 tok/s (1.05×)** |
 | Prefill — 5.8k prompt | — | 3,494.6 tok/s |
 | Short-answer decode — 96 tokens | — | 124–140 tok/s (acceptance 56–66%) |
 | VRAM per GPU (weights + 128k int8 KV + graphs) | 15.2 GiB | **9.39 GiB** |
@@ -190,6 +200,8 @@ decode tok/s 只计已提交的输出 token，不含被拒的 draft。
 | MTP draft 接受率 — 同跑 | 30.8–34.1% | **47.5%** |
 | Prefill — 17.4k prompt（needle 测试，检索命中 ✓） | — | **3,372.8 tok/s** |
 | Prefill — 8.1k prompt (chunked GDN, 2026-10-21) | 3,502.7 tok/s | **3,908.7 tok/s (1.12×)** |
+| Prefill — 120k prompt (Flash-V100 Split-D, 2026-10-22) | 2,489.5 tok/s | **2,735.9 tok/s (1.10×)** |
+| Prefill — 32k prompt (Flash-V100 Split-D, 2026-10-22) | 3,492.7 tok/s | **3,677.4 tok/s (1.05×)** |
 | Prefill — 5.8k prompt | — | 3,494.6 tok/s |
 | 短答 decode — 96 token | — | 124–140 tok/s（接受率 56–66%） |
 | 每卡显存（权重 + 128k int8 KV + graph） | 15.2 GiB | **9.39 GiB** |
@@ -205,13 +217,13 @@ Full cold prefill sweep, 3 reps per context, session salt so no rep hits the pre
 uniquely attributed; the sweep ran with no other active request source). The 8k and 16k
 points reproduce the earlier 5.8k / 17.4k single-shot numbers, confirming stability.
 
-| context | prefill tok/s | time-to-first-token | greedy 300-token decode (t=0) |
+| context | prefill tok/s (baseline 2026-10-21, chunked GDN) | prefill tok/s (current 2026-10-22, + Flash-V100 Split-D + MTP batch) | Δ |
 |---:|---:|---:|---:|
-| 8k | 3,470 | 2.4 s | 143 tok/s |
-| 16k | 3,357 | 4.8 s | 134 tok/s |
-| 32k | 3,118 | 10.3 s | 141 tok/s |
-| 64k | 2,724 | 23.7 s | 117 tok/s |
-| 120k | 2,229 | 54.1 s | 96 tok/s |
+| 8k | 3,917.0 | 3,925.5 | +0.2%（Split-D 不触发，+4.05% 见 MTP 批次） |
+| 16k | 3,755.2 | — | — |
+| 32k | 3,470.0 | 3,654.8 | **+5.3%** |
+| 64k | 2,996.0 | 3,297.6 | **+10.1%**（两优化混算） |
+| 120k | 2,392.1 | 2,721.7 | **+13.8%** |
 
 Prefill declines monotonically with context — the long-context **O(n²) attention wall**:
 8k→16k is near-flat (3,470→3,357), then it steepens (−7%/tier at 32k/64k, −19% into 120k).

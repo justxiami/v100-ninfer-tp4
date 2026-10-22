@@ -4,10 +4,10 @@
 
 ## TL;DR / 一句话简介
 
-**中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill 3.4k tok/s、128k int8 KV 下每卡 ~9.4 GiB。
-长注意力 decode 路由 + MTP4（2026-10-15）：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**。2026-10-21：复用连接首 token **−22 ms**；分支/换题 TTFT **10.3 s → 1.5–3.0 s**。
+**中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill **3.9k tok/s**（分块 GDN：较 3,502.7 +11.6%）、128k int8 KV 下每卡 ~9.4 GiB。
+长注意力 decode 路由 + MTP4（2026-10-15）：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**。2026-10-21：复用连接首 token **−22 ms**；分支/换题 TTFT **10.3 s → 1.5–3.0 s**。 2026-10-22：长上下文 prefill 注意力换成 **Flash-V100 Split-D** 核（1Cat-vLLM，BSD-3）：**120k prefill +9.9%、32k +4.0%**（引擎口径），needle 4/3 全中，decode 未动；MTP 拷贝批次另给 8k prefill +4.05%。
 
-**EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, 3.4k tok/s prefill, ~9.4 GiB/GPU at 128k int8 KV. Long-attention decode routing + MTP4 (2026-10-15): pi-shaped 120k decode **96.0 → 109.1 tok/s (1.136x)**.
+**EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, prefill **3.9k tok/s** (chunked GDN: +11.6% over 3,502.7), ~9.4 GiB/GPU at 128k int8 KV. Long-attention decode routing + MTP4 (2026-10-15): pi-shaped 120k decode **96.0 → 109.1 tok/s (1.136x)**.
 
 
 在 **4 × Tesla V100-SXM2 16 GB**（`sm_70` / Volta，CUDA 12.8）上用 4 路张量并行
@@ -55,6 +55,18 @@ Details: [prefix-checkpoint-2026-10-21.md](docs/tp4/prefix-checkpoint-2026-10-21
 
 详记（算法推导、选型扫描、两个真 bug、验收数据、复现命令）：
 [gdn-chunked-prefill-2026-10-21.md](docs/tp4/gdn-chunked-prefill-2026-10-21.md)
+
+## 2026-10-22: Flash-V100 Split-D 长上下文注意力
+
+16 层全注意力跑的是 vendored llama.cpp SM70 核，上限 35.5 TFLOPS（峰值的 28%）；本机实测的自研 MMA 变体全部 ≤25 TF。
+长上下文 prefill 现在跑 1Cat-vLLM 的 **Flash-V100 Split-D** 核（BSD-3，vendor 到 `src/ops/vendor/flash_v100/`，剥离 ATen）：
+每个 warp 对各持 8 行不同的 Q 算 QK，然后共享 P tile，QK 从不重复 —— 重复正是所有 dim-split 核卡住的根因。
+孤立实测 120k 达 46.9 TFLOPS。引擎内 A/B（同栈、env 开关 `NINFER_ATTN_SPLITD`）：**120k 2489.5 → 2735.9 tok/s（+9.9%）**、
+**32k +4.0%**（引擎口径），needle 4/4 全中，decode 未动（该路线不经过 decode）。核只在 n_kv ≥ 16384 时触发，8k prefill 不变 ——
+它的 +4.05% 来自另一个 MTP 批次（stem 逐列拷贝 → 每 rank 一次 `cudaMemcpy2DAsync`，39.8→6.9 ms/chunk；外加 256 宽 CUTLASS MLP tile）。
+两个批次打进同一份生产二进制（`6ac5c8b5`，闸门通过，needle 4/4）。两个集成坑写在详记里：1024 q-block 的 grid 让核反而变慢
+（改成整 4096 chunk 一次调用解决）；step 与生效条件不同源会悄悄写坏注意力（吞吐好看但 needle 挂掉，被 needle 检查逮住）。
+详记：[flash-v100-splitd-attn-2026-10-22.md](docs/tp4/flash-v100-splitd-attn-2026-10-22.md)。
 
 ## 本 fork 新增了什么
 
@@ -125,13 +137,13 @@ decode tok/s 只计已提交的输出 token，不含被拒的 draft。
 （权威数字 = 引擎 `done` 行，按 req 基线对齐使每个样本可唯一归属；扫描期间无其他
 活跃请求源）。8k 与 16k 两点复现了早期 5.8k / 17.4k 单次数字，确认稳定性。
 
-| 上下文 | prefill tok/s | 首 token 时延 | greedy 300-token decode（t=0） |
+| 上下文 | prefill tok/s（基线 2026-10-21，分块 GDN） | prefill tok/s（现值 2026-10-22，+ Flash-V100 Split-D + MTP 批次） | Δ |
 |---:|---:|---:|---:|
-| 8k | 3,470 | 2.4 s | 143 tok/s |
-| 16k | 3,357 | 4.8 s | 134 tok/s |
-| 32k | 3,118 | 10.3 s | 141 tok/s |
-| 64k | 2,724 | 23.7 s | 117 tok/s |
-| 120k | 2,229 | 54.1 s | 96 tok/s |
+| 8k | 3,917.0 | 3,925.5 | +0.2%（Split-D 不触发，+4.05% 见 MTP 批次） |
+| 16k | 3,755.2 | — | — |
+| 32k | 3,470.0 | 3,654.8 | **+5.3%** |
+| 64k | 2,996.0 | 3,297.6 | **+10.1%**（两优化混算） |
+| 120k | 2,392.1 | 2,721.7 | **+13.8%** |
 
 prefill 随上下文单调下降——长上下文的 **O(n²) 注意力墙**：8k→16k 近平
 （3,470→3,357），之后变陡（32k/64k 每档 −7%，到 120k 时 −19%）。
