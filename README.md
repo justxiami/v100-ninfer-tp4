@@ -6,9 +6,9 @@
 
 ## TL;DR / 一句话简介
 
-**EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, prefill **3.9k tok/s** (chunked GDN: +11.6% over 3,502.7), ~9.4 GiB/GPU at 128k int8 KV. Long-attention decode routing + MTP4 (2026-10-15): pi-shaped 120k decode **96.0 → 109.1 tok/s (1.136x)**. 2026-10-21: keep-alive first token **−22 ms**; branch/prompt-switch TTFT **10.3 s → 1.5–3.0 s**. 2026-10-22: long-context prefill attention swapped to the **Flash-V100 Split-D** kernel (1Cat-vLLM, BSD-3): **120k prefill +9.9%, 32k +4.0%** (engine tok/s), needle 4/4 hit, decode untouched; an MTP copy batch added +4.05% on the 8k prefill.
+**EN** — ninfer's tuned 2-GPU (TP2) V100 stack, re-hosted as a single-instance **4-way tensor-parallel** engine on 4x V100-SXM2 16 GB: NCCL transport, multi-rank CUDA graphs, MTP/speculative fixes, image multimodal (2026-10-05), QUASAR NVFP4-QAT artifacts. Qwen3.8-27B W4A4: **113 tok/s committed decode (1.81x vs TP2)**, prefill **3.9k tok/s** (chunked GDN: +11.6% over 3,502.7), ~9.4 GiB/GPU at 128k int8 KV. Long-attention decode routing + MTP4 (2026-10-15): pi-shaped 120k decode **96.0 → 109.1 tok/s (1.136x)**. 2026-10-21: keep-alive first token **−22 ms**; branch/prompt-switch TTFT **10.3 s → 1.5–3.0 s**. 2026-10-22: long-context prefill attention swapped to the **Flash-V100 Split-D** kernel (1Cat-vLLM, BSD-3): **120k prefill +9.9%, 32k +4.0%** (engine tok/s), needle 4/4 hit, decode untouched; an MTP copy batch added +4.05% on the 8k prefill. 2026-10-22 (decode): the tp>2 allreduce swapped from NCCL to a **one-shot push allreduce** (1Cat's `sm70_cross_device_reduce_1stage_push`, ported to single-process UVA): engine-level two-arm A/B (fresh boot per arm, client decode tok/s excl. ttft) **154.2/151.7 vs 133.0/131.2 = +15.8% decode, 1.032 ms/token saved**, squarely inside 1Cat's +13~18% reference band. Two misdiagnoses corrected along the way (an 'IOMMU dead-end' that was a NULL-pointer bug; a graph-capture crash that was a current-device leak — the live decode is `--no-cuda-graph` eager).
 
-**中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill **3.9k tok/s**（分块 GDN：较 3,502.7 +11.6%）、128k int8 KV 下每卡 ~9.4 GiB。长注意力 decode 路由 + MTP4（2026-10-15）：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**。 2026-10-21：keep-alive 首 token **−22 ms**；分支/换 prompt 的 TTFT **10.3 s → 1.5–3.0 s**。2026-10-22：长上下文 prefill 注意力换成 **Flash-V100 Split-D** 核（1Cat-vLLM，BSD-3）：**120k prefill +9.9%、32k +4.0%**（引擎口径），needle 4/3 全中，decode 未动；MTP 拷贝批次另给 8k prefill +4.05%。
+**中文** — 把 ninfer 调优过的双卡（TP2）V100 移植改写为单实例 **4 路张量并行**引擎（4x V100-SXM2 16 GB）：NCCL 传输、多 rank CUDA graph、MTP/投机解码修复、图像多模态（2026-10-05）、QUASAR NVFP4-QAT 工件。Qwen3.8-27B W4A4：**decode 113 tok/s（TP2 的 1.81 倍）**、prefill **3.9k tok/s**（分块 GDN：较 3,502.7 +11.6%）、128k int8 KV 下每卡 ~9.4 GiB。长注意力 decode 路由 + MTP4（2026-10-15）：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**。 2026-10-21：keep-alive 首 token **−22 ms**；分支/换 prompt 的 TTFT **10.3 s → 1.5–3.0 s**。2026-10-22：长上下文 prefill 注意力换成 **Flash-V100 Split-D** 核（1Cat-vLLM，BSD-3）：**120k prefill +9.9%、32k +4.0%**（引擎口径），needle 4/3 全中，decode 未动；MTP 拷贝批次另给 8k prefill +4.05%。 2026-10-22（decode）：tp>2 allreduce 从 NCCL 换成 **one-shot push allreduce**（移植 1Cat 的 `sm70_cross_device_reduce_1stage_push` 到单进程 UVA）：引擎级两臂 A/B（每臂 fresh 重启、客户端 decode tok/s 剔 ttft）**154.2/151.7 vs 133.0/131.2 = +15.8% decode，省 1.032 ms/token**，正好落在 1Cat 参照的 +13~18% 带内。路上更正了两次误诊（「IOMMU 判死」实为 NULL 指针 bug；「图捕获崩」实为当前设备泄漏——现役 decode 本就是 `--no-cuda-graph` eager）。
 
 
 Single-instance Qwen3.8-27B inference across **4 × Tesla V100-SXM2 16 GB**
@@ -76,6 +76,38 @@ FP32 状态仍常驻寄存器、衰减走 log 空间、decode 路径完全未动
 **中文** — 16 层全注意力跑的是 vendored llama.cpp SM70 核，上限 35.5 TFLOPS（峰值的 28%）；本机实测的自研 MMA 变体全部 ≤25 TF。长上下文 prefill 现在跑 1Cat-vLLM 的 **Flash-V100 Split-D** 核（BSD-3，vendor 到 `src/ops/vendor/flash_v100/`，剥离 ATen）：每个 warp 对各持 8 行不同的 Q 算 QK，然后共享 P tile，QK 从不重复 —— 重复正是所有 dim-split 核卡住的根因。孤立实测 120k 达 46.9 TFLOPS。引擎内 A/B（同栈、env 开关 `NINFER_ATTN_SPLITD`）：**120k 2489.5 → 2735.9 tok/s（+9.9%）**、**32k +4.0%**（引擎口径），needle 4/4 全中，decode 未动（该路线不经过 decode）。核只在 n_kv ≥ 16384 时触发，8k prefill 不变 —— 它的 +4.05% 来自另一个 MTP 批次（stem 逐列拷贝 → 每 rank 一次 `cudaMemcpy2DAsync`，39.8→6.9 ms/chunk；外加 256 宽 CUTLASS MLP tile）。两个批次打进同一份生产二进制（`6ac5c8b5`，闸门通过，needle 4/4）。两个集成坑写在详记里：1024 q-block 的 grid 让核反而变慢（改成整 4096 chunk 一次调用解决）；step 与生效条件不同源会悄悄写坏注意力（吞吐好看但 needle 挂掉，被 needle 检查逮住）。详记：
 [flash-v100-splitd-attn-2026-10-22.md](docs/tp4/flash-v100-splitd-attn-2026-10-22.md)。
 
+## 2026-10-22: one-shot push allreduce / 2026-10-22: one-shot push allreduce
+
+**EN** — The tp>2 allreduce used to go through NCCL (measured 4.6 ms per decode round for the 10 KiB
+shape, 23% of the 8k round wall). It now runs a **one-shot push allreduce** transcribed from 1Cat's
+`sm70_cross_device_reduce_1stage_push` into single-process UVA: every rank pushes its 16-byte pack into
+the peers' staging slots, polls until the peers' packs arrive (sentinel = a reserved bf16 NaN), reduces
+in a fixed rank order, and clears its slots — no host-side events, no NCCL channels, all sequencing
+inside one kernel. Engine-level two-arm A/B (fresh boot per arm, client decode tok/s excluding ttft,
+temp 0.6 × 512 tok English): **PUSH 154.2/151.7 vs NCCL 133.0/131.2 = +15.8% decode, 1.032 ms/token
+saved**, squarely inside 1Cat's +13~18% reference band; ttft unchanged (0.143–0.155 s, the 480 KiB
+prefill block exceeds `kMaxBytes` 80 KiB and correctly falls back to NCCL). Two integration bugs were
+corrected: an 'IOMMU dead-end' that was actually a NULL-pointer bug (`TpComm::create` accessed an empty
+`impl` after a `std::move`), and a warmup crash that was a current-device leak (`push_ar_try`'s launch
+loop left the caller's device at rank 3 → `cudaErrorInvalidResourceHandle` — the live decode is
+`--no-cuda-graph` eager, never graph-captured). The fix is a `CurrentDeviceRestore` RAII guard, and the
+lesson is that a green kernel harness does not prove the engine path: raw cross-GPU dereferencing
+requires peer access to be *explicitly* enabled, and per-rank `cudaSetDevice` must be restored. Details:
+[push-ar-2026-10-22.md](docs/tp4/push-ar-2026-10-22.md).
+
+**中文** — tp>2 allreduce 过去走 NCCL（10 KiB 形态实测 4.6 ms/decode 轮，占 8k 轮墙钟 23%）。现在跑
+**one-shot push allreduce**，从 1Cat 的 `sm70_cross_device_reduce_1stage_push` 转写进单进程 UVA：每个
+rank 把自己的 16 字节包 push 进 peer 的 staging 槽，轮询直到 peer 的包到齐（哨兵 = 保留的 bf16 NaN），
+按固定 rank 序归约，再清槽——没有 host 侧事件、没有 NCCL 通道，全部排序在一个核里完成。引擎级两臂 A/B
+（每臂 fresh 重启、客户端 decode tok/s 剔 ttft、temp 0.6 × 512 tok 英文）：**PUSH 154.2/151.7 vs NCCL
+133.0/131.2 = +15.8% decode，省 1.032 ms/token**，正好落在 1Cat 参照的 +13~18% 带内；ttft 不变
+（0.143–0.155 s，480 KiB prefill 块超 `kMaxBytes` 80 KiB，正确回退 NCCL）。路上更正了两个集成 bug：
+「IOMMU 判死」实为 NULL 指针 bug（`TpComm::create` 在 `std::move` 后访问空 `impl`）；warmup 崩溃实为
+当前设备泄漏（`push_ar_try` 的 launch 循环把调用方的设备留在 rank 3 → `cudaErrorInvalidResourceHandle`
+——现役 decode 是 `--no-cuda-graph` eager，从不捕获图）。修复是 `CurrentDeviceRestore` RAII 守卫，教训是
+kernel harness 绿灯不等于引擎路径绿灯：裸跨 GPU 解引用要求 peer access **显式开启**，逐 rank
+`cudaSetDevice` 必须还原。详记：[push-ar-2026-10-22.md](docs/tp4/push-ar-2026-10-22.md)。
+
 ## What this fork adds / 本 fork 新增了什么
 
 - **Sharding geometry made runtime-sized** — the compile-time 2-GPU assumption is gone:
@@ -115,6 +147,7 @@ FP32 状态仍常驻寄存器、衰减走 log 空间、decode 路径完全未动
   match. Production = MTP4 + target-only routing: pi-shaped 120k decode **96.0 → 109.1
   tok/s (1.136x)** — client-side median, 3 boots x 3 reps, all side-effect gates >= 0.98.
   See [the decode backport write-up](docs/tp4/decode-backport-2026-10-15.md).
+- **One-shot push allreduce for tp4 (2026-10-22)** — the tp>2 allreduce swapped from NCCL (4.6 ms/decode round) to a single-kernel push protocol ported from 1Cat's `sm70_cross_device_reduce_1stage_push`: every rank pushes its 16-byte pack into the peers' staging slots, polls until the peers' packs arrive (sentinel = a reserved bf16 NaN), reduces in a fixed rank order, and clears its slots — no host-side events, no NCCL channels. Engine-level two-arm A/B (fresh boot per arm, client decode tok/s excl. ttft): **154.2/151.7 vs 133.0/131.2 = +15.8% decode, 1.032 ms/token saved**. Raw cross-GPU dereferencing requires peer access to be *explicitly* enabled (querying `cudaDeviceCanAccessPeer` is not enough — it says 'possible', not 'enabled'), and the launch loop must restore the caller's current CUDA device (RAII) or the next op on a rank-0 stream dies with `cudaErrorInvalidResourceHandle`. See [the push allreduce write-up](docs/tp4/push-ar-2026-10-22.md).
 
 Technical history (W1→W6): [`docs/tp4/changelog.md`](docs/tp4/changelog.md) ·
 MTP root-cause analysis: [`docs/tp4/README_tp4_mtp_rca_2026-10-01.md`](docs/tp4/README_tp4_mtp_rca_2026-10-01.md) ·
@@ -154,6 +187,7 @@ decode backport + long-window routing (2026-10-15): [`docs/tp4/decode-backport-2
   长档门 65536 与 KV 分段策略同门槛，CUDA graph profile 边界同步补齐。生产 = MTP4 +
   只开 target：pi 形状 120k decode **96.0 → 109.1 tok/s（1.136 倍）**，客户端中位、
   3 boot × 3 rep、副作用闸全过（≥0.98）。见[decode 回迁专文](docs/tp4/decode-backport-2026-10-15.md)。
+- **tp4 one-shot push allreduce（2026-10-22）** —— tp>2 allreduce 从 NCCL（4.6 ms/decode 轮）换成单核 push 协议，移植自 1Cat 的 `sm70_cross_device_reduce_1stage_push`：每个 rank 把自己的 16 字节包 push 进 peer 的 staging 槽，轮询直到 peer 的包到齐（哨兵 = 保留的 bf16 NaN），按固定 rank 序归约，再清槽——没有 host 侧事件、没有 NCCL 通道。引擎级两臂 A/B（每臂 fresh 重启、客户端 decode tok/s 剔 ttft）：**154.2/151.7 vs 133.0/131.2 = +15.8% decode，省 1.032 ms/token**。裸跨 GPU 解引用要求 peer access **显式开启**（只查 `cudaDeviceCanAccessPeer` 不够——它说「可能」，不说「已开」），且 launch 循环必须还原调用方的当前 CUDA 设备（RAII），否则下一个在 rank 0 stream 上的 op 会死于 `cudaErrorInvalidResourceHandle`。见[push allreduce 专文](docs/tp4/push-ar-2026-10-22.md).
 
 技术史（W1→W6）：[`docs/tp4/changelog.md`](docs/tp4/changelog.md) ·
 MTP 根因分析：[`docs/tp4/README_tp4_mtp_rca_2026-10-01.md`](docs/tp4/README_tp4_mtp_rca_2026-10-01.md) ·
@@ -174,6 +208,7 @@ ones.
 | Metric | tp2 (2-GPU baseline, same artifact) | **tp4** |
 |---|---:|---:|
 | Committed decode — 2,048-token thinking run (t=1.0 / top_p=0.95 / top_k=20) | 62.6 tok/s | **113.1 tok/s (1.81×)** |
+| Committed decode — 2,048-token thinking run, **push allreduce** (2026-10-22) | — | **129.2–136.6 tok/s** (+14~21% over the NCCL row above) |
 | MTP draft acceptance — same run | 30.8–34.1% | **47.5%** |
 | Prefill — 17.4k prompt (needle test, retrieval hit ✓) | — | **3,372.8 tok/s** |
 | Prefill — 8.1k prompt (chunked GDN, 2026-10-21) | 3,502.7 tok/s | **3,908.7 tok/s (1.12×)** |
@@ -340,6 +375,7 @@ The measured artifact is `qwen3_8_27b_w4a4w8a8.ninfer` (21.0 GiB, 1,097 tensors)
 
 ```
 src/core/tp_comm.{h,cu}                  NCCL transport backend
+src/core/push_ar.{h,cu}                  one-shot push allreduce (tp==4, single-process UVA) (2026-10-22)
 src/ops/wrapper/shard_extent.h           runtime shard geometry
 src/ops/{attn,gdn}_input_proj/nvfp4/*sm70*   SM70 NVFP4 decode fast path (2026-10-04)
 src/ops/kernel/swa_volta.cuh             Volta GQA attention (2026-10-01)
